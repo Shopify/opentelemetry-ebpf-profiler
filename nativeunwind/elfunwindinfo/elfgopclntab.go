@@ -325,7 +325,6 @@ func SearchGoPclntab(ef *pfelf.File) ([]byte, error) {
 			}
 		}
 	}
-
 	return nil, nil
 }
 
