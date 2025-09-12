@@ -5,8 +5,13 @@ package golang // import "go.opentelemetry.io/ebpf-profiler/interpreter/go"
 
 import (
 	"fmt"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync/atomic"
 
+	"github.com/dustin/go-humanize"
 	"go.opentelemetry.io/ebpf-profiler/host"
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -38,6 +43,45 @@ type goInstance struct {
 	d *goData
 }
 
+func getRSS() (uint64, error) {
+	content, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0, err
+	}
+
+	fields := strings.Fields(string(content))
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("unexpected content in /proc/self/statm")
+	}
+
+	rssPages, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return rssPages, nil
+}
+
+func getMemStats(when string) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	fmt.Printf("=== %s\n", when)
+	fmt.Printf("Allocated: %s\n", humanize.Bytes(m.Alloc))
+	fmt.Printf("Total Allocated: %s\n", humanize.Bytes(m.TotalAlloc))
+	fmt.Printf("System: %s\n", humanize.Bytes(m.Sys))
+	fmt.Printf("Number of GC cycles: %v\n", m.NumGC)
+
+	rss, err := getRSS()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get rss: %v\n", err)
+		return
+	}
+	fmt.Printf("Resident Set Size (RSS): %s\n", humanize.Bytes(rss))
+	fmt.Println()
+
+}
+
 func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (
 	interpreter.Data, error) {
 	ef, err := info.GetELF()
@@ -48,11 +92,13 @@ func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (
 		return nil, nil
 	}
 
+	getMemStats("Before NewGopclntab")
 	pclntab, err := elfunwindinfo.NewGopclntab(ef)
 	if pclntab == nil {
 		return nil, err
 	}
 
+	getMemStats("After NewGopclntab")
 	g := &goData{pclntab: pclntab}
 	g.refs.Store(1)
 	return g, nil
@@ -113,5 +159,7 @@ func (g *goInstance) Symbolize(frame *host.Frame, frames *libpf.Frames) error {
 		SourceLine:      libpf.SourceLineno(lineNo),
 	})
 	sfCounter.ReportSuccess()
+
+	getMemStats("After Symbolization")
 	return nil
 }
