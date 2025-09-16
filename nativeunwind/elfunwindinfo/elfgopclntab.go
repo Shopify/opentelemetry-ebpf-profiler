@@ -333,8 +333,10 @@ func extractGoPclntab(ef *pfelf.File) (data []byte, err error) {
 
 // Gopclntab is the API for extracting data from .gopclntab
 type Gopclntab struct {
-	dataRef     io.Closer
-	setDontNeed func()
+	dataRef io.Closer
+
+	setDontNeedCounter uint16
+	setDontNeed        func()
 
 	data      []byte
 	textStart uintptr
@@ -529,7 +531,12 @@ func (g *Gopclntab) mapPcval(offs int32, startPc, pc uint) (int32, bool) {
 
 // Symbolize returns the file, line and function information for given PC
 func (g *Gopclntab) Symbolize(pc uintptr) (sourceFile string, line uint, funcName string) {
-	defer g.setDontNeed()
+	defer func() {
+		if g.setDontNeedCounter%512 == 0 {
+			g.setDontNeed()
+		}
+		g.setDontNeedCounter++
+	}()
 	index := sort.Search(g.numFuncs, func(i int) bool {
 		funcPc, _ := g.getFuncMapEntry(i)
 		return funcPc > pc
