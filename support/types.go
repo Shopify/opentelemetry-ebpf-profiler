@@ -271,8 +271,10 @@ type PyProcInfo struct {
 }
 type RubyProcInfo struct {
 	Version                      uint32
-	Current_ec_tls_offset        uint64
 	Current_ctx_ptr              uint64
+	Current_ec_tls_offset        uint64
+	Tls_module_index             uint8
+	Dtv_entry_step               uint8
 	Vm_stack                     uint8
 	Vm_stack_size                uint8
 	Cfp                          uint8
@@ -286,7 +288,6 @@ type RubyProcInfo struct {
 	Iseq_size                    uint8
 	Size_of_value                uint8
 	Running_ec                   uint16
-	Pad_cgo_0                    [2]byte
 }
 type V8ProcInfo struct {
 	Version                    uint32

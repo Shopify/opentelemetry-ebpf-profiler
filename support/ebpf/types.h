@@ -457,10 +457,16 @@ typedef struct RubyProcInfo {
   u32 version;
 
   // current_ctx_ptr holds the address of the symbol ruby_current_execution_context_ptr.
-  u64 current_ec_tls_offset;
+  u64 current_ctx_ptr;
 
   // current_ctx_ptr holds the address of the symbol ruby_current_execution_context_ptr.
-  u64 current_ctx_ptr;
+  u64 current_ec_tls_offset;
+
+  // tls_module holds the index for libruby.so to be able to look up TLS data from DTV.
+  u8 tls_module_index;
+
+  // dtv_entry_step holds the width of a DTV entry (specific to libc version).
+  u8 dtv_entry_step;
 
   // Offsets and sizes of Ruby internal structs
 

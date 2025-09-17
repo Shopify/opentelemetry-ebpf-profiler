@@ -179,11 +179,50 @@ func rubyVersion(major, minor, release uint32) uint32 {
 
 func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libpf.Address,
 	rm remotememory.RemoteMemory) (interpreter.Instance, error) {
+
+	tlsModuleOffset := uint8(1) // 1 is a sensible default, libruby will usually be first lib unless LD_PRELOAD
+
+	// if we cannot detect, assume glibc size for glibc is 16,
+	dtvEntryStep := uint8(16)
+
+	inspector, err := newLinkmapInspector(int(pid), rm)
+	if err != nil {
+		log.Errorf("failed to inspect target process for runtime linker info: %v", err)
+	} else {
+		id, err := inspector.findTLSModuleID("libruby.so") // TODO don't hardcode?
+		if err != nil {
+			log.Errorf("failed to determine loaded libs %v", err)
+			return nil, err
+		} else {
+			log.Debugf("Detected module ID %d", id)
+			tlsModuleOffset = uint8(id)
+		}
+		libs, err := inspector.getLoadedLibraries()
+		if err != nil {
+			log.Errorf("failed to determine loaded libs %v", err)
+		} else {
+			libc := detectLibc(libs)
+			log.Debugf("Detected libc as %s", libc)
+			switch libc {
+			case libcGlibc:
+				// https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/generic/dl-dtv.h#l22
+				dtvEntryStep = uint8(16)
+			case libcMusl:
+				// https://github.com/bminor/musl/blob/master/src/internal/pthread_impl.h#L23
+				dtvEntryStep = uint8(8)
+			default:
+				log.Warnf("Unable to detect DTV step from libc type %s", libc)
+			}
+		}
+	}
+
 	cdata := support.RubyProcInfo{
 		Version: r.version,
 
 		Current_ctx_ptr:       uint64(r.currentCtxPtr + bias),
 		Current_ec_tls_offset: r.currentEcTlsOffset,
+		Tls_module_index:      tlsModuleOffset,
+		Dtv_entry_step:        dtvEntryStep,
 
 		Vm_stack:      r.vmStructs.execution_context_struct.vm_stack,
 		Vm_stack_size: r.vmStructs.execution_context_struct.vm_stack_size,

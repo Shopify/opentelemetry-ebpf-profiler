@@ -226,7 +226,7 @@ save_state:
   return ERR_OK;
 }
 
-static EBPF_INLINE u64 addr_for_tls_symbol(u64 symbol, bool dtv, u32 module_id)
+static EBPF_INLINE u64 addr_for_tls_symbol(u64 symbol, bool dtv, u32 module_id, u32 dtv_step)
 {
   u64 tsd_base;
   if (tsd_get_base((void **)&tsd_base) != 0) {
@@ -267,8 +267,7 @@ static EBPF_INLINE u64 addr_for_tls_symbol(u64 symbol, bool dtv, u32 module_id)
     // DTV[1] = module 1's TLS block
     // DTV[2] = module 2's TLS block
     // ...
-    // size is 16, https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/generic/dl-dtv.h#l22
-    u64 dtv_offset = (module_id) * 16;
+    u64 dtv_offset = module_id * dtv_step;
 
     if ((err = bpf_probe_read_user(&addr, sizeof(void *), (void *)(dtv_addr + dtv_offset)))) {
       DEBUG_PRINT(
@@ -316,10 +315,8 @@ static EBPF_INLINE int unwind_ruby(struct pt_regs *ctx)
 
     u64 tls_symbol = rubyinfo->current_ec_tls_offset;
     DEBUG_PRINT("ruby: got TLS offset %llu", tls_symbol);
-    // assume libruby.so is the first module, which is usually the case.
-    // ruby interpreter also only triggers on libruby.so matches, so no need to check for static
-    // case.
-    u64 tls_current_ec_addr = addr_for_tls_symbol(tls_symbol, true, 1);
+    // ruby interpreter also only triggers on libruby.so matches, so no need to check for static case.
+    u64 tls_current_ec_addr = addr_for_tls_symbol(tls_symbol, true, rubyinfo->tls_module_index, rubyinfo->dtv_entry_step);
     DEBUG_PRINT("ruby: got TLS addr 0x%llx", (u64)tls_current_ec_addr);
 
     if (bpf_probe_read_user(
