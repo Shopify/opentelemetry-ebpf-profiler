@@ -99,6 +99,9 @@ var (
 
 //nolint:lll
 type rubyData struct {
+
+	interpRanges []util.Range
+
 	// currentCtxPtr is the `ruby_current_execution_context_ptr` symbol value which is needed by the
 	// eBPF program to build ruby backtraces.
 	currentCtxPtr libpf.Address
@@ -278,6 +281,23 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 
 		Running_ec: r.vmStructs.rb_ractor_struct.running_ec,
 	}
+
+	memInfo, err := ParseProcessMemory(int(pid))
+	if err != nil {
+		log.Errorf("Failed to analyze memory for pid %d, %v", pid, err)
+	} else {
+		memInfo.PrintYJITRange()
+		start, end, ok := memInfo.GetYJITRangeRelative()
+		if ok {
+			interpRanges := append(r.interpRanges, util.Range{Start: uint64(start), End: uint64(end)})
+			log.Debugf("Ranges %v", interpRanges)
+			//if err = ebpf.UpdateInterpreterOffsets(support.ProgUnwindRuby, info.FileID(),
+			//	interpRanges); err != nil {
+			//	return nil, err
+			//}
+		}
+	}
+
 
 	if err := ebpf.UpdateProcData(libpf.Ruby, pid, unsafe.Pointer(&cdata)); err != nil {
 		return nil, err
@@ -1091,6 +1111,7 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		version:            version,
 		currentCtxPtr:      libpf.Address(currentCtxPtr),
 		currentEcTlsOffset: uint64(currentEcTlsOffset),
+		interpRanges:       interpRanges,
 	}
 
 	vms := &rid.vmStructs

@@ -27,6 +27,7 @@ const (
 	FrameMarkerKernel   = C.FRAME_MARKER_KERNEL
 	FrameMarkerHotSpot  = C.FRAME_MARKER_HOTSPOT
 	FrameMarkerRuby     = C.FRAME_MARKER_RUBY
+	FrameMarkerRubyJIT  = C.FRAME_MARKER_RUBY_JIT
 	FrameMarkerPerl     = C.FRAME_MARKER_PERL
 	FrameMarkerV8       = C.FRAME_MARKER_V8
 	FrameMarkerDotnet   = C.FRAME_MARKER_DOTNET
