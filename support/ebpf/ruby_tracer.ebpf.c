@@ -27,9 +27,12 @@ bpf_map_def SEC("maps") ruby_procs = {
 #define RUBY_FRAME_FLAG_LAMBDA  0x0100
 
 // Record a Ruby cfp frame
-static EBPF_INLINE ErrorCode push_ruby_cfp(Trace *trace, u64 file, u64 line, u64 iseq_body)
+// TODO accept a flag to mask into the upper bits of file so we can indicate
+// what type of "extra" we are sending
+// note that extra contains only 48 bits, and we are using the upper bits of file to store the type info
+static EBPF_INLINE ErrorCode push_ruby_extra(Trace *trace, u64 file, u64 line, u64 extra)
 {
-  return _push_with_extra(trace, file, line, iseq_body, FRAME_MARKER_RUBY);
+  return _push_with_extra(trace, file, line, extra, FRAME_MARKER_RUBY);
 }
 
 // walk_ruby_stack processes a Ruby VM stack, extracts information from the individual frames and
@@ -207,6 +210,25 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
       return ERR_RUBY_READ_ISEQ_SIZE;
     }
 
+    // TODO do the "happy path" of check_method_entry, where it succeeds on the first loop
+    // write a flag to the mask-out of the "File" Id which will indicate what type of address is in extra, if any:
+    // eg: 0x0 -> it contains the cfp, which may be more volatile
+    //     0x1 -> it contains the method entry we were able to resolve
+    //     0x2 -> it contains the ep or something else, in the future
+    // this can be masked out of File in userspace, since we only need 48 bits for the address
+    // when processing the "extra" we can use this to determine if we should just
+    // treat it as a method entry right away, or need to do additional parsing
+
+    // check if it is local, and if it is not, just push the next EP to check as that should be a rarer case
+    // https://github.com/ruby/ruby/blob/master/vm_insnhelper.c#L770
+    // if it is local, check the method entry
+    // https://github.com/ruby/ruby/blob/master/vm_insnhelper.c#L738-L762
+    // if imemo type is IMEMO_MENT, then push the address of the method entry and indicate
+    // the type via the flag
+    // if it is NOT IMEMO_MENT, then push this to userspace and let them try to resolve it
+    // this way we can do some basic checks in bpf, but not need to unroll a loop checking
+    // if all of this fails, push the CFP and hopefully userspace can figure it out, or else fall back to iseq body
+
     // To get the line number iseq_encoded is subtracted from pc. This result also represents the
     // size of the current instruction sequence. If the calculated size of the instruction sequence
     // is greater than the value in iseq_encoded we don't report this pc to user space.
@@ -221,7 +243,7 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
     // For symbolization of the frame we forward the information about the instruction sequence
     // and program counter to user space.
     // From this we can then extract information like file or function name and line number.
-    ErrorCode error = push_ruby_cfp(trace, (u64)stack_ptr, pc, (u64) iseq_body);
+    ErrorCode error = push_ruby_extra(trace, (u64)iseq_body, pc, (u64)stack_ptr );
     if (error) {
       DEBUG_PRINT("ruby: failed to push frame");
       return error;

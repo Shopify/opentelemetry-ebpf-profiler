@@ -810,6 +810,8 @@ func (r *rubyInstance) processCmeFrame(cmeAddr libpf.Address) (libpf.String, lib
 	case vmMethodTypeIseq:
 
 		classDefinition := r.rm.Ptr(cmeAddr + libpf.Address(vms.rb_method_entry_struct.defined_class))
+		// TODO check if the class is a singleton here too, and if it is, use `.` instead of `#` in the function name, per
+		// https://github.com/ruby/ruby/blob/b627532/vm_backtrace.c#L1974-L1975
 		classPath, err = r.readClassName(classDefinition)
 		if err != nil {
 			log.Errorf("Failed to read class name for iseq: %v", err)
@@ -1008,17 +1010,14 @@ func (r *rubyInstance) Symbolize(frame *host.Frame, frames *libpf.Frames) error 
 	var sourceFile libpf.String
 	var sourceLine libpf.SourceLineno
 
-	cfp := libpf.Address(frame.File)
+	iseqBodyAddr := libpf.Address(frame.File) // TODO extract the "extra" type from upper bits of frame.File
+	cfp := libpf.Address(frame.Extra)  // TODO handle "extra"
+	// The Ruby VM program counter that was extracted from the current call frame is embedded in
+	// the Linenos field.
+	pc := libpf.Address(frame.Lineno)
+	log.Debugf("Got (iseq body:0x%08x), (pc: 0x%08x), (cfp: 0x:%08x)", iseqBodyAddr, pc, cfp)
+
 	cme, err := r.checkCmeFrame(cfp)
-
-	iseqBodyAddr := libpf.Address(frame.Extra)
-	log.Debugf("Got iseq body addr 0x%08x", iseqBodyAddr)
-	pc := r.rm.Ptr(cfp)
-
-	// Doesn't seem to happen on x86?
-	//if libpf.AddressOrLineno(pc) != frame.Lineno {
-	//	log.Debugf("PC CHANGED FOR CFP 0x%08x (pc: 0x%08x, 0x%08x) ", cfp, frame.Lineno, pc)
-	//}
 
 	if err != nil {
 		// If the frame type from the eBPF Ruby unwinder is iseq type, we receive
@@ -1044,14 +1043,11 @@ func (r *rubyInstance) Symbolize(frame *host.Frame, frames *libpf.Frames) error 
 		iseqBody = iseqBodyAddr
 	}
 	if iseqBody == 0 {
-		log.Debugf("Couldn't handle CFP 0x%08x (pc: 0x%08x, 0x%08x) as CME frame, falling back to iseq frame, (body: 0x%08x vs 0x%08x) %v", cfp, frame.Lineno, pc, iseqBody, iseqBodyAddr, err)
+		log.Debugf("Couldn't handle CFP 0x%08x (pc: 0x%08x) as CME frame, falling back to iseq frame, (body: 0x%08x vs 0x%08x) %v", cfp, frame.Lineno, iseqBody, iseqBodyAddr, err)
 		return nil
 	}
 
 	if methodName == libpf.NullString {
-		// The Ruby VM program counter that was extracted from the current call frame is embedded in
-		// the Linenos field.
-		pc := frame.Lineno
 
 		key := rubyIseqBodyPC{
 			addr: iseqBody,
@@ -1123,6 +1119,7 @@ func (r *rubyInstance) Symbolize(frame *host.Frame, frames *libpf.Frames) error 
 
 	if classPath != libpf.NullString {
 		// TODO we should properly use a `.` not `#` if it is a singleton class
+		// when processing a CME frame, we should check what it is
 		methodName = libpf.Intern(fmt.Sprintf("%s#%s", classPath, methodName))
 	}
 
