@@ -365,6 +365,14 @@ const (
 	V8LineCookieShift = 0x20
 	V8LineCookieMask  = 0xffffffff00000000
 	V8LineDeltaMask   = 0xffffffff
+
+	RubyAddrMask48Bit     = 0xffffffffffff
+	RubyExtraAddrTypeMask = 0xff000000000000
+
+	RubyExtraAddrTypeNone = 0x0
+	RubyExtraAddrTypeCFP  = 0x1
+	RubyExtraAddrTypeCME  = 0x2
+	RubyExtraAddrTypeEP   = 0x3
 )
 
 var MetricsTranslation = []metrics.MetricID{

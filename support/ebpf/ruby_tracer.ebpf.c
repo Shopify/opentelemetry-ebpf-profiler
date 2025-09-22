@@ -1,5 +1,6 @@
 // This file contains the code and map definitions for the Ruby tracer
 
+#include "ruby_tracer.h"
 #include "bpfdefs.h"
 #include "tracemgmt.h"
 #include "tsd.h"
@@ -26,13 +27,81 @@ bpf_map_def SEC("maps") ruby_procs = {
 #define RUBY_FRAME_FLAG_BMETHOD 0x0040
 #define RUBY_FRAME_FLAG_LAMBDA  0x0100
 
+#define VM_ENV_FLAG_LOCAL 0x02
+#define RUBY_FL_USHIFT    12
+#define IMEMO_MASK        0x0f
+#define IMEMO_CREF        1 /*!< class reference */
+#define IMEMO_SVAR        2 /*!< special variable */
+#define IMEMO_MENT        6
+
+// https://github.com/ruby/ruby/blob/2083fa89fc29005035c1a098185c4b707686a437/vm_core.h#L1415-L1416
+// NOTE - we do byte-indexing in kernel space, but array in userspace offsets by type size
+#define VM_ENV_DATA_INDEX_ME_CREF (-2 * sizeof(size_t)) /* ep[-2] */
+#define VM_ENV_DATA_INDEX_SPECVAL (-1 * sizeof(size_t)) /* ep[-1] */
+
 // Record a Ruby cfp frame
-// TODO accept a flag to mask into the upper bits of file so we can indicate
-// what type of "extra" we are sending
-// note that extra contains only 48 bits, and we are using the upper bits of file to store the type info
-static EBPF_INLINE ErrorCode push_ruby_extra(Trace *trace, u64 file, u64 line, u64 extra)
+// Accept a flag to mask into the upper bits of file so we can indicate,
+// what type of "extra" address we are sending, if any.
+// eg: 0x0 -> nothing extra is packed
+//     0x1 -> it contains the cfp, which may be more volatile
+//     0x2 -> it contains the method entry we were able to resolve
+//     0x3 -> it contains the ep or something else, in the future
+// this can be masked out of File in userspace, since we only need 48 bits for the address
+// when processing the "extra" we can use this to determine if we should just
+// treat it as a method entry right away, or need to do additional parsing
+// Note that extra contains only 48 bits, and we are using the upper bits of file to store the type
+// info
+static EBPF_INLINE ErrorCode
+push_ruby_extra(Trace *trace, u64 file, u64 line, u64 extra, u8 extra_addr_type)
 {
+  if (extra_addr_type != ADDR_TYPE_NONE) {
+    // Ensure address is actually no more than 48-bits
+    u64 addr = file & ADDR_MASK_48_BIT;
+    if (addr != file) {
+      DEBUG_PRINT("ruby: error pushing extra addr, file data was more than 48 bits");
+    } else {
+      // Shift data to bits 48-55
+      u64 packed = addr | ((u64)extra_addr_type << 48);
+      file       = packed;
+    }
+  }
   return _push_with_extra(trace, file, line, extra, FRAME_MARKER_RUBY);
+}
+
+// Check for ruby method entry
+// this uses the heuristic that often the CME will be in the first local entry
+// if it isn't, it will return the EP
+static EBPF_INLINE int check_method_entry(
+  const u64 ep, u64 *extra_addr, u8 *addr_type)
+{
+  u64 env_me_cref = 0;
+
+  if (bpf_probe_read_user(
+        &env_me_cref, sizeof(env_me_cref), (void *)(ep + VM_ENV_DATA_INDEX_ME_CREF))) {
+    DEBUG_PRINT("ruby: failed to get env_me_cref");
+    return -1;
+  }
+
+  if (env_me_cref == 0) {
+    return -1;
+  }
+
+  // should be at offset 0 on the struct, and size of VALUE, so u64 should fit it
+  u64 rbasic_flags = 0;
+
+  DEBUG_PRINT("ruby: checking %llx", env_me_cref);
+  if (bpf_probe_read_user(&rbasic_flags, sizeof(rbasic_flags), (void *)(env_me_cref))) {
+    DEBUG_PRINT("ruby: failed to read flags to check method entry %llx", env_me_cref);
+    return -1;
+  }
+
+  if (((rbasic_flags >> RUBY_FL_USHIFT) & IMEMO_MASK)== IMEMO_MENT) {
+    DEBUG_PRINT("ruby: imemo type is method entry");
+    *addr_type  = ADDR_TYPE_CME;
+    *extra_addr = env_me_cref;
+    return 0;
+  }
+  return -1;
 }
 
 // walk_ruby_stack processes a Ruby VM stack, extracts information from the individual frames and
@@ -146,14 +215,26 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
   // iseq_size holds the size in bytes of a particular instruction sequence
   u32 iseq_size;
   s64 n;
+  u64 extra_addr;
+  u8 extra_addr_type;
 
   UNROLL for (u32 i = 0; i < FRAMES_PER_WALK_RUBY_STACK; ++i)
   {
-    pc        = 0;
-    iseq_addr = NULL;
+    pc              = 0;
+    iseq_addr       = NULL;
+    extra_addr      = 0;
+    extra_addr_type = 0;
 
     bpf_probe_read_user(&iseq_addr, sizeof(iseq_addr), (void *)(stack_ptr + rubyinfo->iseq));
     bpf_probe_read_user(&pc, sizeof(pc), (void *)(stack_ptr + rubyinfo->pc));
+
+    u64 ep = 0;
+    if (bpf_probe_read_user(&ep, sizeof(ep), (void *)(stack_ptr + rubyinfo->ep))) {
+      DEBUG_PRINT("ruby: failed to get ep");
+      increment_metric(metricID_UnwindRubyErrReadEp);
+      return ERR_RUBY_READ_EP;
+    }
+
     // If iseq or pc is 0, then this frame represents a registered hook.
     // https://github.com/ruby/ruby/blob/5445e0435260b449decf2ac16f9d09bae3cafe72/vm.c#L1960
     if (pc == 0 || iseq_addr == NULL) {
@@ -170,13 +251,6 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
         goto skip;
       }
 
-      u64 ep = 0;
-      if (bpf_probe_read_user(&ep, sizeof(ep), (void *)(stack_ptr + rubyinfo->ep))) {
-        DEBUG_PRINT("ruby: failed to get ep");
-        increment_metric(metricID_UnwindRubyErrReadEp);
-        return ERR_RUBY_READ_EP;
-      }
-
       if (
         (ep & (RUBY_FRAME_FLAG_LAMBDA | RUBY_FRAME_FLAG_BMETHOD)) ==
         (RUBY_FRAME_FLAG_LAMBDA | RUBY_FRAME_FLAG_BMETHOD)) {
@@ -188,6 +262,23 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
       stack_ptr += rubyinfo->size_of_control_frame_struct;
       *next_unwinder = PROG_UNWIND_NATIVE;
       goto save_state;
+    }
+
+    // This mimics the "happy path" of check_method_entry, where it succeeds on the first loop
+    // write a flag to the mask-out of the "File" Id which will indicate what type of address is in
+    // extra, if any: check if it is local, and if it is not, just push the next EP to check as that
+    // should be a rarer case https://github.com/ruby/ruby/blob/master/vm_insnhelper.c#L770 if it is
+    // local, check the method entry
+    // https://github.com/ruby/ruby/blob/master/vm_insnhelper.c#L738-L762
+    // if imemo type is IMEMO_MENT, then push the address of the method entry and indicate
+    // the type via the flag
+    // if it is NOT IMEMO_MENT, then push this to userspace and let them try to resolve it
+    // this way we can do some basic checks in bpf, but not need to unroll a loop checking
+    // if all of this fails, push the CFP and hopefully userspace can figure it out, or else fall
+    // back to iseq body
+    if (check_method_entry(ep, &extra_addr, &extra_addr_type) != 0) {
+      extra_addr      = (u64)stack_ptr;
+      extra_addr_type = ADDR_TYPE_CFP;
     }
 
     if (bpf_probe_read_user(&iseq_body, sizeof(iseq_body), (void *)(iseq_addr + rubyinfo->body))) {
@@ -209,26 +300,6 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
       increment_metric(metricID_UnwindRubyErrReadIseqSize);
       return ERR_RUBY_READ_ISEQ_SIZE;
     }
-
-    // TODO do the "happy path" of check_method_entry, where it succeeds on the first loop
-    // write a flag to the mask-out of the "File" Id which will indicate what type of address is in extra, if any:
-    // eg: 0x0 -> it contains the cfp, which may be more volatile
-    //     0x1 -> it contains the method entry we were able to resolve
-    //     0x2 -> it contains the ep or something else, in the future
-    // this can be masked out of File in userspace, since we only need 48 bits for the address
-    // when processing the "extra" we can use this to determine if we should just
-    // treat it as a method entry right away, or need to do additional parsing
-
-    // check if it is local, and if it is not, just push the next EP to check as that should be a rarer case
-    // https://github.com/ruby/ruby/blob/master/vm_insnhelper.c#L770
-    // if it is local, check the method entry
-    // https://github.com/ruby/ruby/blob/master/vm_insnhelper.c#L738-L762
-    // if imemo type is IMEMO_MENT, then push the address of the method entry and indicate
-    // the type via the flag
-    // if it is NOT IMEMO_MENT, then push this to userspace and let them try to resolve it
-    // this way we can do some basic checks in bpf, but not need to unroll a loop checking
-    // if all of this fails, push the CFP and hopefully userspace can figure it out, or else fall back to iseq body
-
     // To get the line number iseq_encoded is subtracted from pc. This result also represents the
     // size of the current instruction sequence. If the calculated size of the instruction sequence
     // is greater than the value in iseq_encoded we don't report this pc to user space.
@@ -243,7 +314,7 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
     // For symbolization of the frame we forward the information about the instruction sequence
     // and program counter to user space.
     // From this we can then extract information like file or function name and line number.
-    ErrorCode error = push_ruby_extra(trace, (u64)iseq_body, pc, (u64)stack_ptr );
+    ErrorCode error = push_ruby_extra(trace, (u64)iseq_body, pc, extra_addr, extra_addr_type);
     if (error) {
       DEBUG_PRINT("ruby: failed to push frame");
       return error;
@@ -359,8 +430,10 @@ static EBPF_INLINE int unwind_ruby(struct pt_regs *ctx)
     u64 tls_symbol = rubyinfo->current_ec_tls_offset;
     DEBUG_PRINT("ruby: got TLS offset %llu", tls_symbol);
     // assume libruby.so is the first module, which is usually the case.
-    // ruby interpreter also only triggers on libruby.so matches, so no need to check for static case.
-    u64 tls_current_ec_addr = addr_for_tls_symbol(tls_symbol, true, rubyinfo->tls_module_index, rubyinfo->dtv_entry_step);
+    // ruby interpreter also only triggers on libruby.so matches, so no need to check for static
+    // case.
+    u64 tls_current_ec_addr =
+      addr_for_tls_symbol(tls_symbol, true, rubyinfo->tls_module_index, rubyinfo->dtv_entry_step);
     DEBUG_PRINT("ruby: got TLS addr 0x%llx", (u64)tls_current_ec_addr);
 
     if (bpf_probe_read_user(
@@ -369,8 +442,7 @@ static EBPF_INLINE int unwind_ruby(struct pt_regs *ctx)
     }
 
     DEBUG_PRINT("ruby: EC from TLS: 0x%llx", (u64)current_ctx_addr);
-  }
-  else if (rubyinfo->version >= 0x30000) {
+  } else if (rubyinfo->version >= 0x30000) {
     // https://github.com/ruby/ruby/commit/7b3948750e1b1dd8cb271c0a7377b911bb3b8f1b
     // there is no guarantee than an EC exists before 3.0.3
     // ruby versions 3.0.0 - 3.0.3 will use a maybe invalid EC if multiple ractors / threads
@@ -386,8 +458,7 @@ static EBPF_INLINE int unwind_ruby(struct pt_regs *ctx)
           (void *)(single_main_ractor + rubyinfo->running_ec))) {
       goto exit;
     }
-  }
-  else {
+  } else {
     if (bpf_probe_read_user(
           &current_ctx_addr, sizeof(current_ctx_addr), (void *)rubyinfo->current_ctx_ptr)) {
       goto exit;

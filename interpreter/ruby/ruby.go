@@ -968,11 +968,7 @@ func (r *rubyInstance) checkMethodEntry(envMeCref libpf.Address, svarAllowed boo
 	return envMeCref, fmt.Errorf("unable to find a candidate CME")
 }
 
-func (r *rubyInstance) checkCmeFrame(cfp libpf.Address) (libpf.Address, error) {
-
-	vms := &r.r.vmStructs
-
-	ep := r.rm.Ptr(cfp + libpf.Address(vms.control_frame_struct.ep))
+func (r *rubyInstance) checkCmeFrame(ep libpf.Address) (libpf.Address, error) {
 	envSpecval := r.rm.Ptr(ep - libpf.Address(VM_ENV_DATA_INDEX_SPECVAL))
 	envMeCref := r.rm.Ptr(ep - libpf.Address(VM_ENV_DATA_INDEX_ME_CREF))
 
@@ -1004,51 +1000,58 @@ func (r *rubyInstance) Symbolize(frame *host.Frame, frames *libpf.Frames) error 
 	sfCounter := successfailurecounter.New(&r.successCount, &r.failCount)
 	defer sfCounter.DefaultToFailure()
 
+	var cme libpf.Address
 	var iseqBody libpf.Address
 	var classPath libpf.String
 	var methodName libpf.String
 	var sourceFile libpf.String
 	var sourceLine libpf.SourceLineno
+	var err error
 
-	iseqBodyAddr := libpf.Address(frame.File) // TODO extract the "extra" type from upper bits of frame.File
-	cfp := libpf.Address(frame.Extra)  // TODO handle "extra"
+	iseqBodyAddr := libpf.Address(frame.File & support.RubyAddrMask48Bit)
+	extraAddrType := uint8(frame.File >> 48)
+	extraAddr := libpf.Address(frame.Extra)
 	// The Ruby VM program counter that was extracted from the current call frame is embedded in
 	// the Linenos field.
 	pc := libpf.Address(frame.Lineno)
-	log.Debugf("Got (iseq body:0x%08x), (pc: 0x%08x), (cfp: 0x:%08x)", iseqBodyAddr, pc, cfp)
+	log.Debugf("Got (iseq body:0x%08x), (pc: 0x%08x), (extra: 0x:%08x) (extra_type: %d)", iseqBodyAddr, pc, extraAddr, extraAddrType)
 
-	cme, err := r.checkCmeFrame(cfp)
+	switch extraAddrType {
+	case support.RubyExtraAddrTypeCME:
+		cme = extraAddr
+	case support.RubyExtraAddrTypeCFP:
+		ep := r.rm.Ptr(extraAddr + libpf.Address(vms.control_frame_struct.ep))
+		cme, err = r.checkCmeFrame(ep)
+	case support.RubyExtraAddrTypeEP:
+		cme, err = r.checkCmeFrame(extraAddr)
+	case support.RubyExtraAddrTypeNone:
+		fallthrough
+	default:
+		err = fmt.Errorf("not possible to retrieve any CME from extra addr, type was %d", extraAddrType)
+	}
 
 	if err != nil {
-		// If the frame type from the eBPF Ruby unwinder is iseq type, we receive
-		// the address to the instruction sequence body in the Files field.
-		//
+		log.Debugf("Unable to obtain a CME from extra addr 0x%08x: %v ", extraAddr, err)
+		// Fallback to decoding the iseq body if we cannot get a CME
 		// rb_iseq_constant_body
 		// https://github.com/ruby/ruby/blob/5445e0435260b449decf2ac16f9d09bae3cafe72/vm_core.h#L311
-		iseqAddr := r.rm.Ptr(cfp + libpf.Address(vms.control_frame_struct.iseq))
-		iseqBody = r.rm.Ptr(iseqAddr + libpf.Address(vms.iseq_struct.body))
+		iseqBody = iseqBodyAddr
 	} else {
 		log.Debugf("Got ruby CME at 0x%08x", cme)
 		var err error
 		classPath, methodName, iseqBody, err = r.processCmeFrame(cme)
 		if err != nil {
 			log.Warnf("Tried and failed to process as CME frame %v", err)
-			iseqAddr := r.rm.Ptr(cfp + libpf.Address(vms.control_frame_struct.iseq))
-			iseqBody = r.rm.Ptr(iseqAddr + libpf.Address(vms.iseq_struct.body))
+			iseqBody = iseqBodyAddr
 		}
 	}
 
-	if iseqBody == 0 && iseqBodyAddr != 0 {
-		log.Debugf("Falling back to iseqbody jammed into padding")
-		iseqBody = iseqBodyAddr
-	}
 	if iseqBody == 0 {
-		log.Debugf("Couldn't handle CFP 0x%08x (pc: 0x%08x) as CME frame, falling back to iseq frame, (body: 0x%08x vs 0x%08x) %v", cfp, frame.Lineno, iseqBody, iseqBodyAddr, err)
+		log.Debugf("Couldn't handle  (pc: 0x%08x) as CME frame, falling back to iseq frame, (body: 0x%08x vs 0x%08x) %v", frame.Lineno, iseqBody, iseqBodyAddr, err)
 		return nil
 	}
 
 	if methodName == libpf.NullString {
-
 		key := rubyIseqBodyPC{
 			addr: iseqBody,
 			pc:   uint64(pc),
