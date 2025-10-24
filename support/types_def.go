@@ -14,6 +14,7 @@ import (
 #include "./ebpf/frametypes.h"
 #include "./ebpf/stackdeltatypes.h"
 #include "./ebpf/v8_tracer.h"
+#include "./ebpf/ruby_tracer.h"
 */
 import "C"
 
@@ -190,6 +191,21 @@ const (
 	V8LineCookieShift = C.V8_LINE_COOKIE_SHIFT
 	V8LineCookieMask  = C.V8_LINE_COOKIE_MASK
 	V8LineDeltaMask   = C.V8_LINE_DELTA_MASK
+
+	RubyAddrMask48Bit     = C.ADDR_MASK_48_BIT
+	RubyExtraAddrTypeMask = C.EXTRA_TYPE_MASK
+
+	RubyFrameTypeNone     = C.FRAME_TYPE_NONE
+	RubyFrameTypeCmeIseq  = C.FRAME_TYPE_CME_ISEQ
+	RubyFrameTypeCmeCfunc = C.FRAME_TYPE_CME_CFUNC
+	RubyFrameTypeIseq     = C.FRAME_TYPE_ISEQ
+	RubyFrameTypeJit      = C.FRAME_TYPE_JIT
+	RubyFrameTypeGc       = C.FRAME_TYPE_GC
+
+	RubyGcModeNone       = C.GC_MODE_NONE
+	RubyGcModeMarking    = C.GC_MODE_MARKING
+	RubyGcModeSweeping   = C.GC_MODE_SWEEPING
+	RubyGcModeCompacting = C.GC_MODE_COMPACTING
 )
 
 var MetricsTranslation = []metrics.MetricID{
