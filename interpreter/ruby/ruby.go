@@ -4,6 +4,7 @@
 package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 
 import (
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -164,7 +165,14 @@ type rubyData struct {
 	// eBPF program to build ruby backtraces.
 	currentCtxPtr libpf.Address
 
+	// Offset of the current EC directly from TPBase
 	currentEcTpBaseTlsOffset libpf.Address
+
+	// Offset of the current EC within TLS for this module
+	currentEcTlsOffset libpf.Address
+
+	// TLS Module ID offset in ELF, to read mod ID after loaded and written by linker
+	tlsModuleIdOffset libpf.Address
 
 	// Address to global symbols, for id to string mappings
 	globalSymbolsAddr libpf.Address
@@ -306,11 +314,19 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		tlsOffset = rm.Uint64(bias + r.currentEcTpBaseTlsOffset + 8)
 	}
 
+	var modId uint64
+	if r.tlsModuleIdOffset != 0 {
+		modId = rm.Uint64(bias + r.tlsModuleIdOffset)
+		log.Debugf("Read TLS module as %d", modId)
+	}
+
 	cdata := support.RubyProcInfo{
 		Version: r.version,
 
 		Current_ctx_ptr:              uint64(r.currentCtxPtr + bias),
 		Current_ec_tpbase_tls_offset: tlsOffset,
+		Current_ec_tls_offset: uint64(r.currentEcTlsOffset),
+		Tls_module_id: modId,
 
 		Vm_stack:      r.vmStructs.execution_context_struct.vm_stack,
 		Vm_stack_size: r.vmStructs.execution_context_struct.vm_stack_size,
@@ -1716,12 +1732,30 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	}); err != nil {
 		log.Warnf("failed to locate TLS descriptor: %v", err)
 	}
+	
+
+	var tlsModuleIdOffset libpf.Address
+	if err = ef.VisitRelocations(func(r pfelf.ElfReloc, symName string) bool {
+		// We've already verified that the relocation is DTPMOD type
+		// so if we get here, we should be able to read the module ID from this offset
+		log.Debugf("Found module id at %x", r.Off)
+		tlsModuleIdOffset = libpf.Address(r.Off)
+		return false
+	}, func(rela pfelf.ElfReloc) bool {
+		ty := rela.Info & 0xffff
+		return (ef.Machine == elf.EM_AARCH64 && elf.R_AARCH64(ty) == elf.R_AARCH64_TLS_DTPMOD64) ||
+			(ef.Machine == elf.EM_X86_64 && elf.R_X86_64(ty) == elf.R_X86_64_DTPMOD64)
+	}); err != nil {
+		log.Warnf("failed to mod offset: %v", err)
+	}
 
 	log.Debugf("Discovered EC tls tpbase offset %x, fallback ctx %x, interp ranges: %v", currentEcTpBaseTlsOffset, currentCtxPtr, interpRanges)
 
 	rid := &rubyData{
 		version:            version,
 		currentEcTpBaseTlsOffset:     libpf.Address(currentEcTpBaseTlsOffset),
+		tlsModuleIdOffset:  tlsModuleIdOffset,
+		currentEcTlsOffset: libpf.Address(currentEcSymbolAddress),
 		currentCtxPtr:      libpf.Address(currentCtxPtr),
 		globalSymbolsAddr:  libpf.Address(globalSymbolsAddr),
 	}
