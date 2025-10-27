@@ -10,6 +10,43 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
+// analyzeDTVOffsetX86 analyzes __tls_get_addr to find the DTV offset from FS base
+func analyzeDTVOffsetX86(code []byte) (uint32, error) {
+	// We're looking for: mov %fs:offset,%reg
+	// This loads the DTV pointer from thread-local storage
+
+	offset := 0
+	for offset < len(code) {
+		inst, err := x86asm.Decode(code[offset:], 64)
+		if err != nil {
+			// Try next byte in case of misalignment
+			offset++
+			continue
+		}
+
+		// Check if this is a MOV instruction
+		if inst.Op == x86asm.MOV {
+			// Check if source operand is a memory reference with FS segment
+			if mem, ok := inst.Args[1].(x86asm.Mem); ok {
+				if mem.Segment == x86asm.FS {
+					// Found it! Extract the displacement (offset)
+					return uint32(mem.Disp), nil
+				}
+			}
+		}
+
+		offset += inst.Len
+
+		if inst.Op == x86asm.CMP {
+			// Typically this instruction should be near the beginning
+			// If we've gone too far, something's wrong
+			break
+		}
+	}
+
+	return 0, errors.New("DTV offset not found: no mov from FS segment found")
+}
+
 func extractTSDInfoX86(code []byte) (TSDInfo, error) {
 	it := amd.NewInterpreterWithCode(code)
 	key := it.Regs.Get(amd.RDI)

@@ -84,6 +84,7 @@ func IsPotentialTSDDSO(filename string) bool {
 	return libcRegex.MatchString(filename)
 }
 
+// TODO rename to be more general to libc
 // ExtractTSDInfo extracts the introspection data for pthread thread specific data.
 func ExtractTSDInfo(ef *pfelf.File) (*TSDInfo, error) {
 	_, code, err := ef.SymbolData("__pthread_getspecific", 2048)
