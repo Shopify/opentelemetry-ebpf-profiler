@@ -462,8 +462,11 @@ typedef struct RubyProcInfo {
 
   // is reading gc state from objspace supported for this version?
   bool has_objspace;
-  // Offsets and sizes of Ruby internal structs
 
+  // JIT regions, for detecting if a native PC was JIT
+  u64 jit_start, jit_end;
+
+  // Offsets and sizes of Ruby internal structs
   // rb_execution_context_struct offsets:
   u8 vm_stack, vm_stack_size, cfp, thread_ptr;
 
@@ -697,6 +700,8 @@ typedef struct RubyUnwindState {
   void *last_stack_frame;
   // Frame for last cfunc before we switched to native unwinder
   u64 cfunc_saved_frame;
+  // Detect if JIT code ran in the process (at any time)
+  bool jit_detected;
 } RubyUnwindState;
 
 // Container for additional scratch space needed by the HotSpot unwinder.
