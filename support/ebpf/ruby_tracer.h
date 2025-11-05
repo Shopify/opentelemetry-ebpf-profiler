@@ -5,3 +5,4 @@
 #define FRAME_TYPE_CME_ISEQ  1
 #define FRAME_TYPE_CME_CFUNC 2
 #define FRAME_TYPE_ISEQ      3
+#define FRAME_TYPE_JIT       5
