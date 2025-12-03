@@ -505,6 +505,7 @@ static EBPF_INLINE int unwind_ruby(struct pt_regs *ctx)
 
     u64 tls_current_ec_addr = tsd_base + rubyinfo->current_ec_tpbase_tls_offset;
 
+    DEBUG_PRINT("ruby: reading EC from TLS %lld", rubyinfo->current_ec_tpbase_tls_offset);
     if (bpf_probe_read_user(
           &current_ctx_addr, sizeof(current_ctx_addr), (void *)(tls_current_ec_addr))) {
       goto exit;
