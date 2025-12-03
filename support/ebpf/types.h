@@ -455,7 +455,7 @@ typedef struct RubyProcInfo {
   u32 version;
 
   // tls_offset holds TLS base + ruby_current_ec tls symbol, as an offset from tpbase
-  u64 current_ec_tpbase_tls_offset;
+  s64 current_ec_tpbase_tls_offset;
 
   // current_ec_tls_offset is the offset of the current EC within the TLS
   u64 current_ec_tls_offset;
