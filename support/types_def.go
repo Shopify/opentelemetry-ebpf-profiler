@@ -105,10 +105,17 @@ const (
 	TraceOriginProbe    = C.TRACE_PROBE
 )
 
+const (
+	CustomLabelsTypeNone   = C.CUSTOM_LABELS_TYPE_NONE
+	CustomLabelsTypeNative = C.CUSTOM_LABELS_TYPE_NATIVE
+	CustomLabelsTypeGo     = C.CUSTOM_LABELS_TYPE_GO
+)
+
 type ApmSpanID C.ApmSpanID
 type ApmTraceID C.ApmTraceID
 type CustomLabel C.CustomLabel
 type CustomLabelsArray C.CustomLabelsArray
+type CustomLabelsData C.CustomLabelsData
 type Event C.Event
 type OffsetRange C.OffsetRange
 type PIDPage C.PIDPage
@@ -131,6 +138,7 @@ type PHPProcInfo C.PHPProcInfo
 type PerlProcInfo C.PerlProcInfo
 type PyProcInfo C.PyProcInfo
 type RubyProcInfo C.RubyProcInfo
+type ThreadContextProcInfo C.ThreadContextProcInfo
 type V8ProcInfo C.V8ProcInfo
 type LuaJITProcInfo C.LuaJITProcInfo
 
@@ -324,4 +332,11 @@ var MetricsTranslation = []metrics.MetricID{
 	C.metricID_UnwindNativeErrNoVMA:                       metrics.IDUnwindNativeErrNoVMA,
 	C.metricID_UnwindNativeErrUnsupportedAnonymousMapping: metrics.IDUnwindNativeErrUnsupportedAnonymousMapping,
 	C.metricID_UnwindNativeErrNonExecutableVMA:            metrics.IDUnwindNativeErrNonExecutableVMA,
+	C.metricID_UnwindThreadContextErrReadTsdBase:          metrics.IDUnwindThreadContextErrReadTsdBase,
+	C.metricID_UnwindThreadContextErrReadThreadCtxBufPtr:  metrics.IDUnwindThreadContextErrReadThreadCtxBufPtr,
+	C.metricID_UnwindThreadContextErrReadThreadCtxBuf:     metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
+	C.metricID_UnwindThreadContextErrReadThreadCtxAttrs:   metrics.IDUnwindThreadContextErrReadThreadCtxAttrs,
+	C.metricID_UnwindThreadContextErrReadDtvPtr:           metrics.IDUnwindThreadContextErrReadDtvPtr,
+	C.metricID_UnwindThreadContextErrReadModuleTlsBase:    metrics.IDUnwindThreadContextErrReadModuleTlsBase,
+	C.metricID_UnwindThreadContextReadSuccesses:           metrics.IDUnwindThreadContextReadSuccesses,
 }

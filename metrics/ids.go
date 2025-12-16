@@ -686,6 +686,27 @@ const (
 	// Number of times we didn't find an entry for this process in the LuaJIT process info array
 	IDUnwindLuaJITErrNoProcInfo = 299
 
+	// Number of failures to get TSD base for thread context
+	IDUnwindThreadContextErrReadTsdBase = 300
+
+	// Number of failures to read the thread context buffer pointer
+	IDUnwindThreadContextErrReadThreadCtxBufPtr = 301
+
+	// Number of failures to read the thread context buffer
+	IDUnwindThreadContextErrReadThreadCtxBuf = 302
+
+	// Number of failures to read the thread context attributes
+	IDUnwindThreadContextErrReadThreadCtxAttrs = 303
+
+	// Number of failures to read the DTV pointer
+	IDUnwindThreadContextErrReadDtvPtr = 304
+
+	// Number of failures to read the module TLS base
+	IDUnwindThreadContextErrReadModuleTlsBase = 305
+
+	// Number of successful reads of thread context info
+	IDUnwindThreadContextReadSuccesses = 306
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 300
+	IDMax = 307
 )
