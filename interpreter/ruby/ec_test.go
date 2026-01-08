@@ -13,6 +13,16 @@ func TestExtractEcOffset(t *testing.T) {
 		code    []byte
 		offset  int64
 	}{
+		"ruby 4.0 static / x86_64": {
+			machine: elf.EM_X86_64,
+			code: []byte{
+				// mov    %fs:0xffffffffffffff88,%rax
+				// ret
+				0x64, 0x48, 0x8b, 0x04, 0x25, 0x88, 0xff, 0xff, 0xff,
+				0xc3,
+			},
+			offset: -120,
+		},
 		"ruby 3.4.7 static / x86_64": {
 			//machine: elf.EM_AARCH64,
 			machine: elf.EM_X86_64,
