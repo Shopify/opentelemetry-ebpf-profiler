@@ -1399,7 +1399,7 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	//   https://www.jetbrains.com/lp/devecosystem-2020/ruby/
 	// Reason for maximum supported version 3.5.x:
 	// - this is currently the newest stable version
-	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(3, 6, 0)
+	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(4, 1, 0)
 	if version < minVer || version >= maxVer {
 		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and <= %d.%d.%d)",
 			(version>>16)&0xff, (version>>8)&0xff, version&0xff,
