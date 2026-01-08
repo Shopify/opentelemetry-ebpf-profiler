@@ -86,7 +86,8 @@ const (
 
 var (
 	// regex to identify the Ruby interpreter executable
-	rubyRegex = regexp.MustCompile(`^(?:.*/)?libruby(?:-.*)?\.so\.(\d)\.(\d)\.(\d)$`)
+	libRubyRegex = regexp.MustCompile(`^(?:.*/)?libruby(?:-.*)?\.so\.(\d)\.(\d)\.(\d)$`)
+	binRubyRegex = regexp.MustCompile(`^(?:.*/)?(?:bin/)?ruby$`)
 	// regex to extract a version from a string
 	rubyVersionRegex = regexp.MustCompile(`^(\d)\.(\d)\.(\d)$`)
 
@@ -113,6 +114,9 @@ type rubyData struct {
 
 	// Address to the ruby_current_ec variable in TLS, as an offset from tpbase
 	currentEcTpBaseTlsOffset libpf.Address
+
+	// In local exec / static mode, the EC is an absolute offset from tpbase
+	absoluteTpBaseOffset int64
 
 	// Address to global symbols, for id to string mappings
 	globalSymbolsAddr libpf.Address
@@ -291,10 +295,14 @@ func (r *rubyData) String() string {
 func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libpf.Address,
 	rm remotememory.RemoteMemory,
 ) (interpreter.Instance, error) {
-	var tlsOffset uint64
-	if r.currentEcTpBaseTlsOffset != 0 {
+	var tlsOffset int64
+	if r.absoluteTpBaseOffset == 0 && r.currentEcTpBaseTlsOffset != 0 {
 		// Read TLS offset from the TLS descriptor.
-		tlsOffset = rm.Uint64(bias + r.currentEcTpBaseTlsOffset + 8)
+		tlsOffset = int64(rm.Uint64(bias + r.currentEcTpBaseTlsOffset + 8))
+	}
+
+	if r.absoluteTpBaseOffset != 0 {
+		tlsOffset = r.absoluteTpBaseOffset
 	}
 
 	var modId uint64
@@ -1371,7 +1379,8 @@ func determineRubyVersion(ef *pfelf.File) (uint32, error) {
 }
 
 func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
-	if !rubyRegex.MatchString(info.FileName()) {
+	var isBinRuby = binRubyRegex.MatchString(info.FileName())
+	if !libRubyRegex.MatchString(info.FileName()) && !isBinRuby {
 		return nil, nil
 	}
 
@@ -1414,6 +1423,7 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 
 	var globalSymbols libpf.SymbolValue
 	var currentEcTpBaseTlsOffset libpf.Address
+	var absoluteTpBaseOffset int64
 	var interpRanges []util.Range
 
 	globalSymbolsName := libpf.SymbolName("ruby_global_symbols")
@@ -1512,12 +1522,21 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		log.Warnf("failed to mod offset: %v", err)
 	}
 
+	if isBinRuby {
+		offset, err := extractEcOffset(ef)
+		if err != nil {
+			return nil, fmt.Errorf("unable to extract ec offset for static ruby %v", err)
+		}
+		absoluteTpBaseOffset = offset
+	}
+
 	log.Debugf("Discovered EC tls tpbase offset %x, fallback ctx %x, interp ranges: %v, global symbols: %x", currentEcTpBaseTlsOffset, currentCtxPtr, interpRanges, globalSymbols)
 
 	rid := &rubyData{
 		version:                  version,
 		currentEcTpBaseTlsOffset: libpf.Address(currentEcTpBaseTlsOffset),
 		tlsModuleIdOffset:        tlsModuleIdOffset,
+		absoluteTpBaseOffset:     absoluteTpBaseOffset,
 		currentEcTlsOffset:       libpf.Address(currentEcSymbolAddress),
 		currentCtxPtr:            libpf.Address(currentCtxPtr),
 		hasGlobalSymbols:         globalSymbols != 0,
