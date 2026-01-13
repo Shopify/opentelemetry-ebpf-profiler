@@ -1,4 +1,4 @@
-package ruby
+package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 
 import (
 	"debug/elf"
