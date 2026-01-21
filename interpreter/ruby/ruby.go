@@ -4,6 +4,7 @@
 package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 
 import (
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,9 +25,12 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
+	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	npsr "go.opentelemetry.io/ebpf-profiler/nopanicslicereader"
+	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
+	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/successfailurecounter"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/util"
@@ -87,16 +91,31 @@ const (
 	// ID_ENTRY_SIZE
 	// https://github.com/ruby/ruby/blob/980e18496e1aafc642b199d24c81ab4a8afb3abb/symbol.c#L93
 	idEntrySize = uint64(2)
+
+	// https://github.com/ruby/ruby/blob/20cda200d3ce092571d0b5d342dadca69636cb0f/gc/default/default.c#L438-L443
+	rubyGcModeNone       = 0
+	rubyGcModeMarking    = 1
+	rubyGcModeSweeping   = 2
+	rubyGcModeCompacting = 3
 )
 
 var (
 	// regex to identify the Ruby interpreter executable
-	rubyRegex = regexp.MustCompile(`^(?:.*/)?libruby(?:-.*)?\.so\.(\d)\.(\d)\.(\d)$`)
+	libRubyRegex = regexp.MustCompile(`^(?:.*/)?libruby(?:-.*)?\.so\.(\d)\.(\d)\.(\d)$`)
+	binRubyRegex = regexp.MustCompile(`^(?:.*/)?(?:bin/)?ruby$`)
 	// regex to extract a version from a string
 	rubyVersionRegex = regexp.MustCompile(`^(\d)\.(\d)\.(\d)$`)
 
-	unknownCfunc   = libpf.Intern("<unknown cfunc>")
-	cfuncDummyFile = libpf.Intern("<cfunc>")
+	unknownCfunc      = libpf.Intern("<unknown cfunc>")
+	cfuncDummyFile    = libpf.Intern("<cfunc>")
+	rubyGcFrame       = libpf.Intern("(garbage collection)")
+	rubyGcRunning     = libpf.Intern("(running)")
+	rubyGcMarking     = libpf.Intern("(marking)")
+	rubyGcSweeping    = libpf.Intern("(sweeping)")
+	rubyGcCompacting  = libpf.Intern("(compacting)")
+	rubyGcDummyFile   = libpf.Intern("<gc>")
+	rubyJitDummyFrame = libpf.Intern("<unknown jit code>")
+	rubyJitDummyFile  = libpf.Intern("<jitted code>")
 	// compiler check to make sure the needed interfaces are satisfied
 	_ interpreter.Data     = &rubyData{}
 	_ interpreter.Instance = &rubyInstance{}
@@ -111,8 +130,18 @@ type rubyData struct {
 	// Address to the ruby_current_ec variable in TLS, as an offset from tpbase
 	currentEcTpBaseTlsOffset libpf.Address
 
+	// In local exec / static mode, the EC is an absolute offset from tpbase
+	absoluteTpBaseOffset int64
+
 	// Address to global symbols, for id to string mappings
 	globalSymbolsAddr libpf.Address
+
+	// Offset of the current EC within TLS for this module
+	currentEcTlsOffset libpf.Address
+
+	// TLS Module ID offset in ELF, to read mod ID after loaded and written by linker
+	tlsModuleIdOffset libpf.Address
+
 	// version of the currently used Ruby interpreter.
 	// major*0x10000 + minor*0x100 + release (e.g. 3.0.1 -> 0x30001)
 	version uint32
@@ -127,6 +156,9 @@ type rubyData struct {
 	// Is it possible to read the classpath
 	hasClassPath bool
 
+	// Is it possible to objspace information
+	hasObjspace bool
+
 	// Is it possible to read the global symbol table (to symbolize cfuncs)
 	hasGlobalSymbols bool
 
@@ -135,7 +167,23 @@ type rubyData struct {
 		// rb_execution_context_struct
 		// https://github.com/ruby/ruby/blob/5445e0435260b449decf2ac16f9d09bae3cafe72/vm_core.h#L843
 		execution_context_struct struct {
-			vm_stack, vm_stack_size, cfp uint8
+			vm_stack, vm_stack_size, cfp, thread_ptr uint8
+		}
+
+		// https://github.com/ruby/ruby/blob/v3_4_5/vm_core.h#L1108
+		thread_struct struct {
+			vm uint8
+		}
+
+		// https://github.com/ruby/ruby/blob/v3_4_5/vm_core.h#L666
+		vm_struct struct {
+			gc_objspace uint16
+		}
+
+		// https://github.com/ruby/ruby/blob/v3_4_5/gc/default/default.c#L445
+		objspace struct {
+			flags         uint8
+			size_of_flags uint8
 		}
 
 		// rb_control_frame_struct
@@ -264,10 +312,20 @@ func (r *rubyData) String() string {
 func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libpf.Address,
 	rm remotememory.RemoteMemory,
 ) (interpreter.Instance, error) {
-	var tlsOffset uint64
-	if r.currentEcTpBaseTlsOffset != 0 {
+	var tlsOffset int64
+	if r.absoluteTpBaseOffset == 0 && r.currentEcTpBaseTlsOffset != 0 {
 		// Read TLS offset from the TLS descriptor.
-		tlsOffset = rm.Uint64(bias + r.currentEcTpBaseTlsOffset + 8)
+		tlsOffset = int64(rm.Uint64(bias + r.currentEcTpBaseTlsOffset + 8))
+	}
+
+	if r.absoluteTpBaseOffset != 0 {
+		tlsOffset = r.absoluteTpBaseOffset
+	}
+
+	var modId uint64
+	if r.tlsModuleIdOffset != 0 {
+		modId = rm.Uint64(bias + r.tlsModuleIdOffset)
+		log.Debugf("Read TLS module as %d", modId)
 	}
 
 	cdata := support.RubyProcInfo{
@@ -275,6 +333,8 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 
 		Current_ctx_ptr:              uint64(r.currentCtxPtr + bias),
 		Current_ec_tpbase_tls_offset: tlsOffset,
+		Current_ec_tls_offset:        uint64(r.currentEcTlsOffset),
+		Tls_module_id:                modId,
 
 		Vm_stack:      r.vmStructs.execution_context_struct.vm_stack,
 		Vm_stack_size: r.vmStructs.execution_context_struct.vm_stack_size,
@@ -284,6 +344,14 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		Iseq:                         r.vmStructs.control_frame_struct.iseq,
 		Ep:                           r.vmStructs.control_frame_struct.ep,
 		Size_of_control_frame_struct: r.vmStructs.control_frame_struct.size_of_control_frame_struct,
+		Thread_ptr:                   r.vmStructs.execution_context_struct.thread_ptr,
+
+		Thread_vm:    r.vmStructs.thread_struct.vm,
+		Has_objspace: r.hasObjspace,
+		Vm_objspace:  r.vmStructs.vm_struct.gc_objspace,
+
+		Objspace_flags:         r.vmStructs.objspace.flags,
+		Objspace_size_of_flags: r.vmStructs.objspace.size_of_flags,
 
 		Body:           r.vmStructs.iseq_struct.body,
 		Cme_method_def: r.vmStructs.rb_method_entry_struct.def,
@@ -306,8 +374,11 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 	return &rubyInstance{
 		r:                 r,
 		rm:                rm,
+		procInfo:          &cdata,
 		globalSymbolsAddr: r.globalSymbolsAddr + bias,
 		addrToString:      addrToString,
+		mappings:          make(map[process.Mapping]*uint32),
+		prefixes:          make(map[lpm.Prefix]*uint32),
 		memPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, 512)
@@ -351,6 +422,9 @@ type rubyInstance struct {
 
 	// lastId is a cached copy index of the final entry in the global symbol table
 	lastId uint32
+	// Store the procinfo so we can update it if mappings are updated
+	procInfo *support.RubyProcInfo
+
 	// globalSymbolsAddr is the offset of the global symbol table, for looking up ruby symbolic ids
 	globalSymbolsAddr libpf.Address
 
@@ -363,6 +437,13 @@ type rubyInstance struct {
 	// maxSize is the largest number we did see in the last reporting interval for size
 	// in getRubyLineNo.
 	maxSize atomic.Uint32
+
+	// mappings is indexed by the Mapping to its generation
+	mappings map[process.Mapping]*uint32
+	// prefixes is indexed by the prefix added to ebpf maps (to be cleaned up) to its generation
+	prefixes map[lpm.Prefix]*uint32
+	// mappingGeneration is the current generation (so old entries can be pruned)
+	mappingGeneration uint32
 }
 
 func (r *rubyInstance) Detach(ebpf interpreter.EbpfHandler, pid libpf.PID) error {
@@ -982,6 +1063,45 @@ func (r *rubyInstance) Symbolize(ef libpf.EbpfFrame, frames *libpf.Frames) error
 
 	case support.RubyFrameTypeIseq:
 		iseqBody = libpf.Address(frameAddr)
+	case support.RubyFrameTypeGc:
+		gcMode := frameAddr
+		var gcModeStr libpf.String
+		switch gcMode {
+		case rubyGcModeNone:
+			gcModeStr = rubyGcRunning
+		case rubyGcModeMarking:
+			gcModeStr = rubyGcMarking
+		case rubyGcModeSweeping:
+			gcModeStr = rubyGcSweeping
+		case rubyGcModeCompacting:
+			gcModeStr = rubyGcCompacting
+		}
+
+		frames.Append(&libpf.Frame{
+			Type:         libpf.RubyFrame,
+			FunctionName: gcModeStr,
+			SourceFile:   rubyGcDummyFile,
+			SourceLine:   0,
+		})
+
+		// Push a common "garbage collection" frame to nest
+		// different GC modes under
+		frames.Append(&libpf.Frame{
+			Type:         libpf.RubyFrame,
+			FunctionName: rubyGcFrame,
+			SourceFile:   rubyGcDummyFile,
+			SourceLine:   0,
+		})
+		return nil
+	case support.RubyFrameTypeJit:
+		label := rubyJitDummyFrame
+		frames.Append(&libpf.Frame{
+			Type:         libpf.RubyFrame,
+			FunctionName: label,
+			SourceFile:   rubyJitDummyFile,
+			SourceLine:   0,
+		})
+		return nil
 	default:
 		return fmt.Errorf("Unable to get CME or ISEQ from frame address (%d)", frameAddrType)
 	}
@@ -1114,6 +1234,92 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 	return libpf.Intern(profileLabel)
 }
 
+func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
+	_ reporter.ExecutableReporter, pr process.Process, mappings []process.Mapping) error {
+	var jitMapping *process.Mapping
+
+	pid := pr.PID()
+	jitFound := false
+	r.mappingGeneration++
+
+	log.Debugf("Synchronizing ruby mappings")
+
+	for idx := range mappings {
+		m := &mappings[idx]
+		if !m.IsExecutable() || !m.IsAnonymous() {
+			continue
+		}
+		// If prctl is allowed, ruby should label the memory region
+		// always prefer that
+		if strings.Contains(m.Path.String(), "jit_reserve_addr_space") {
+			jitMapping = m
+			jitFound = true
+		}
+		// Use the first executable anon region we find if it isn't labeled
+		// If we find more, prefer ones earlier in memory or larger in size
+		if !jitFound && (jitMapping == nil || m.Vaddr < jitMapping.Vaddr || m.Length > jitMapping.Length) {
+			// Don't set jitFound here as it is a heuristic, we aren't sure
+			// could be on a system without linux config flag to allow prctl to label memoy
+			jitMapping = m
+		}
+
+		if _, exists := r.mappings[*m]; exists {
+			*r.mappings[*m] = r.mappingGeneration
+			continue
+		}
+
+		// Generate a new uint32 pointer which is shared for mapping and the prefixes it owns
+		// so updating the mapping above will reflect to prefixes also.
+		mappingGeneration := r.mappingGeneration
+		r.mappings[*m] = &mappingGeneration
+
+		// Just assume all anonymous and executable mappings are Ruby for now
+		log.Debugf("Enabling Ruby interpreter for %#x/%#x", m.Vaddr, m.Length)
+
+		prefixes, err := lpm.CalculatePrefixList(m.Vaddr, m.Vaddr+m.Length)
+		if err != nil {
+			return fmt.Errorf("new anonymous mapping lpm failure %#x/%#x", m.Vaddr, m.Length)
+		}
+
+		for _, prefix := range prefixes {
+			_, exists := r.prefixes[prefix]
+			if !exists {
+				err := ebpf.UpdatePidInterpreterMapping(pid, prefix, support.ProgUnwindRuby, 0, 0)
+				if err != nil {
+					return err
+				}
+			}
+			r.prefixes[prefix] = &mappingGeneration
+		}
+	}
+	if jitMapping != nil && (r.procInfo.Jit_start != jitMapping.Vaddr || r.procInfo.Jit_end != jitMapping.Vaddr+jitMapping.Length) {
+		r.procInfo.Jit_start = jitMapping.Vaddr
+		r.procInfo.Jit_end = jitMapping.Vaddr + jitMapping.Length
+		if err := ebpf.UpdateProcData(libpf.Ruby, pr.PID(), unsafe.Pointer(r.procInfo)); err != nil {
+			return err
+		}
+		log.Debugf("Added jit mapping %08x ruby proc info, %08x", r.procInfo.Jit_start, r.procInfo.Jit_end)
+	}
+	// Remove prefixes not seen
+	for prefix, generationPtr := range r.prefixes {
+		if *generationPtr == r.mappingGeneration {
+			continue
+		}
+		log.Debugf("Delete Ruby prefix %#v", prefix)
+		_ = ebpf.DeletePidInterpreterMapping(pid, prefix)
+		delete(r.prefixes, prefix)
+	}
+	for m, generationPtr := range r.mappings {
+		if *generationPtr == r.mappingGeneration {
+			continue
+		}
+		log.Debugf("Disabling Ruby for %#x/%#x", m.Vaddr, m.Length)
+		delete(r.mappings, m)
+	}
+
+	return nil
+}
+
 func (r *rubyInstance) GetAndResetMetrics() ([]metrics.Metric, error) {
 	addrToStringStats := r.addrToString.ResetMetrics()
 
@@ -1170,7 +1376,8 @@ func determineRubyVersion(ef *pfelf.File) (uint32, error) {
 }
 
 func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
-	if !rubyRegex.MatchString(info.FileName()) {
+	var isBinRuby = binRubyRegex.MatchString(info.FileName())
+	if !libRubyRegex.MatchString(info.FileName()) && !isBinRuby {
 		return nil, nil
 	}
 
@@ -1189,7 +1396,7 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	//   https://www.jetbrains.com/lp/devecosystem-2020/ruby/
 	// Reason for maximum supported version 3.5.x:
 	// - this is currently the newest stable version
-	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(3, 6, 0)
+	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(4, 1, 0)
 	if version < minVer || version >= maxVer {
 		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and <= %d.%d.%d)",
 			(version>>16)&0xff, (version>>8)&0xff, version&0xff,
@@ -1213,6 +1420,7 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 
 	var globalSymbols libpf.SymbolValue
 	var currentEcTpBaseTlsOffset libpf.Address
+	var absoluteTpBaseOffset int64
 	var interpRanges []util.Range
 
 	globalSymbolsName := libpf.SymbolName("ruby_global_symbols")
@@ -1295,11 +1503,37 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		log.Warnf("failed to locate TLS descriptor: %v", err)
 	}
 
+	var tlsModuleIdOffset libpf.Address
+	if err = ef.VisitRelocations(func(r pfelf.ElfReloc, symName string) bool {
+		// We've already verified that the relocation is DTPMOD type
+		// so if we get here, we should be able to read the module ID from this offset
+		log.Debugf("Found module id at %x", r.Off)
+		tlsModuleIdOffset = libpf.Address(r.Off)
+		return false
+	}, func(rela pfelf.ElfReloc) bool {
+		ty := rela.Info & 0xffff
+		return (ef.Machine == elf.EM_AARCH64 && elf.R_AARCH64(ty) == elf.R_AARCH64_TLS_DTPMOD64) ||
+			(ef.Machine == elf.EM_X86_64 && elf.R_X86_64(ty) == elf.R_X86_64_DTPMOD64)
+	}); err != nil {
+		log.Warnf("failed to mod offset: %v", err)
+	}
+
+	if isBinRuby {
+		offset, err := extractEcOffset(ef)
+		if err != nil {
+			return nil, fmt.Errorf("unable to extract ec offset for static ruby %v", err)
+		}
+		absoluteTpBaseOffset = offset
+	}
+
 	log.Debugf("Discovered EC tls tpbase offset %x, fallback ctx %x, interp ranges: %v, global symbols: %x", currentEcTpBaseTlsOffset, currentCtxPtr, interpRanges, globalSymbols)
 
 	rid := &rubyData{
 		version:                  version,
 		currentEcTpBaseTlsOffset: libpf.Address(currentEcTpBaseTlsOffset),
+		tlsModuleIdOffset:        tlsModuleIdOffset,
+		absoluteTpBaseOffset:     absoluteTpBaseOffset,
+		currentEcTlsOffset:       libpf.Address(currentEcSymbolAddress),
 		currentCtxPtr:            libpf.Address(currentCtxPtr),
 		hasGlobalSymbols:         globalSymbols != 0,
 		globalSymbolsAddr:        libpf.Address(globalSymbols),
@@ -1316,6 +1550,13 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		vms.rclass_and_rb_classext_t.classext = 32
 		vms.rb_classext_struct.as_singleton_class_attached_object = 96
 		vms.rb_classext_struct.classpath = 120
+	case version >= rubyVersion(4, 0, 0) && version < rubyVersion(4, 1, 0):
+		rid.hasClassPath = true
+		rid.rubyFlSingleton = libpf.Address(RUBY_FL_USER1)
+
+		vms.rclass_and_rb_classext_t.classext = 24
+		vms.rb_classext_struct.as_singleton_class_attached_object = 112
+		vms.rb_classext_struct.classpath = 128
 	default:
 		rid.hasClassPath = true
 		rid.rubyFlSingleton = libpf.Address(RUBY_FL_USER1)
@@ -1336,6 +1577,8 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		rid.lastOpId = 169
 	case version < rubyVersion(3, 5, 0):
 		rid.lastOpId = 170
+	case version < rubyVersion(4, 1, 0):
+		rid.lastOpId = 171
 	default:
 		rid.lastOpId = 170
 	}
@@ -1346,6 +1589,61 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	vms.execution_context_struct.vm_stack = 0
 	vms.execution_context_struct.vm_stack_size = 8
 	vms.execution_context_struct.cfp = 16
+	vms.execution_context_struct.thread_ptr = 48
+
+	vms.thread_struct.vm = 32
+
+	// objspace address varies a lot by version since it is deep in the vm struct
+	// here only specific versions are supported for ruby 3.1.0+, as rubies older
+	// than this fail to compile in modern toolchains making it difficult to
+	// verify their offsets.
+	rid.hasObjspace = false
+	switch {
+	case version < rubyVersion(3, 1, 0):
+	case version < rubyVersion(3, 2, 0):
+		rid.hasObjspace = true
+		if runtime.GOARCH == "amd64" {
+			vms.vm_struct.gc_objspace = 1104
+		} else {
+			vms.vm_struct.gc_objspace = 1128
+		}
+		vms.objspace.flags = 16
+	case version < rubyVersion(3, 3, 0):
+		rid.hasObjspace = true
+		if runtime.GOARCH == "amd64" {
+			vms.vm_struct.gc_objspace = 1128
+		} else {
+			vms.vm_struct.gc_objspace = 1152
+		}
+		vms.objspace.flags = 16
+	case version < rubyVersion(3, 4, 0):
+		rid.hasObjspace = true
+		if runtime.GOARCH == "amd64" {
+			vms.vm_struct.gc_objspace = 1304
+		} else {
+			vms.vm_struct.gc_objspace = 1320
+		}
+		vms.objspace.flags = 16
+	case version >= rubyVersion(4, 0, 0) && version < rubyVersion(4, 1, 0):
+		rid.hasObjspace = true
+		if runtime.GOARCH == "amd64" {
+			vms.vm_struct.gc_objspace = 1248
+		} else {
+			// TODO fixme
+			vms.vm_struct.gc_objspace = 1320
+		}
+		vms.objspace.flags = 28
+	default:
+		rid.hasObjspace = true
+		vms.objspace.flags = 20
+		if runtime.GOARCH == "amd64" {
+			vms.vm_struct.gc_objspace = 1296
+		} else {
+			vms.vm_struct.gc_objspace = 1320
+		}
+	}
+
+	vms.objspace.size_of_flags = 4
 
 	vms.control_frame_struct.pc = 0
 	vms.control_frame_struct.iseq = 16
@@ -1397,6 +1695,12 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		vms.iseq_constant_body.insn_info_size = 128
 		vms.iseq_constant_body.succ_index_table = 136
 		vms.iseq_constant_body.local_iseq = 168
+		vms.iseq_constant_body.size_of_iseq_constant_body = 352
+	case version >= rubyVersion(4, 0, 0) && version < rubyVersion(4, 1, 0):
+		vms.iseq_constant_body.insn_info_body = 112
+		vms.iseq_constant_body.insn_info_size = 128
+		vms.iseq_constant_body.succ_index_table = 136
+		vms.iseq_constant_body.local_iseq = 176
 		vms.iseq_constant_body.size_of_iseq_constant_body = 352
 	default: // 3.3.x and 3.5.x have the same values
 		vms.iseq_constant_body.insn_info_body = 112
