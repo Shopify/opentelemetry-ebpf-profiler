@@ -3,7 +3,7 @@ package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 import (
 	"errors"
 
-	ah "go.opentelemetry.io/ebpf-profiler/armhelpers"
+	ah "go.opentelemetry.io/ebpf-profiler/asm/arm"
 	aa "golang.org/x/arch/arm64/arm64asm"
 )
 
