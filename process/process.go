@@ -277,7 +277,6 @@ func parseMappings(mapsFile io.Reader) ([]Mapping, uint32, error) {
 				// This is an anonymous mapping, keep it
 			} else if strings.HasPrefix(fields[5], "[anon:") {
 				// This is an anonymous mapping, that has been named with prctl, keep the name
-				log.Debugf("Got named mapping: %s", fields[5])
 				path = libpf.Intern(trimMappingPath(fields[5]))
 			} else {
 				// Ignore other mappings that are invalid, non-existent or are special pseudo-files

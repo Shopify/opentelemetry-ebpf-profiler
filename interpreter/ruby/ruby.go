@@ -1235,38 +1235,56 @@ func hasJitFramePointers(pr process.Process) bool {
 
 func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 	_ reporter.ExecutableReporter, pr process.Process, mappings []process.Mapping) error {
-	var jitMapping *process.Mapping
-
 	pid := pr.PID()
-	jitFound := false
 	r.mappingGeneration++
 
 	log.Debugf("Synchronizing ruby mappings")
 
+	// First pass: detect JIT bounds from ALL mappings (including non-executable).
+	// Ruby reserves a large address range for JIT code via mmap and labels it with
+	// prctl(PR_SET_VMA), giving it a path like "[anon:Ruby:rb_jit_reserve_addr_space]".
+	// The reserved region is typically ---p (non-executable). Ruby then mprotects individual
+	// pages to r-xp as JIT code is compiled. We need the full reserved region bounds for
+	// jit_start/jit_end so the eBPF program can recognize any PC within the JIT range,
+	// even as new pages are made executable.
+	var jitStart, jitEnd uint64
+	jitFound := false
+	for idx := range mappings {
+		m := &mappings[idx]
+		if strings.Contains(m.Path.String(), "jit_reserve_addr_space") {
+			if !jitFound || m.Vaddr < jitStart {
+				jitStart = m.Vaddr
+			}
+			if !jitFound || m.Vaddr+m.Length > jitEnd {
+				jitEnd = m.Vaddr + m.Length
+			}
+			jitFound = true
+		}
+	}
+
+	// Second pass: register LPM prefixes for executable anonymous/JIT mappings.
+	// This only covers r-xp pages so the eBPF unwinder is invoked for JIT code that
+	// has actually been committed. If no labeled JIT region was found above, fall back
+	// to heuristic detection from executable anonymous mappings.
+	var heuristicJitMapping *process.Mapping
 	for idx := range mappings {
 		m := &mappings[idx]
 		if !m.IsExecutable() {
 			continue
 		}
 
-		// Check for prctl-labeled JIT region first.
-		// On Linux with CONFIG_ANON_VMA_NAME, Ruby labels its JIT memory via prctl(PR_SET_VMA)
-		// which gives it a path like "[anon:Ruby:rb_yjit_reserve_addr_space]".
-		// This is NOT considered anonymous by IsAnonymous() since the path is non-null,
-		// so we must check for it explicitly before the IsAnonymous() filter.
-		if strings.Contains(m.Path.String(), "jit_reserve_addr_space") {
-			jitMapping = m
-			jitFound = true
-		} else if !m.IsAnonymous() {
+		isJitLabeled := strings.Contains(m.Path.String(), "jit_reserve_addr_space")
+		if !isJitLabeled && !m.IsAnonymous() {
 			continue
 		}
 
-		// Use the first executable anon region we find if it isn't labeled
-		// If we find more, prefer ones earlier in memory or larger in size
-		if !jitFound && (jitMapping == nil || m.Vaddr < jitMapping.Vaddr || m.Length > jitMapping.Length) {
-			// Don't set jitFound here as it is a heuristic, we aren't sure
-			// could be on a system without linux config flag to allow prctl to label memoy
-			jitMapping = m
+		// Heuristic fallback: if no prctl label was found, use the first/smallest-addr
+		// executable anonymous mapping as the JIT region.
+		if !jitFound && !isJitLabeled {
+			if heuristicJitMapping == nil || m.Vaddr < heuristicJitMapping.Vaddr ||
+				m.Length > heuristicJitMapping.Length {
+				heuristicJitMapping = m
+			}
 		}
 
 		if _, exists := r.mappings[*m]; exists {
@@ -1279,7 +1297,6 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 		mappingGeneration := r.mappingGeneration
 		r.mappings[*m] = &mappingGeneration
 
-		// Just assume all anonymous and executable mappings are Ruby for now
 		log.Debugf("Enabling Ruby interpreter for %#x/%#x", m.Vaddr, m.Length)
 
 		prefixes, err := lpm.CalculatePrefixList(m.Vaddr, m.Vaddr+m.Length)
@@ -1298,9 +1315,18 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 			r.prefixes[prefix] = &mappingGeneration
 		}
 	}
-	if jitMapping != nil && (r.procInfo.Jit_start != jitMapping.Vaddr || r.procInfo.Jit_end != jitMapping.Vaddr+jitMapping.Length) {
-		r.procInfo.Jit_start = jitMapping.Vaddr
-		r.procInfo.Jit_end = jitMapping.Vaddr + jitMapping.Length
+
+	// Determine final JIT bounds: prefer labeled region, fall back to heuristic.
+	if !jitFound && heuristicJitMapping != nil {
+		jitStart = heuristicJitMapping.Vaddr
+		jitEnd = heuristicJitMapping.Vaddr + heuristicJitMapping.Length
+		jitFound = true
+	}
+
+	// Update proc info if JIT bounds changed.
+	if jitStart != 0 && (r.procInfo.Jit_start != jitStart || r.procInfo.Jit_end != jitEnd) {
+		r.procInfo.Jit_start = jitStart
+		r.procInfo.Jit_end = jitEnd
 
 		// Detect whether the JIT is emitting frame pointers.
 		// On arm64, YJIT always emits frame pointers unconditionally.
