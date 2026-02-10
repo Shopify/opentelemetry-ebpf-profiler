@@ -467,6 +467,11 @@ typedef struct RubyProcInfo {
 
   // JIT regions, for detecting if a native PC was JIT
   u64 jit_start, jit_end;
+
+  // Whether the JIT is emitting frame pointers (e.g. --yjit-perf on x86_64, always on arm64).
+  // When true, we walk the native FP chain through JIT frames instead of stopping.
+  bool frame_pointers_enabled;
+
   // Offsets and sizes of Ruby internal structs
 
   // rb_execution_context_struct offsets:
@@ -706,7 +711,8 @@ typedef struct RubyUnwindState {
   void *last_stack_frame;
   // Frame for last cfunc before we switched to native unwinder
   u64 cfunc_saved_frame;
-  // Detect if JIT code ran in the process (at any time)
+  // Set when JIT code is detected in the current trace and frame pointers are not available.
+  // Used to suppress native unwinding and push cfuncs inline.
   bool jit_detected;
 } RubyUnwindState;
 

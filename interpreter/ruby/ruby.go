@@ -4,10 +4,12 @@
 package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 
 import (
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/bits"
+	"os"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -1212,6 +1214,28 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 	return libpf.Intern(profileLabel)
 }
 
+// hasJitFramePointers detects whether YJIT is emitting frame pointers for this process.
+// On arm64, YJIT always emits frame pointers unconditionally.
+// On x86_64, frame pointers are only emitted when --yjit-perf or --yjit-perf=fp is used.
+// When --yjit-perf is active, YJIT also creates /tmp/perf-PID.map, which we use as the
+// detection signal on x86_64.
+func hasJitFramePointers(pr process.Process) bool {
+	machine := pr.GetMachineData().Machine
+	if machine == elf.EM_AARCH64 {
+		// YJIT on arm64 always emits frame pointers (unconditionally in the backend).
+		return true
+	}
+
+	// On x86_64, check for the perf map file which indicates --yjit-perf was used.
+	// The --yjit-perf flag enables both frame pointers and the perf map.
+	perfMapPath := fmt.Sprintf("/tmp/perf-%d.map", pr.PID())
+	if _, err := os.Stat(perfMapPath); err == nil {
+		return true
+	}
+
+	return false
+}
+
 func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 	_ reporter.ExecutableReporter, pr process.Process, mappings []process.Mapping) error {
 	var jitMapping *process.Mapping
@@ -1224,15 +1248,22 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 
 	for idx := range mappings {
 		m := &mappings[idx]
-		if !m.IsExecutable() || !m.IsAnonymous() {
+		if !m.IsExecutable() {
 			continue
 		}
-		// If prctl is allowed, ruby should label the memory region
-		// always prefer that
+
+		// Check for prctl-labeled JIT region first.
+		// On Linux with CONFIG_ANON_VMA_NAME, Ruby labels its JIT memory via prctl(PR_SET_VMA)
+		// which gives it a path like "[anon:Ruby:rb_yjit_reserve_addr_space]".
+		// This is NOT considered anonymous by IsAnonymous() since the path is non-null,
+		// so we must check for it explicitly before the IsAnonymous() filter.
 		if strings.Contains(m.Path.String(), "jit_reserve_addr_space") {
 			jitMapping = m
 			jitFound = true
+		} else if !m.IsAnonymous() {
+			continue
 		}
+
 		// Use the first executable anon region we find if it isn't labeled
 		// If we find more, prefer ones earlier in memory or larger in size
 		if !jitFound && (jitMapping == nil || m.Vaddr < jitMapping.Vaddr || m.Length > jitMapping.Length) {
@@ -1273,10 +1304,18 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 	if jitMapping != nil && (r.procInfo.Jit_start != jitMapping.Vaddr || r.procInfo.Jit_end != jitMapping.Vaddr+jitMapping.Length) {
 		r.procInfo.Jit_start = jitMapping.Vaddr
 		r.procInfo.Jit_end = jitMapping.Vaddr + jitMapping.Length
+
+		// Detect whether the JIT is emitting frame pointers.
+		// On arm64, YJIT always emits frame pointers unconditionally.
+		// On x86_64, frame pointers are only emitted with --yjit-perf or --yjit-perf=fp,
+		// which also creates a /tmp/perf-PID.map file as a side effect.
+		r.procInfo.Frame_pointers_enabled = hasJitFramePointers(pr)
+
 		if err := ebpf.UpdateProcData(libpf.Ruby, pr.PID(), unsafe.Pointer(r.procInfo)); err != nil {
 			return err
 		}
-		log.Debugf("Added jit mapping %08x ruby proc info, %08x", r.procInfo.Jit_start, r.procInfo.Jit_end)
+		log.Debugf("Added jit mapping %08x-%08x ruby proc info (frame_pointers=%v)",
+			r.procInfo.Jit_start, r.procInfo.Jit_end, r.procInfo.Frame_pointers_enabled)
 	}
 	// Remove prefixes not seen
 	for prefix, generationPtr := range r.prefixes {
