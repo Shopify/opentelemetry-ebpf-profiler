@@ -20,10 +20,6 @@ struct ruby_procs_t {
 // NOTE: the maximum size stack is FRAMES_PER_WALK_RUBY_STACK * calls to tail_call().
 #define FRAMES_PER_WALK_RUBY_STACK 32
 
-// The maximum number of JIT frames to unwind via frame pointers.
-// YJIT creates one native frame per JIT entry (not per Ruby method),
-// so in practice there is typically only 1 (occasionally 2 for nested entries).
-#define MAX_JIT_FP_FRAMES 4
 // When resolving a CME, we need to traverse environment pointers until we
 // find IMEMO_MENT. Since we can't do a while loop, we have to bound this
 // the max encountered in experimentation on a production rails app is 6.
@@ -457,40 +453,25 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
   }
 
   // Detect if the CPU PC is in the JIT region.
-  // When frame pointers are available, walk the native FP chain through JIT frames.
-  // When not available, push a single dummy JIT frame and skip FP walking.
+  // When frame pointers are available, we keep the native unwind state in sync with
+  // the Ruby VM stack by advancing the FP chain by one frame per loop iteration.
+  // This handles both YJIT (1 JIT frame, exits after first iteration) and ZJIT
+  // (1 JIT frame per iseq, 1:1 with CFPs, stays in sync throughout the walk).
+  //
+  // When frame pointers are not available, we push a single dummy JIT frame and
+  // set jit_detected to suppress native unwinding.
   bool in_jit = rubyinfo->jit_start > 0 && record->state.pc >= rubyinfo->jit_start &&
                 record->state.pc < rubyinfo->jit_end;
 
   if (in_jit) {
     if (rubyinfo->frame_pointers_enabled) {
-      // Walk the native FP chain through JIT frames, pushing each as a JIT frame
-      // so it can potentially be symbolized via perf maps later.
-      UNROLL for (int j = 0; j < MAX_JIT_FP_FRAMES; j++)
-      {
-        ErrorCode jit_error =
-          push_ruby(&record->state, trace, RUBY_FRAME_TYPE_JIT, (u64)record->state.pc, 0, 0);
-        if (jit_error) {
-          return jit_error;
-        }
-
-        if (!unwinder_unwind_frame_pointer(&record->state)) {
-          // FP chain broken, cannot continue
-          *next_unwinder = PROG_UNWIND_STOP;
-          return ERR_OK;
-        }
-
-        // Check if we've left the JIT region
-        if (record->state.pc < rubyinfo->jit_start || record->state.pc >= rubyinfo->jit_end) {
-          break;
-        }
+      // Push a leaf JIT frame with the raw machine PC for perf-map symbolization.
+      ErrorCode jit_error =
+        push_ruby(&record->state, trace, RUBY_FRAME_TYPE_JIT, (u64)record->state.pc, 0, 0);
+      if (jit_error) {
+        return jit_error;
       }
-      // After walking JIT frames, PC should be in rb_vm_exec or other native code.
-      // Resolve the mapping for the new PC so text_section_id/offset/bias are correct.
-      ErrorCode map_err = get_next_unwinder_after_native_frame(record, next_unwinder);
-      if (map_err) {
-        return map_err;
-      }
+
     } else {
       // No frame pointers available: push a single dummy JIT frame.
       // Mark jit_detected so that cfuncs are pushed inline and end-of-stack uses
@@ -501,18 +482,38 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
       if (jit_error) {
         return jit_error;
       }
+      in_jit = false;
     }
   }
 
   for (u32 i = 0; i < FRAMES_PER_WALK_RUBY_STACK; ++i) {
+    // Keep the native unwind state in sync: if the native PC is still in the JIT
+    // region, advance it by one frame pointer to match the Ruby VM stack pop.
+    // For YJIT this exits JIT on the first iteration. For ZJIT this pops one JIT
+    // native frame per CFP, keeping the two stacks in lockstep.
+    if (in_jit) {
+      if (!unwinder_unwind_frame_pointer(&record->state)) {
+        *next_unwinder = PROG_UNWIND_STOP;
+        return ERR_OK;
+      }
+      if (record->state.pc < rubyinfo->jit_start || record->state.pc >= rubyinfo->jit_end) {
+        // Exited the JIT region. Resolve the mapping for the post-JIT PC so that
+        // text_section_id/offset/bias are correct for native unwinding later.
+        in_jit            = false;
+        ErrorCode map_err = get_next_unwinder_after_native_frame(record, next_unwinder);
+        if (map_err) {
+          return map_err;
+        }
+      }
+    }
+
     error = read_ruby_frame(record, rubyinfo, stack_ptr, next_unwinder);
     if (error != ERR_OK)
       return error;
 
     if (last_stack_frame <= stack_ptr) {
       // We have processed all frames in the Ruby VM and can stop here.
-      // If we walked through JIT frames via FP, the state is clean and native unwinding
-      // can continue. If JIT was detected without FP, the PC is still in the JIT region
+      // If JIT was detected without FP, the PC is still in the JIT region
       // and native unwinding would fail, so we stop.
       *next_unwinder = record->rubyUnwindState.jit_detected ? PROG_UNWIND_STOP : PROG_UNWIND_NATIVE;
       goto save_state;
