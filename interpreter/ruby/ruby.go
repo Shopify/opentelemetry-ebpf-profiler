@@ -4,10 +4,12 @@
 package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 
 import (
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/bits"
+	"os"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -1279,54 +1281,26 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 	return libpf.Intern(profileLabel)
 }
 
-// findJITRegion detects the YJIT JIT code region from process memory mappings.
-// YJIT reserves a large contiguous address range (typically 48-128 MiB) via mmap
-// with PROT_NONE and then mprotects individual 16k codepages to r-x as needed.
-// On systems with CONFIG_ANON_VMA_NAME, Ruby labels the region via prctl(PR_SET_VMA)
-// giving it a path like "[anon:Ruby:rb_yjit_reserve_addr_space]".
-// On systems without that config, we fall back to a heuristic: the first anonymous
-// executable mapping (by address) is assumed to be the JIT region since YJIT
-// initializes before any gems could create anonymous executable mappings.
-// Returns (start, end, found).
-func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
-	var jitStart, jitEnd uint64
-	labelFound := false
-	var heuristicStart, heuristicEnd uint64
-	heuristicFound := false
-
-	for idx := range mappings {
-		m := &mappings[idx]
-
-		// Check for prctl-labeled JIT region. These mappings may be ---p (PROT_NONE)
-		// or r-xp depending on whether YJIT has activated codepages in this region.
-		if strings.Contains(m.Path, "jit_reserve_addr_space") {
-			if !labelFound || m.Vaddr < jitStart {
-				jitStart = m.Vaddr
-			}
-			if !labelFound || m.Vaddr+m.Length > jitEnd {
-				jitEnd = m.Vaddr + m.Length
-			}
-			labelFound = true
-			continue
-		}
-
-		// Heuristic fallback: first anonymous executable mapping by address.
-		// Mappings from /proc/pid/maps are sorted by address, so the first
-		// match is the lowest address.
-		if !heuristicFound && m.IsExecutable() && m.IsAnonymous() {
-			heuristicStart = m.Vaddr
-			heuristicEnd = m.Vaddr + m.Length
-			heuristicFound = true
-		}
+// hasJitFramePointers detects whether YJIT is emitting frame pointers for this process.
+// On arm64, YJIT always emits frame pointers unconditionally.
+// On x86_64, frame pointers are only emitted when --yjit-perf or --yjit-perf=fp is used.
+// When --yjit-perf is active, YJIT also creates /tmp/perf-PID.map, which we use as the
+// detection signal on x86_64.
+func hasJitFramePointers(pr process.Process) bool {
+	machine := pr.GetMachineData().Machine
+	if machine == elf.EM_AARCH64 {
+		// YJIT on arm64 always emits frame pointers (unconditionally in the backend).
+		return true
 	}
 
-	if labelFound {
-		return jitStart, jitEnd, true
+	// On x86_64, check for the perf map file which indicates --yjit-perf was used.
+	// The --yjit-perf flag enables both frame pointers and the perf map.
+	perfMapPath := fmt.Sprintf("/tmp/perf-%d.map", pr.PID())
+	if _, err := os.Stat(perfMapPath); err == nil {
+		return true
 	}
-	if heuristicFound {
-		return heuristicStart, heuristicEnd, true
-	}
-	return 0, 0, false
+
+	return false
 }
 
 func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
@@ -1376,10 +1350,18 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 	if jitFound && (r.procInfo.Jit_start != jitStart || r.procInfo.Jit_end != jitEnd) {
 		r.procInfo.Jit_start = jitStart
 		r.procInfo.Jit_end = jitEnd
+
+		// Detect whether the JIT is emitting frame pointers.
+		// On arm64, YJIT always emits frame pointers unconditionally.
+		// On x86_64, frame pointers are only emitted with --yjit-perf or --yjit-perf=fp,
+		// which also creates a /tmp/perf-PID.map file as a side effect.
+		r.procInfo.Frame_pointers_enabled = hasJitFramePointers(pr)
+
 		if err := ebpf.UpdateProcData(libpf.Ruby, pr.PID(), unsafe.Pointer(r.procInfo)); err != nil {
 			return err
 		}
-		log.Debugf("Updated JIT region %#x-%#x in ruby proc info", jitStart, jitEnd)
+		log.Debugf("Updated JIT region %#x-%#x in ruby proc info (frame_pointers=%v)",
+			jitStart, jitEnd, r.procInfo.Frame_pointers_enabled)
 	}
 	// Remove prefixes not seen
 	for prefix, generationPtr := range r.prefixes {
