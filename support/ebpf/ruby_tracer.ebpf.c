@@ -494,47 +494,8 @@ save_state:
   return ERR_OK;
 }
 
-static EBPF_INLINE u64 read_tls_addr_from_dtv(u64 symbol, u32 module_id, u32 dtv_step)
-{
-  int err;
-  u64 addr;
-
-  u64 tsd_base;
-  if (tsd_get_base((void **)&tsd_base) != 0) {
-    DEBUG_PRINT("ruby: failed to get TSD base for TLS symbol lookup");
-    return 0;
-  }
-
-  u64 dtv_addr;
-  // On x86-64, the FS register points to the TCB
-  // The DTV is typically at offset 0 or 8 from the TCB
-  // You may need to adjust this offset based on your glibc version
-
-  // Try offset 8 first (common in modern glibc)
-  // https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/x86_64/nptl/tls.h;h=683f8bfdfcad45734c4cc1aeea844582a5528640;hb=HEAD#l46
-  if ((err = bpf_probe_read_user(&dtv_addr, sizeof(void *), (void *)(tsd_base + 8)))) {
-    DEBUG_PRINT("ruby: failed to read TLS DTV addr: %d", err);
-    return 0;
-  }
-
-  // DTV layout is the same across architectures:
-  // DTV[0] = generation counter
-  // DTV[1] = module 1's TLS block
-  // DTV[2] = module 2's TLS block
-  // ...
-  u64 dtv_offset = module_id * dtv_step;
-
-  if ((err = bpf_probe_read_user(&addr, sizeof(void *), (void *)(dtv_addr + dtv_offset)))) {
-    DEBUG_PRINT(
-      "ruby: failed to read TLS block addr for module %d at DTV offset %llu: %d",
-      module_id,
-      dtv_offset,
-      err);
-    return 0;
-  }
-  addr += symbol;
-  return addr;
-}
+// read_tls_addr_from_dtv is now a shared function in dtv.h
+#include "dtv.h"
 
 // unwind_ruby is the tail call destination for PROG_UNWIND_RUBY.
 static EBPF_INLINE int unwind_ruby(struct pt_regs *ctx)

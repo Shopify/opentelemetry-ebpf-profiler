@@ -124,6 +124,7 @@ type Trace C.Trace
 type UnwindInfo C.UnwindInfo
 
 type ApmIntProcInfo C.ApmIntProcInfo
+type TlcrProcInfo C.TlcrProcInfo
 type BEAMProcInfo C.BEAMProcInfo
 type DotnetProcInfo C.DotnetProcInfo
 type GoLabelsOffsets C.GoLabelsOffsets
@@ -298,4 +299,8 @@ var MetricsTranslation = []metrics.MetricID{
 	C.metricID_UnwindRubyErrReadSvar:                      metrics.IDUnwindRubyErrReadSvar,
 	C.metricID_UnwindRubyErrReadRbasicFlags:               metrics.IDUnwindRubyErrReadRbasicFlags,
 	C.metricID_UnwindRubyErrCmeMaxEp:                      metrics.IDUnwindRubyErrCmeMaxEp,
+	C.metricID_UnwindTlcrErrReadTsdBase:                   metrics.IDUnwindTlcrErrReadTsdBase,
+	C.metricID_UnwindTlcrErrReadPtr:                       metrics.IDUnwindTlcrErrReadPtr,
+	C.metricID_UnwindTlcrErrReadRecord:                    metrics.IDUnwindTlcrErrReadRecord,
+	C.metricID_UnwindTlcrReadSuccesses:                    metrics.IDUnwindTlcrReadSuccesses,
 }

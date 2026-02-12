@@ -7,6 +7,7 @@
 #include "tracemgmt.h"
 #include "tsd.h"
 #include "types.h"
+#include "dtv.h"
 
 // Begin shared maps
 
@@ -125,6 +126,13 @@ struct apm_int_procs_t {
   __uint(max_entries, 128);
 } apm_int_procs SEC(".maps");
 
+struct tlcr_procs_t {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, pid_t);
+  __type(value, TlcrProcInfo);
+  __uint(max_entries, 128);
+} tlcr_procs SEC(".maps");
+
 // filter_error_frames is set during load time.
 BPF_RODATA_VAR(bool, filter_error_frames, false)
 
@@ -237,6 +245,90 @@ static EBPF_INLINE void maybe_add_apm_info(Trace *trace)
     corr_buf.trace_flags);
 }
 
+// maybe_add_tlcr_info reads the Thread-Local Context Record (TLCR) from the
+// sampled thread's TLS and copies the trace_id/span_id into the trace metadata.
+//
+// This is the BPF-side counterpart to the Go-side Loader in interpreter/tlcr/tlcr.go
+// which discovers the TLS variable and populates TlcrProcInfo at attach time.
+//
+// The TLS variable (custom_labels_current_set_v2) is a pointer to a TlcrRecord struct
+// written by the instrumentation library. We resolve its address via one of two paths:
+//
+//   1. Direct TP offset (tls_tpbase_offset):
+//      Used when the Go loader resolved the offset at attach time via TLSDESC GOT
+//      entry read or Local Exec TLS ABI computation. The address is simply:
+//        thread_pointer + tls_tpbase_offset
+//      This covers TLSDESC-resolved shared libraries (Strategies 1 & 2 in the Go
+//      loader) and statically-linked executables (Strategy 4).
+//
+//   2. DTV lookup (use_dtv=1):
+//      Used for dlopen'd libraries where the TLS block is dynamically allocated and
+//      indexed via the Dynamic Thread Vector. The Go loader stores the module_id and
+//      symbol_offset from DTPMOD/DTPOFF relocations (Strategy 3), and we call
+//      read_tls_addr_from_dtv() to walk the DTV array at runtime.
+static EBPF_INLINE void maybe_add_tlcr_info(Trace *trace)
+{
+  u32 pid           = trace->pid;
+  TlcrProcInfo *proc = bpf_map_lookup_elem(&tlcr_procs, &pid);
+  if (!proc) {
+    return;
+  }
+
+  DEBUG_PRINT("Trace is within a process with TLCR enabled");
+
+  // Resolve the address of the TLCR TLS variable in the target thread.
+  u64 tlcr_ptr_addr;
+  if (proc->use_dtv) {
+    // DTV path: walk the Dynamic Thread Vector to find the TLS block for the
+    // module that defines the TLCR variable, then add the symbol offset.
+    tlcr_ptr_addr = read_tls_addr_from_dtv(
+      proc->tls_symbol_offset, proc->tls_module_id, proc->dtv_step);
+    if (!tlcr_ptr_addr) {
+      increment_metric(metricID_UnwindTlcrErrReadTsdBase);
+      DEBUG_PRINT("Failed to resolve TLCR TLS address via DTV");
+      return;
+    }
+  } else {
+    // Direct TP path: the offset from the thread pointer was pre-computed by
+    // the Go loader (from TLSDESC GOT read or Local Exec ABI computation).
+    u64 tsd_base;
+    if (tsd_get_base((void **)&tsd_base) != 0) {
+      increment_metric(metricID_UnwindTlcrErrReadTsdBase);
+      DEBUG_PRINT("Failed to get TSD base for TLCR");
+      return;
+    }
+    tlcr_ptr_addr = tsd_base + proc->tls_tpbase_offset;
+  }
+
+  DEBUG_PRINT("TLCR ptr addr: 0x%llx", tlcr_ptr_addr);
+
+  void *record_ptr;
+  if (bpf_probe_read_user(&record_ptr, sizeof(record_ptr), (void *)tlcr_ptr_addr)) {
+    increment_metric(metricID_UnwindTlcrErrReadPtr);
+    DEBUG_PRINT("Failed to read TLCR pointer");
+    return;
+  }
+  if (!record_ptr) {
+    return; // No active context (e.g. thread is idle between requests)
+  }
+
+  TlcrRecord record;
+  if (bpf_probe_read_user(&record, sizeof(record), record_ptr)) {
+    increment_metric(metricID_UnwindTlcrErrReadRecord);
+    DEBUG_PRINT("Failed to read TLCR record");
+    return;
+  }
+  if (record.valid != 1) {
+    return;
+  }
+
+  __builtin_memcpy(&trace->apm_trace_id, record.trace_id, 16);
+  __builtin_memcpy(&trace->apm_transaction_id, record.span_id, 8);
+  increment_metric(metricID_UnwindTlcrReadSuccesses);
+
+  DEBUG_PRINT("TLCR read success, span_id: %016llX", trace->apm_transaction_id.as_int);
+}
+
 // unwind_stop is the tail call destination for PROG_UNWIND_STOP.
 static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
 {
@@ -247,6 +339,7 @@ static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
   UnwindState *state = &record->state;
 
   maybe_add_apm_info(trace);
+  maybe_add_tlcr_info(trace);
 
   // If the stack is otherwise empty, push an error for that: we should
   // never encounter empty stacks for successful unwinding.

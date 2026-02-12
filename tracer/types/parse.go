@@ -70,8 +70,8 @@ func IsMapEnabled(mapName string, includeTracers IncludedTracers) bool {
 		return includeTracers.Has(DotnetTracer)
 	case "beam_procs":
 		return includeTracers.Has(BEAMTracer)
-	case "go_labels_procs", "apm_int_procs":
-		// go_labels_procs and apm_int_procs are called from
+	case "go_labels_procs", "apm_int_procs", "tlcr_procs":
+		// go_labels_procs, apm_int_procs, and tlcr_procs are called from
 		// unwind_stop and therefore need to be available all the time.
 		return true
 	default:

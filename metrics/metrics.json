@@ -2063,5 +2063,33 @@
     "name": "UnwindRubyErrCmeMaxEp",
     "field": "bpf.ruby.errors.read_cme_max_ep",
     "id": 285
+  },
+  {
+    "description": "Number of failures to get TSD base for TLCR",
+    "type": "counter",
+    "name": "UnwindTlcrErrReadTsdBase",
+    "field": "bpf.tlcr.errors.read_tsd_base",
+    "id": 286
+  },
+  {
+    "description": "Number of failures to read the TLCR pointer",
+    "type": "counter",
+    "name": "UnwindTlcrErrReadPtr",
+    "field": "bpf.tlcr.errors.read_ptr",
+    "id": 287
+  },
+  {
+    "description": "Number of failures to read the TLCR record",
+    "type": "counter",
+    "name": "UnwindTlcrErrReadRecord",
+    "field": "bpf.tlcr.errors.read_record",
+    "id": 288
+  },
+  {
+    "description": "Number of successful reads of TLCR info",
+    "type": "counter",
+    "name": "UnwindTlcrReadSuccesses",
+    "field": "bpf.tlcr.read.successes",
+    "id": 289
   }
 ]

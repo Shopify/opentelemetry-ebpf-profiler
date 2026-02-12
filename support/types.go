@@ -59,7 +59,7 @@ const (
 const UnwindInfoMaxEntries = 0x4000
 
 const (
-	MetricIDBeginCumulative = 0x68
+	MetricIDBeginCumulative = 0x6c
 )
 
 const (
@@ -175,6 +175,14 @@ type UnwindInfo struct {
 
 type ApmIntProcInfo struct {
 	Offset uint64
+}
+type TlcrProcInfo struct {
+	Tls_tpbase_offset int64
+	Tls_symbol_offset uint64
+	Tls_module_id     uint64
+	Dtv_step          uint32
+	Use_dtv           uint8
+	Pad_cgo_0         [3]byte
 }
 type BEAMProcInfo struct {
 	Bias                   uint64
@@ -482,4 +490,8 @@ var MetricsTranslation = []metrics.MetricID{
 	0x65: metrics.IDUnwindRubyErrReadSvar,
 	0x66: metrics.IDUnwindRubyErrReadRbasicFlags,
 	0x67: metrics.IDUnwindRubyErrCmeMaxEp,
+	0x68: metrics.IDUnwindTlcrErrReadTsdBase,
+	0x69: metrics.IDUnwindTlcrErrReadPtr,
+	0x6a: metrics.IDUnwindTlcrErrReadRecord,
+	0x6b: metrics.IDUnwindTlcrReadSuccesses,
 }

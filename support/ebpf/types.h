@@ -325,6 +325,18 @@ enum {
   // number of failed attempts to read a CME by exceeding max EP checks
   metricID_UnwindRubyErrCmeMaxEp,
 
+  // number of failures to get TSD base for TLCR
+  metricID_UnwindTlcrErrReadTsdBase,
+
+  // number of failures to read the TLCR pointer
+  metricID_UnwindTlcrErrReadPtr,
+
+  // number of failures to read the TLCR record
+  metricID_UnwindTlcrErrReadRecord,
+
+  // number of successful reads of TLCR info
+  metricID_UnwindTlcrReadSuccesses,
+
   //
   // Metric IDs above are for counters (cumulative values)
   //
@@ -561,6 +573,16 @@ typedef struct __attribute__((packed)) ApmCorrelationBuf {
   ApmSpanID span_id;
   ApmSpanID transaction_id;
 } ApmCorrelationBuf;
+
+// Thread-Local Context Record header (28 bytes)
+// Spec: custom_labels_v2_tl_record_t
+typedef struct __attribute__((packed)) TlcrRecord {
+  u8 trace_id[16];
+  u8 span_id[8];
+  u8 valid;
+  u8 _padding;
+  u16 attrs_data_size;
+} TlcrRecord;
 
 #define CUSTOM_LABEL_MAX_KEY_LEN COMM_LEN
 // Big enough to hold UUIDs, etc.
@@ -960,6 +982,19 @@ typedef struct PIDPageMappingInfo {
 typedef struct ApmIntProcInfo {
   u64 tls_offset;
 } ApmIntProcInfo;
+
+typedef struct TlcrProcInfo {
+  // TLS offset for direct tpbase access (TLSDESC resolved)
+  s64 tls_tpbase_offset;
+  // TLS symbol offset within module (for DTV access)
+  u64 tls_symbol_offset;
+  // Module ID for DTV-based TLS lookup (dlopen'd libraries)
+  u64 tls_module_id;
+  // DTV step size (typically 16 = sizeof(void*) * 2)
+  u32 dtv_step;
+  // Access method: 0=direct tpbase, 1=DTV
+  u8 use_dtv;
+} TlcrProcInfo;
 
 typedef struct GoLabelsOffsets {
   u32 m_offset;

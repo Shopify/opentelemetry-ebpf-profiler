@@ -647,6 +647,18 @@ const (
 	// Number of failed attempts to read a CME by exceeding max EP checks
 	IDUnwindRubyErrCmeMaxEp = 285
 
+	// Number of failures to get TSD base for TLCR
+	IDUnwindTlcrErrReadTsdBase = 286
+
+	// Number of failures to read the TLCR pointer
+	IDUnwindTlcrErrReadPtr = 287
+
+	// Number of failures to read the TLCR record
+	IDUnwindTlcrErrReadRecord = 288
+
+	// Number of successful reads of TLCR info
+	IDUnwindTlcrReadSuccesses = 289
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 286
+	IDMax = 290
 )

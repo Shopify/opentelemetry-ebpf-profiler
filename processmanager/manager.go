@@ -6,6 +6,7 @@ package processmanager // import "go.opentelemetry.io/ebpf-profiler/processmanag
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -320,6 +321,19 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 		Frames:       make(libpf.Frames, kernelFramesLen, kernelFramesLen+bpfTrace.NumFrames),
 		CustomLabels: bpfTrace.CustomLabels,
 	}
+
+	// Propagate APM trace context (from TLCR or APM integration) as custom labels
+	// so they appear as sample attributes in the exported OTLP profile.
+	if bpfTrace.APMTraceID != (libpf.APMTraceID{}) {
+		if trace.CustomLabels == nil {
+			trace.CustomLabels = make(map[libpf.String]libpf.String)
+		}
+		trace.CustomLabels[libpf.Intern("trace_id")] =
+			libpf.Intern(hex.EncodeToString(bpfTrace.APMTraceID[:]))
+		trace.CustomLabels[libpf.Intern("span_id")] =
+			libpf.Intern(hex.EncodeToString(bpfTrace.APMTransactionID[:]))
+	}
+
 	copy(trace.Frames, bpfTrace.KernelFrames)
 
 	cacheMiss := uint64(0)

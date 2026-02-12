@@ -47,6 +47,9 @@ const (
 
 	// Go identifies the pseudo-interpreter for Go custom labels support.
 	GoLabels InterpreterType = 0x101
+
+	// TLCR identifies the pseudo-interpreter for Thread-Local Context Record support.
+	TLCR InterpreterType = 0x102
 )
 
 // Frame converts the interpreter type into the corresponding frame type.
@@ -75,6 +78,7 @@ var interpreterTypeToString = map[InterpreterType]string{
 	APMInt:   "apm-integration",
 	Go:       "go",
 	GoLabels: "go-labels",
+	TLCR:     "tlcr",
 }
 
 var stringToInterpreterType = make(map[string]InterpreterType, len(interpreterTypeToString))
