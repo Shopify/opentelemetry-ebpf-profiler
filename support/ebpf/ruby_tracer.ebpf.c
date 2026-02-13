@@ -543,7 +543,8 @@ static EBPF_INLINE int unwind_ruby(struct pt_regs *ctx)
     DEBUG_PRINT("ruby: EC from TLS: 0x%llx", (u64)current_ctx_addr);
   } else if (rubyinfo->tls_module_id != 0) {
     u64 tls_current_ec_addr =
-      read_tls_addr_from_dtv(rubyinfo->current_ec_tls_offset, rubyinfo->tls_module_id, 16);
+      read_tls_addr_from_dtv(rubyinfo->current_ec_tls_offset, rubyinfo->tls_module_id,
+                             8, 16, 0);
     if (tls_current_ec_addr == 0) {
       DEBUG_PRINT("ruby: failed failed to read EC from DTV");
       goto exit;

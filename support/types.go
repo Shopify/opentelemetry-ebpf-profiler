@@ -180,9 +180,11 @@ type TlcrProcInfo struct {
 	Tls_tpbase_offset int64
 	Tls_symbol_offset uint64
 	Tls_module_id     uint64
-	Dtv_step          uint32
+	Dtv_offset        int16
+	Dtv_step          uint8
+	Dtv_indirect      uint8
 	Use_dtv           uint8
-	Pad_cgo_0         [3]byte
+	X_pad             [3]uint8
 }
 type BEAMProcInfo struct {
 	Bias                   uint64

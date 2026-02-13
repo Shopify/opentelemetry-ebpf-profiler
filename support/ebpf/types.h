@@ -984,16 +984,21 @@ typedef struct ApmIntProcInfo {
 } ApmIntProcInfo;
 
 typedef struct TlcrProcInfo {
-  // TLS offset for direct tpbase access (TLSDESC resolved)
+  // Direct TP offset (TLSDESC / Local Exec / Static TLS from link_map)
   s64 tls_tpbase_offset;
-  // TLS symbol offset within module (for DTV access)
+  // Symbol offset within TLS block (DTV path)
   u64 tls_symbol_offset;
-  // Module ID for DTV-based TLS lookup (dlopen'd libraries)
+  // Module ID for DTV indexing
   u64 tls_module_id;
-  // DTV step size (typically 16 = sizeof(void*) * 2)
-  u32 dtv_step;
-  // Access method: 0=direct tpbase, 1=DTV
+  // DTV pointer offset from TP (e.g. +8 for glibc x86_64, 0 for glibc aarch64)
+  s16 dtv_offset;
+  // DTV entry stride (16 for glibc, 8 for musl)
+  u8 dtv_step;
+  // 1 = dereference TP:0 before adding dtv_offset
+  u8 dtv_indirect;
+  // 0 = use tls_tpbase_offset, 1 = use DTV
   u8 use_dtv;
+  u8 _pad[3];
 } TlcrProcInfo;
 
 typedef struct GoLabelsOffsets {

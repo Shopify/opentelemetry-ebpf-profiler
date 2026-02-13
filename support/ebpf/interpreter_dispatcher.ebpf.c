@@ -282,7 +282,8 @@ static EBPF_INLINE void maybe_add_tlcr_info(Trace *trace)
     // DTV path: walk the Dynamic Thread Vector to find the TLS block for the
     // module that defines the TLCR variable, then add the symbol offset.
     tlcr_ptr_addr = read_tls_addr_from_dtv(
-      proc->tls_symbol_offset, proc->tls_module_id, proc->dtv_step);
+      proc->tls_symbol_offset, proc->tls_module_id,
+      proc->dtv_offset, proc->dtv_step, proc->dtv_indirect);
     if (!tlcr_ptr_addr) {
       increment_metric(metricID_UnwindTlcrErrReadTsdBase);
       DEBUG_PRINT("Failed to resolve TLCR TLS address via DTV");
