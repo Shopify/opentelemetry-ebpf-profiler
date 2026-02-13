@@ -309,6 +309,7 @@ static EBPF_INLINE void maybe_add_tlcr_info(Trace *trace)
     DEBUG_PRINT("Failed to read TLCR pointer");
     return;
   }
+  DEBUG_PRINT("TLCR record_ptr: 0x%llx", (u64)record_ptr);
   if (!record_ptr) {
     return; // No active context (e.g. thread is idle between requests)
   }
@@ -316,10 +317,11 @@ static EBPF_INLINE void maybe_add_tlcr_info(Trace *trace)
   TlcrRecord record;
   if (bpf_probe_read_user(&record, sizeof(record), record_ptr)) {
     increment_metric(metricID_UnwindTlcrErrReadRecord);
-    DEBUG_PRINT("Failed to read TLCR record");
+    DEBUG_PRINT("Failed to read TLCR record at 0x%llx", (u64)record_ptr);
     return;
   }
   if (record.valid != 1) {
+    DEBUG_PRINT("TLCR record.valid=%d (not 1), ignoring", record.valid);
     return;
   }
 
