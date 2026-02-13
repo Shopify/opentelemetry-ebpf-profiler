@@ -29,8 +29,8 @@ const arm64TCBSize = 16
 // Loader implements interpreter.Loader for TLCR-enabled libraries and executables.
 //
 // It scans every loaded ELF file for the TLCR TLS variable symbol
-// (custom_labels_current_set_v2) using a 4-strategy fallback that covers
-// most ELF TLS access models:
+// (custom_labels_current_set_v2) using a 5-strategy fallback that covers
+// all common ELF TLS access models:
 //
 //	Strategy 1 — Named TLSDESC: The linker emitted a TLSDESC relocation with the
 //	symbol name. This is the common case for shared libraries that reference a TLS
@@ -44,17 +44,50 @@ const arm64TCBSize = 16
 //	match it against TLSDESC relocations by addend.
 //	(context-reader equivalent: same SharedLibrary path, matched by offset)
 //
-//	Strategy 3 — DTPMOD/DTPOFF: For dlopen'd libraries that lack TLSDESC support,
-//	the linker emits DTPMOD64 + DTPOFF64 relocation pairs. At runtime we read the
-//	module ID from the GOT entry and walk the Dynamic Thread Vector (DTV) in BPF.
+//	Strategy 3 — Named DTPMOD/DTPOFF: For dlopen'd libraries that lack TLSDESC
+//	support, the linker emits DTPMOD64 + DTPOFF64 relocation pairs with the symbol
+//	name. At runtime we read the module ID from the GOT entry and walk the Dynamic
+//	Thread Vector (DTV) in BPF.
 //	(context-reader equivalent: DTV lookup with module_id)
 //
-//	Strategy 4 — Local Exec TLS: For statically linked binaries or main executables
+//	Strategy 4 — Anonymous DTPMOD (Local Dynamic model): For LOCAL TLS symbols in
+//	shared libraries (e.g., cdylib crates where the linker version script demotes
+//	symbols to LOCAL). The linker uses the Local Dynamic (LD) TLS model: a single
+//	anonymous DTPMOD64 relocation shared by all LOCAL TLS variables in the module,
+//	with offsets baked into the code at link time. We find any DTPMOD64 in the .so
+//	and use st_value from .symtab as the symbol's offset within the TLS block.
+//	This is the common case for Rust cdylib .so files that embed C TLS variables.
+//
+//	Strategy 5 — Local Exec TLS: For statically linked binaries or main executables
 //	where the linker resolved the TP offset at link time. No TLS relocations exist;
 //	we compute the offset from the PT_TLS segment and st_value using the ELF TLS ABI:
 //	  ARM64 (variant 1): TP + round_up(tcb_size, p_align) + st_value
 //	  x86_64 (variant 2): TP - round_up(p_memsz, p_align) + st_value
 //	(context-reader equivalent: TlsLocation::MainExecutable)
+//
+// Known gaps vs the reference context-reader (research/ctx-sharing-demo/context-reader/):
+//
+//   - Static TLS via l_tls_offset: The context-reader walks glibc's link_map chain
+//     (via _r_debug → r_map) to read l_tls_offset per module. This gives a direct
+//     TP-relative offset for shared libraries that received a static TLS slot at
+//     load time — faster than DTV since it avoids the double-dereference. We rely
+//     on TLSDESC or DTV instead, which is correct but slower for early-loaded libs.
+//     See: context-reader/src/tls_symbols/dynamic_linker.rs (walk_link_map_chain,
+//     read_tls_offset) and tls_accessor.rs (get_tls_via_static_with_tp).
+//
+//   - musl libc support: The context-reader detects glibc vs musl and adjusts:
+//     (a) DTV pointer location (musl aarch64: TP-8, vs glibc aarch64: TP+0),
+//     (b) DTV entry size (musl: 8 bytes, glibc: 16 bytes),
+//     (c) DSO chain walking (_dl_debug_addr + struct dso instead of _r_debug + link_map).
+//     Our profiler hardcodes glibc's dtv_step=16 in Attach(). This breaks on musl.
+//     See: context-reader/src/tls_symbols/dynamic_linker.rs (detect_libc, Libc enum,
+//     walk_musl_dso_chain, MUSL_DSO_TLS_ID_OFFSET).
+//
+//   - glibc link_map field discovery: The context-reader reads
+//     _thread_db_link_map_l_tls_modid and _thread_db_link_map_l_tls_offset symbols
+//     from libc.so to discover the byte offsets of TLS fields within link_map at
+//     runtime, rather than hardcoding them per glibc version.
+//     See: context-reader/src/tls_symbols/dynamic_linker.rs (discover_tls_field_offsets).
 func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
 	ef, err := info.GetELF()
 	if err != nil {
@@ -121,7 +154,7 @@ func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interprete
 		}, nil
 	}
 
-	// Strategy 3: DTPMOD (for dlopen'd libraries without TLSDESC)
+	// Strategy 3: Named DTPMOD (for dlopen'd libraries without TLSDESC)
 	var moduleIdOffset libpf.Address
 	var symbolOffset uint64
 	foundDTPMOD := false
@@ -156,7 +189,7 @@ func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interprete
 			log.Debugf("TLCR: failed to visit DTPOFF relocations for %s: %v", info.FileName(), err)
 		}
 
-		log.Debugf("TLCR: found DTPMOD for %s at 0x%08X, symbol offset %d in %s",
+		log.Debugf("TLCR: found named DTPMOD for %s at 0x%08X, symbol offset %d in %s",
 			tlsSymbolName, moduleIdOffset, symbolOffset, info.FileName())
 
 		return &data{
@@ -166,7 +199,34 @@ func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interprete
 		}, nil
 	}
 
-	// Strategy 4: Local Exec TLS (static binaries / main executables).
+	// Strategy 4: Anonymous DTPMOD (Local Dynamic model).
+	// The symbol is LOCAL in .symtab, so the linker uses the LD model with a
+	// single anonymous DTPMOD64 shared by all LOCAL TLS variables in the module.
+	// The symbol's st_value is the offset within the module's TLS block.
+	var anonDTPMODOffset libpf.Address
+	if err = ef.VisitRelocations(func(r pfelf.ElfReloc, _ string) bool {
+		anonDTPMODOffset = libpf.Address(r.Off)
+		return false // take the first DTPMOD64 (all anonymous ones share the same module ID)
+	}, func(rela pfelf.ElfReloc) bool {
+		ty := rela.Info & 0xffff
+		return (ef.Machine == elf.EM_AARCH64 && elf.R_AARCH64(ty) == elf.R_AARCH64_TLS_DTPMOD64) ||
+			(ef.Machine == elf.EM_X86_64 && elf.R_X86_64(ty) == elf.R_X86_64_DTPMOD64)
+	}); err != nil {
+		log.Debugf("TLCR: failed to visit anonymous DTPMOD relocations for %s: %v",
+			info.FileName(), err)
+	}
+
+	if anonDTPMODOffset != 0 {
+		log.Debugf("TLCR: found anonymous DTPMOD at 0x%08X, using st_value 0x%X as TLS offset in %s",
+			anonDTPMODOffset, tlsSymbolOffset, info.FileName())
+		return &data{
+			moduleIdOffset: anonDTPMODOffset,
+			symbolOffset:   uint64(tlsSymbolOffset),
+			useDTV:         true,
+		}, nil
+	}
+
+	// Strategy 5: Local Exec TLS (static binaries / main executables).
 	// No TLS relocations exist because the linker resolved the TP offset at link time.
 	// Compute the offset from the thread pointer using the PT_TLS segment and the
 	// ELF TLS ABI for the target architecture.
@@ -189,11 +249,11 @@ func Loader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interprete
 // computeLocalExecTPOffset computes the thread-pointer-relative offset for a TLS
 // variable in the main executable's initial TLS block, using the ELF TLS ABI.
 //
-// This is Strategy 4 in the Loader and corresponds to TlsLocation::MainExecutable
+// This is Strategy 5 in the Loader and corresponds to TlsLocation::MainExecutable
 // in the reference context-reader (research/ctx-sharing-demo/context-reader/).
 // The reference implementation additionally supports reading l_tls_offset from
 // glibc's link_map for shared library static TLS; we don't need that because
-// Strategies 1-3 cover shared libraries via relocations.
+// Strategies 1-4 cover shared libraries via relocations.
 //
 // Architecture formulas (from the ELF TLS specification):
 //   - ARM64 (variant 1): TP + round_up(tcb_size, p_align) + st_value
@@ -250,9 +310,9 @@ func roundUp(val, align uint64) uint64 {
 //     computeLocalExecTPOffset. No runtime reads needed.
 type data struct {
 	tlsDescElfAddr libpf.Address // ELF address of TLSDESC GOT entry (Strategies 1 & 2)
-	moduleIdOffset libpf.Address // ELF address of DTPMOD GOT entry (Strategy 3)
-	symbolOffset   uint64        // Symbol offset within TLS block (Strategy 3)
-	staticTPOffset int64         // Pre-computed TP offset (Strategy 4)
+	moduleIdOffset libpf.Address // ELF address of DTPMOD GOT entry (Strategies 3 & 4)
+	symbolOffset   uint64        // Symbol offset within TLS block (Strategies 3 & 4)
+	staticTPOffset int64         // Pre-computed TP offset (Strategy 5)
 	useDTV         bool          // Use DTV-based TLS access
 	useStaticTLS   bool          // Use pre-computed static TP offset
 }
