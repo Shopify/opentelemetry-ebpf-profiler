@@ -55,13 +55,6 @@ static EBPF_INLINE u64 read_tls_addr_from_dtv(u64 symbol, u32 module_id,
     return 0;
   }
 
-  DEBUG_PRINT("[TLCR] dtv: TP=0x%llx DTV=0x%llx block=0x%llx", tsd_base, dtv_addr, addr);
-
-  // Control: read 8 bytes at block+0 to verify bpf_probe_read_user works here
-  u64 control_val;
-  bpf_probe_read_user(&control_val, sizeof(control_val), (void *)addr);
-  DEBUG_PRINT("[TLCR] dtv: block[0]=0x%llx block[%llu]=?", control_val, symbol);
-
   addr += symbol;
   return addr;
 }
