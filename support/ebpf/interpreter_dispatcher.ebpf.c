@@ -274,7 +274,7 @@ static EBPF_INLINE void maybe_add_tlcr_info(Trace *trace)
     return;
   }
 
-  DEBUG_PRINT("Trace is within a process with TLCR enabled");
+  DEBUG_PRINT("[TLCR] pid=%d use_dtv=%d", pid, proc->use_dtv);
 
   // Resolve the address of the TLCR TLS variable in the target thread.
   u64 tlcr_ptr_addr;
@@ -286,7 +286,7 @@ static EBPF_INLINE void maybe_add_tlcr_info(Trace *trace)
       proc->dtv_offset, proc->dtv_step, proc->dtv_indirect);
     if (!tlcr_ptr_addr) {
       increment_metric(metricID_UnwindTlcrErrReadTsdBase);
-      DEBUG_PRINT("Failed to resolve TLCR TLS address via DTV");
+      DEBUG_PRINT("[TLCR] ERR: DTV resolution failed");
       return;
     }
   } else {
@@ -295,33 +295,33 @@ static EBPF_INLINE void maybe_add_tlcr_info(Trace *trace)
     u64 tsd_base;
     if (tsd_get_base((void **)&tsd_base) != 0) {
       increment_metric(metricID_UnwindTlcrErrReadTsdBase);
-      DEBUG_PRINT("Failed to get TSD base for TLCR");
+      DEBUG_PRINT("[TLCR] ERR: failed to get TSD base");
       return;
     }
     tlcr_ptr_addr = tsd_base + proc->tls_tpbase_offset;
   }
 
-  DEBUG_PRINT("TLCR ptr addr: 0x%llx", tlcr_ptr_addr);
+  DEBUG_PRINT("[TLCR] var_addr=0x%llx", tlcr_ptr_addr);
 
   void *record_ptr;
   if (bpf_probe_read_user(&record_ptr, sizeof(record_ptr), (void *)tlcr_ptr_addr)) {
     increment_metric(metricID_UnwindTlcrErrReadPtr);
-    DEBUG_PRINT("Failed to read TLCR pointer");
+    DEBUG_PRINT("[TLCR] ERR: read failed at 0x%llx", tlcr_ptr_addr);
     return;
   }
-  DEBUG_PRINT("TLCR record_ptr: 0x%llx", (u64)record_ptr);
+  DEBUG_PRINT("[TLCR] record_ptr=0x%llx", (u64)record_ptr);
   if (!record_ptr) {
-    return; // No active context (e.g. thread is idle between requests)
+    return;
   }
 
   TlcrRecord record;
   if (bpf_probe_read_user(&record, sizeof(record), record_ptr)) {
     increment_metric(metricID_UnwindTlcrErrReadRecord);
-    DEBUG_PRINT("Failed to read TLCR record at 0x%llx", (u64)record_ptr);
+    DEBUG_PRINT("[TLCR] ERR: record read failed at 0x%llx", (u64)record_ptr);
     return;
   }
   if (record.valid != 1) {
-    DEBUG_PRINT("TLCR record.valid=%d (not 1), ignoring", record.valid);
+    DEBUG_PRINT("[TLCR] record.valid=%d, ignoring", record.valid);
     return;
   }
 
@@ -329,7 +329,7 @@ static EBPF_INLINE void maybe_add_tlcr_info(Trace *trace)
   __builtin_memcpy(&trace->apm_transaction_id, record.span_id, 8);
   increment_metric(metricID_UnwindTlcrReadSuccesses);
 
-  DEBUG_PRINT("TLCR read success, span_id: %016llX", trace->apm_transaction_id.as_int);
+  DEBUG_PRINT("[TLCR] OK span=%016llX", trace->apm_transaction_id.as_int);
 }
 
 // unwind_stop is the tail call destination for PROG_UNWIND_STOP.

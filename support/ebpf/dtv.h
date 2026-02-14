@@ -21,7 +21,7 @@ static EBPF_INLINE u64 read_tls_addr_from_dtv(u64 symbol, u32 module_id,
 
   u64 tsd_base;
   if (tsd_get_base((void **)&tsd_base) != 0) {
-    DEBUG_PRINT("dtv: failed to get TSD base for TLS symbol lookup");
+    DEBUG_PRINT("[TLCR] dtv: failed to get TSD base");
     return 0;
   }
 
@@ -33,7 +33,7 @@ static EBPF_INLINE u64 read_tls_addr_from_dtv(u64 symbol, u32 module_id,
   u64 dtv_ptr_base = tsd_base;
   if (dtv_indirect) {
     if ((err = bpf_probe_read_user(&dtv_ptr_base, sizeof(void *), (void *)tsd_base))) {
-      DEBUG_PRINT("dtv: failed to read indirect base at TP: %d", err);
+      DEBUG_PRINT("[TLCR] dtv: failed indirect base read: %d", err);
       return 0;
     }
   }
@@ -41,7 +41,7 @@ static EBPF_INLINE u64 read_tls_addr_from_dtv(u64 symbol, u32 module_id,
   u64 dtv_addr;
   if ((err = bpf_probe_read_user(&dtv_addr, sizeof(void *),
                                  (void *)((s64)dtv_ptr_base + dtv_off)))) {
-    DEBUG_PRINT("dtv: failed to read DTV addr at base+%d: %d", dtv_off, err);
+    DEBUG_PRINT("[TLCR] dtv: failed DTV ptr read at base+%d: %d", dtv_off, err);
     return 0;
   }
 
@@ -50,10 +50,18 @@ static EBPF_INLINE u64 read_tls_addr_from_dtv(u64 symbol, u32 module_id,
 
   if ((err = bpf_probe_read_user(&addr, sizeof(void *),
                                  (void *)(dtv_addr + dtv_entry_offset)))) {
-    DEBUG_PRINT("dtv: failed to read TLS block for module %d at offset %llu: %d",
+    DEBUG_PRINT("[TLCR] dtv: failed TLS block read mod=%d off=%llu: %d",
                 module_id, dtv_entry_offset, err);
     return 0;
   }
+
+  DEBUG_PRINT("[TLCR] dtv: TP=0x%llx DTV=0x%llx block=0x%llx", tsd_base, dtv_addr, addr);
+
+  // Control: read 8 bytes at block+0 to verify bpf_probe_read_user works here
+  u64 control_val;
+  bpf_probe_read_user(&control_val, sizeof(control_val), (void *)addr);
+  DEBUG_PRINT("[TLCR] dtv: block[0]=0x%llx block[%llu]=?", control_val, symbol);
+
   addr += symbol;
   return addr;
 }
