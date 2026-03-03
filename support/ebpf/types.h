@@ -495,6 +495,10 @@ typedef struct RubyProcInfo {
   // Whether the JIT is emitting frame pointers (e.g. --yjit-perf on x86_64, always on arm64).
   // When true, we walk the native FP chain through JIT frames instead of stopping.
   bool frame_pointers_enabled;
+  // When true, cfunc frames are pushed inline without transitioning back to the
+  // native unwinder. This saves tail calls at the cost of losing native frames
+  // within cfuncs, preventing stack truncation on deep mixed stacks.
+  bool skip_native_resume;
 
   // Offsets and sizes of Ruby internal structs
 

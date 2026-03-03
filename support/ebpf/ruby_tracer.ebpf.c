@@ -276,6 +276,10 @@ static EBPF_INLINE ErrorCode read_ruby_frame(
         // through JIT frames to get back to native code. Push the cfunc inline
         // instead of handing off to the native unwinder.
         frame_type = RUBY_FRAME_TYPE_CME_CFUNC;
+      } else if (rubyinfo->skip_native_resume) {
+        // Push cfunc inline without transitioning to the native unwinder.
+        // This saves tail calls at the cost of losing native frames within cfuncs.
+        frame_type = RUBY_FRAME_TYPE_CME_CFUNC;
       } else {
         // We save this cfp on in the "Record" entry, and when we start the unwinder
         // again we'll push it so that the order is correct and the cfunc "owns" any native code we
