@@ -287,6 +287,7 @@ type RubyProcInfo struct {
 	Current_ec_tpbase_tls_offset uint64
 	Current_ctx_ptr              uint64
 	Has_objspace                 bool
+	Skip_native_resume           bool
 	Vm_stack                     uint8
 	Vm_stack_size                uint8
 	Cfp                          uint8
@@ -303,7 +304,7 @@ type RubyProcInfo struct {
 	Cme_method_def               uint8
 	Size_of_value                uint8
 	Running_ec                   uint16
-	Pad_cgo_0                    [4]byte
+	Pad_cgo_0                    [2]byte
 }
 type V8ProcInfo struct {
 	Version                      uint32
