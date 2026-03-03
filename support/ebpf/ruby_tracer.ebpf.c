@@ -270,10 +270,9 @@ static EBPF_INLINE ErrorCode read_ruby_frame(
         // continue unwinding Ruby VM frames. Due to this issue, the ordering of Ruby and native
         // frames will almost certainly be incorrect for Ruby versions < 2.6.
         frame_type = RUBY_FRAME_TYPE_CME_CFUNC;
-      } else if (record->rubyUnwindState.jit_detected) {
-        // JIT is active but frame pointers are not available, so we cannot unwind
-        // through JIT frames to get back to native code. Push the cfunc inline
-        // instead of handing off to the native unwinder.
+      } else if (record->rubyUnwindState.jit_detected || rubyinfo->skip_native_resume) {
+        // JIT code and skip_native_resume both push cfuncs inline instead of
+        // handing off to the native unwinder.
         frame_type = RUBY_FRAME_TYPE_CME_CFUNC;
       } else {
         // We save this cfp on in the "Record" entry, and when we start the unwinder
@@ -484,8 +483,11 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
     if (last_stack_frame <= stack_ptr) {
       // We have processed all frames in the Ruby VM and can stop here.
       // If JIT was detected, the PC is in the JIT region and native
-      // unwinding would fail, so we stop.
-      *next_unwinder = record->rubyUnwindState.jit_detected ? PROG_UNWIND_STOP : PROG_UNWIND_NATIVE;
+      // unwinding would fail, so we stop. If skip_native_resume is set, stop
+      // instead of resuming native unwinding.
+      *next_unwinder = record->rubyUnwindState.jit_detected || rubyinfo->skip_native_resume
+                         ? PROG_UNWIND_STOP
+                         : PROG_UNWIND_NATIVE;
       goto save_state;
     } else {
       // If we aren't at the end, advance the stack pointer to continue from the next frame
