@@ -290,6 +290,7 @@ type RubyProcInfo struct {
 	Tls_module_id                uint32
 	Current_ctx_ptr              uint64
 	Has_objspace                 bool
+	Skip_native_resume           bool
 	Jit_start                    uint64
 	Jit_end                      uint64
 	Vm_stack                     uint8
