@@ -289,6 +289,7 @@ type RubyProcInfo struct {
 	Has_objspace                 bool
 	Jit_start                    uint64
 	Jit_end                      uint64
+	Frame_pointers_enabled       bool
 	Vm_stack                     uint8
 	Vm_stack_size                uint8
 	Cfp                          uint8

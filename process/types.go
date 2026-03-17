@@ -45,7 +45,7 @@ func (m *Mapping) IsExecutable() bool {
 }
 
 func (m *Mapping) IsAnonymous() bool {
-	return m.Path == libpf.NullString || m.IsMemFD()
+	return m.Path == libpf.NullString || m.IsMemFD() || strings.HasPrefix(m.Path.String(), "[anon:")
 }
 
 func (m *Mapping) IsMemFD() bool {
