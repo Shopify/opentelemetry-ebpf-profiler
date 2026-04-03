@@ -6,6 +6,8 @@ package libpf // import "go.opentelemetry.io/ebpf-profiler/libpf"
 import (
 	"unique"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
 	"go.opentelemetry.io/ebpf-profiler/stringutil"
 )
 
@@ -148,6 +150,7 @@ type EbpfTrace struct {
 	Origin           Origin
 	APMTraceID       APMTraceID
 	APMTransactionID APMTransactionID
+	Resource         *pcommon.Resource
 }
 
 type EbpfFrame []uint64
