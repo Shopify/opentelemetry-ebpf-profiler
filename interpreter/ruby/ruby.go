@@ -1286,6 +1286,56 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 // On x86_64, frame pointers are only emitted when --yjit-perf or --yjit-perf=fp is used.
 // When --yjit-perf is active, YJIT also creates /tmp/perf-PID.map, which we use as the
 // detection signal on x86_64.
+// findJITRegion detects the YJIT JIT code region from process memory mappings.
+// YJIT reserves a large contiguous address range (typically 48-128 MiB) via mmap
+// with PROT_NONE and then mprotects individual 16k codepages to r-x as needed.
+// On systems with CONFIG_ANON_VMA_NAME, Ruby labels the region via prctl(PR_SET_VMA)
+// giving it a path like "[anon:Ruby:rb_yjit_reserve_addr_space]".
+// On systems without that config, we fall back to a heuristic: the first anonymous
+// executable mapping (by address) is assumed to be the JIT region since YJIT
+// initializes before any gems could create anonymous executable mappings.
+// Returns (start, end, found).
+func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
+	var jitStart, jitEnd uint64
+	labelFound := false
+	var heuristicStart, heuristicEnd uint64
+	heuristicFound := false
+
+	for idx := range mappings {
+		m := &mappings[idx]
+
+		// Check for prctl-labeled JIT region. These mappings may be ---p (PROT_NONE)
+		// or r-xp depending on whether YJIT has activated codepages in this region.
+		if strings.Contains(m.Path, "jit_reserve_addr_space") {
+			if !labelFound || m.Vaddr < jitStart {
+				jitStart = m.Vaddr
+			}
+			if !labelFound || m.Vaddr+m.Length > jitEnd {
+				jitEnd = m.Vaddr + m.Length
+			}
+			labelFound = true
+			continue
+		}
+
+		// Heuristic fallback: first anonymous executable mapping by address.
+		// Mappings from /proc/pid/maps are sorted by address, so the first
+		// match is the lowest address.
+		if !heuristicFound && m.IsExecutable() && m.IsAnonymous() {
+			heuristicStart = m.Vaddr
+			heuristicEnd = m.Vaddr + m.Length
+			heuristicFound = true
+		}
+	}
+
+	if labelFound {
+		return jitStart, jitEnd, true
+	}
+	if heuristicFound {
+		return heuristicStart, heuristicEnd, true
+	}
+	return 0, 0, false
+}
+
 func hasJitFramePointers(pr process.Process) bool {
 	machine := pr.GetMachineData().Machine
 	if machine == elf.EM_AARCH64 {
