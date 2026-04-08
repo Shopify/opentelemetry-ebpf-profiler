@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
-	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -1281,11 +1281,6 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 	return libpf.Intern(profileLabel)
 }
 
-// hasJitFramePointers detects whether YJIT is emitting frame pointers for this process.
-// On arm64, YJIT always emits frame pointers unconditionally.
-// On x86_64, frame pointers are only emitted when --yjit-perf or --yjit-perf=fp is used.
-// When --yjit-perf is active, YJIT also creates /tmp/perf-PID.map, which we use as the
-// detection signal on x86_64.
 // findJITRegion detects the YJIT JIT code region from process memory mappings.
 // YJIT reserves a large contiguous address range (typically 48-128 MiB) via mmap
 // with PROT_NONE and then mprotects individual 16k codepages to r-x as needed.
@@ -1336,6 +1331,11 @@ func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
 	return 0, 0, false
 }
 
+// hasJitFramePointers detects whether YJIT is emitting frame pointers for this process.
+// On arm64, YJIT always emits frame pointers unconditionally.
+// On x86_64, frame pointers are only emitted when --yjit-perf or --yjit-perf=fp is used.
+// When --yjit-perf is active, YJIT also creates /tmp/perf-PID.map, which we use as the
+// detection signal on x86_64.
 func hasJitFramePointers(pr process.Process) bool {
 	machine := pr.GetMachineData().Machine
 	if machine == elf.EM_AARCH64 {
@@ -1345,8 +1345,11 @@ func hasJitFramePointers(pr process.Process) bool {
 
 	// On x86_64, check for the perf map file which indicates --yjit-perf was used.
 	// The --yjit-perf flag enables both frame pointers and the perf map.
-	perfMapPath := fmt.Sprintf("/tmp/perf-%d.map", pr.PID())
-	if _, err := os.Stat(perfMapPath); err == nil {
+	// We access via /proc/PID/root/tmp/ to handle containerized processes with
+	// different mount namespaces. We glob perf-*.map because Ruby uses its
+	// namespace-local PID for the filename, which differs from the host PID.
+	perfMapPattern := fmt.Sprintf("/proc/%d/root/tmp/perf-*.map", pr.PID())
+	if matches, err := filepath.Glob(perfMapPattern); err == nil && len(matches) > 0 {
 		return true
 	}
 
