@@ -4,10 +4,13 @@
 package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 
 import (
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/bits"
+	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -25,9 +28,12 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
+	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	npsr "go.opentelemetry.io/ebpf-profiler/nopanicslicereader"
+	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
+	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/successfailurecounter"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/util"
@@ -96,6 +102,17 @@ const (
 	rubyGcModeCompacting = 3
 )
 
+// skipNativeResume returns whether the Ruby unwinder should push cfunc frames
+// inline without transitioning back to the native unwinder. This saves tail
+// calls (each cfunc round-trip costs 2-3 tail calls out of a budget of 29)
+// at the cost of losing native frames within cfuncs.
+// Opt-in via OTEL_EBPF_RUBY_SKIP_NATIVE_RESUME=true (default: false).
+// Evaluated per-process at attach time; could be hoisted to Loader if needed.
+func skipNativeResume() bool {
+	v := os.Getenv("OTEL_EBPF_RUBY_SKIP_NATIVE_RESUME")
+	return strings.EqualFold(v, "true") || v == "1"
+}
+
 var (
 	// regex to identify the Ruby interpreter shared library
 	libRubyRegex = regexp.MustCompile(`^(?:.*/)?libruby(?:-.*)?\.so\.(\d+)\.(\d+)\.(\d+)$`)
@@ -104,14 +121,16 @@ var (
 	// regex to extract a version from a string
 	rubyVersionRegex = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)$`)
 
-	unknownCfunc     = libpf.Intern("<unknown cfunc>")
-	cfuncDummyFile   = libpf.Intern("<cfunc>")
-	rubyGcFrame      = libpf.Intern("(garbage collection)")
-	rubyGcRunning    = libpf.Intern("(running)")
-	rubyGcMarking    = libpf.Intern("(marking)")
-	rubyGcSweeping   = libpf.Intern("(sweeping)")
-	rubyGcCompacting = libpf.Intern("(compacting)")
-	rubyGcDummyFile  = libpf.Intern("<gc>")
+	unknownCfunc      = libpf.Intern("<unknown cfunc>")
+	cfuncDummyFile    = libpf.Intern("<cfunc>")
+	rubyGcFrame       = libpf.Intern("(garbage collection)")
+	rubyGcRunning     = libpf.Intern("(running)")
+	rubyGcMarking     = libpf.Intern("(marking)")
+	rubyGcSweeping    = libpf.Intern("(sweeping)")
+	rubyGcCompacting  = libpf.Intern("(compacting)")
+	rubyGcDummyFile   = libpf.Intern("<gc>")
+	rubyJitDummyFrame = libpf.Intern("<unknown jit code>")
+	rubyJitDummyFile  = libpf.Intern("<jitted code>")
 	// compiler check to make sure the needed interfaces are satisfied
 	_ interpreter.Data     = &rubyData{}
 	_ interpreter.Instance = &rubyInstance{}
@@ -358,6 +377,10 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		Size_of_value: r.vmStructs.size_of_value,
 
 		Running_ec: r.vmStructs.rb_ractor_struct.running_ec,
+
+		// Skip native resume for cfuncs to save tail calls when opted in.
+		// Enable with OTEL_EBPF_RUBY_SKIP_NATIVE_RESUME=true.
+		Skip_native_resume: skipNativeResume(),
 	}
 
 	if err := ebpf.UpdateProcData(libpf.Ruby, pid, unsafe.Pointer(&cdata)); err != nil {
@@ -376,6 +399,8 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		procInfo:          &cdata,
 		globalSymbolsAddr: r.globalSymbolsAddr + bias,
 		addrToString:      addrToString,
+		mappings:          make(map[process.RawMapping]*uint32),
+		prefixes:          make(map[lpm.Prefix]*uint32),
 		memPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, 512)
@@ -425,6 +450,7 @@ type rubyInstance struct {
 
 	// lastId is a cached copy index of the final entry in the global symbol table
 	lastId uint32
+
 	// globalSymbolsAddr is the offset of the global symbol table, for looking up ruby symbolic ids
 	globalSymbolsAddr libpf.Address
 
@@ -437,10 +463,28 @@ type rubyInstance struct {
 	// maxSize is the largest number we did see in the last reporting interval for size
 	// in getRubyLineNo.
 	maxSize atomic.Uint32
+
+	// mappings is indexed by the Mapping to its generation
+	mappings map[process.RawMapping]*uint32
+	// prefixes is indexed by the prefix added to ebpf maps (to be cleaned up) to its generation
+	prefixes map[lpm.Prefix]*uint32
+	// mappingGeneration is the current generation (so old entries can be pruned)
+	mappingGeneration uint32
 }
 
 func (r *rubyInstance) Detach(ebpf interpreter.EbpfHandler, pid libpf.PID) error {
-	return ebpf.DeleteProcData(libpf.Ruby, pid)
+	var err error
+	err = ebpf.DeleteProcData(libpf.Ruby, pid)
+
+	for prefix := range r.prefixes {
+		if err2 := ebpf.DeletePidInterpreterMapping(pid, prefix); err2 != nil {
+			err = errors.Join(err,
+				fmt.Errorf("failed to remove ruby prefix 0x%x/%d: %v",
+					prefix.Key, prefix.Length, err2))
+		}
+	}
+
+	return err
 }
 
 // UpdateLibcInfo is called when libc introspection data becomes available.
@@ -1115,6 +1159,15 @@ func (r *rubyInstance) Symbolize(ef libpf.EbpfFrame, frames *libpf.Frames, _ lib
 			SourceLine:   0,
 		})
 		return nil
+	case support.RubyFrameTypeJit:
+		label := rubyJitDummyFrame
+		frames.Append(&libpf.Frame{
+			Type:         libpf.RubyFrame,
+			FunctionName: label,
+			SourceFile:   rubyJitDummyFile,
+			SourceLine:   0,
+		})
+		return nil
 	default:
 		return fmt.Errorf("Unable to get CME or ISEQ from frame address (%d)", frameAddrType)
 	}
@@ -1242,6 +1295,162 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 
 	// Get the prefix from label and concatenate with qualifiedMethodName
 	return libpf.Intern(profileLabel)
+}
+
+// findJITRegion detects the YJIT JIT code region from process memory mappings.
+// YJIT reserves a large contiguous address range (typically 48-128 MiB) via mmap
+// with PROT_NONE and then mprotects individual 16k codepages to r-x as needed.
+// On systems with CONFIG_ANON_VMA_NAME, Ruby labels the region via prctl(PR_SET_VMA)
+// giving it a path like "[anon:Ruby:rb_yjit_reserve_addr_space]".
+// On systems without that config, we fall back to a heuristic: the first anonymous
+// executable mapping (by address) is assumed to be the JIT region since YJIT
+// initializes before any gems could create anonymous executable mappings.
+// Returns (start, end, found).
+func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
+	var jitStart, jitEnd uint64
+	labelFound := false
+	var heuristicStart, heuristicEnd uint64
+	heuristicFound := false
+
+	for idx := range mappings {
+		m := &mappings[idx]
+
+		// Check for prctl-labeled JIT region. These mappings may be ---p (PROT_NONE)
+		// or r-xp depending on whether YJIT has activated codepages in this region.
+		if strings.Contains(m.Path, "jit_reserve_addr_space") {
+			if !labelFound || m.Vaddr < jitStart {
+				jitStart = m.Vaddr
+			}
+			if !labelFound || m.Vaddr+m.Length > jitEnd {
+				jitEnd = m.Vaddr + m.Length
+			}
+			labelFound = true
+			continue
+		}
+
+		// Heuristic fallback: first anonymous executable mapping by address.
+		// Mappings from /proc/pid/maps are sorted by address, so the first
+		// match is the lowest address.
+		if !heuristicFound && m.IsExecutable() && m.IsAnonymous() {
+			heuristicStart = m.Vaddr
+			heuristicEnd = m.Vaddr + m.Length
+			heuristicFound = true
+		}
+	}
+
+	if labelFound {
+		return jitStart, jitEnd, true
+	}
+	if heuristicFound {
+		return heuristicStart, heuristicEnd, true
+	}
+	return 0, 0, false
+}
+
+// hasJitFramePointers detects whether YJIT is emitting frame pointers for this process.
+// On arm64, YJIT always emits frame pointers unconditionally.
+// On x86_64, frame pointers are only emitted when --yjit-perf or --yjit-perf=fp is used.
+// When --yjit-perf is active, YJIT also creates /tmp/perf-PID.map, which we use as the
+// detection signal on x86_64.
+func hasJitFramePointers(pr process.Process) bool {
+	machine := pr.GetMachineData().Machine
+	if machine == elf.EM_AARCH64 {
+		// YJIT on arm64 always emits frame pointers (unconditionally in the backend).
+		return true
+	}
+
+	// On x86_64, check for the perf map file which indicates --yjit-perf was used.
+	// The --yjit-perf flag enables both frame pointers and the perf map.
+	// We access via /proc/PID/root/tmp/ to handle containerized processes with
+	// different mount namespaces. We glob perf-*.map because Ruby uses its
+	// namespace-local PID for the filename, which differs from the host PID.
+	perfMapPattern := fmt.Sprintf("/proc/%d/root/tmp/perf-*.map", pr.PID())
+	if matches, err := filepath.Glob(perfMapPattern); err == nil && len(matches) > 0 {
+		return true
+	}
+
+	return false
+}
+
+func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
+	_ reporter.ExecutableReporter, pr process.Process, mappings []process.RawMapping) error {
+	pid := pr.PID()
+	r.mappingGeneration++
+
+	log.Debugf("Synchronizing ruby mappings")
+
+	// Register LPM prefixes for executable anonymous mappings.
+	for idx := range mappings {
+		m := &mappings[idx]
+		if !m.IsExecutable() || !m.IsAnonymous() {
+			continue
+		}
+
+		if gen, exists := r.mappings[*m]; exists {
+			*gen = r.mappingGeneration
+			continue
+		}
+
+		// Generate a new uint32 pointer which is shared for mapping and the prefixes it owns
+		// so updating the mapping above will reflect to prefixes also.
+		mappingGeneration := r.mappingGeneration
+		r.mappings[*m] = &mappingGeneration
+
+		log.Debugf("Enabling Ruby interpreter for %#x/%#x", m.Vaddr, m.Length)
+
+		prefixes, err := lpm.CalculatePrefixList(m.Vaddr, m.Vaddr+m.Length)
+		if err != nil {
+			return fmt.Errorf("new anonymous mapping lpm failure %#x/%#x: %w", m.Vaddr, m.Length, err)
+		}
+
+		for _, prefix := range prefixes {
+			_, exists := r.prefixes[prefix]
+			if !exists {
+				err := ebpf.UpdatePidInterpreterMapping(pid, prefix, support.ProgUnwindRuby, 0, 0)
+				if err != nil {
+					return err
+				}
+			}
+			r.prefixes[prefix] = &mappingGeneration
+		}
+	}
+	// Detect JIT region from all mappings and update proc data if changed.
+	jitStart, jitEnd, jitFound := findJITRegion(mappings)
+	if jitFound && (r.procInfo.Jit_start != jitStart || r.procInfo.Jit_end != jitEnd) {
+		r.procInfo.Jit_start = jitStart
+		r.procInfo.Jit_end = jitEnd
+
+		// Detect whether the JIT is emitting frame pointers.
+		// On arm64, YJIT always emits frame pointers unconditionally.
+		// On x86_64, frame pointers are only emitted with --yjit-perf or --yjit-perf=fp,
+		// which also creates a /tmp/perf-PID.map file as a side effect.
+		r.procInfo.Frame_pointers_enabled = hasJitFramePointers(pr)
+
+		if err := ebpf.UpdateProcData(libpf.Ruby, pr.PID(), unsafe.Pointer(r.procInfo)); err != nil {
+			return err
+		}
+		log.Debugf("Updated JIT region %#x-%#x in ruby proc info (frame_pointers=%v)",
+			jitStart, jitEnd, r.procInfo.Frame_pointers_enabled)
+	}
+	// Remove prefixes not seen
+	for prefix, generationPtr := range r.prefixes {
+		if *generationPtr == r.mappingGeneration {
+			continue
+		}
+		if err := ebpf.DeletePidInterpreterMapping(pid, prefix); err != nil {
+			log.Debugf("Failed to delete Ruby prefix %#v: %v", prefix, err)
+		}
+		delete(r.prefixes, prefix)
+	}
+	for m, generationPtr := range r.mappings {
+		if *generationPtr == r.mappingGeneration {
+			continue
+		}
+		log.Debugf("Disabling Ruby for %#x/%#x", m.Vaddr, m.Length)
+		delete(r.mappings, m)
+	}
+
+	return nil
 }
 
 func (r *rubyInstance) GetAndResetMetrics() ([]metrics.Metric, error) {
