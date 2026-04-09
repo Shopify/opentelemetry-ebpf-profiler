@@ -461,7 +461,7 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
   // When frame pointers are not available, we push a single dummy JIT frame and
   // set jit_detected to suppress native unwinding.
   bool in_jit = rubyinfo->jit_start > 0 && record->state.pc >= rubyinfo->jit_start &&
-                record->state.pc < rubyinfo->jit_end;
+                record->state.pc < rubyinfo->jit_end && !record->rubyUnwindState.jit_detected;
 
   if (in_jit) {
     if (rubyinfo->frame_pointers_enabled) {
