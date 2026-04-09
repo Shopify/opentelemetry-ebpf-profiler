@@ -4,10 +4,12 @@
 package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 
 import (
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/bits"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -1329,6 +1331,31 @@ func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
 	return 0, 0, false
 }
 
+// hasJitFramePointers detects whether YJIT is emitting frame pointers for this process.
+// On arm64, YJIT always emits frame pointers unconditionally.
+// On x86_64, frame pointers are only emitted when --yjit-perf or --yjit-perf=fp is used.
+// When --yjit-perf is active, YJIT also creates /tmp/perf-PID.map, which we use as the
+// detection signal on x86_64.
+func hasJitFramePointers(pr process.Process) bool {
+	machine := pr.GetMachineData().Machine
+	if machine == elf.EM_AARCH64 {
+		// YJIT on arm64 always emits frame pointers (unconditionally in the backend).
+		return true
+	}
+
+	// On x86_64, check for the perf map file which indicates --yjit-perf was used.
+	// The --yjit-perf flag enables both frame pointers and the perf map.
+	// We access via /proc/PID/root/tmp/ to handle containerized processes with
+	// different mount namespaces. We glob perf-*.map because Ruby uses its
+	// namespace-local PID for the filename, which differs from the host PID.
+	perfMapPattern := fmt.Sprintf("/proc/%d/root/tmp/perf-*.map", pr.PID())
+	if matches, err := filepath.Glob(perfMapPattern); err == nil && len(matches) > 0 {
+		return true
+	}
+
+	return false
+}
+
 func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 	_ reporter.ExecutableReporter, pr process.Process, mappings []process.RawMapping) error {
 	pid := pr.PID()
@@ -1370,10 +1397,18 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 	if jitFound && (r.procInfo.Jit_start != jitStart || r.procInfo.Jit_end != jitEnd) {
 		r.procInfo.Jit_start = jitStart
 		r.procInfo.Jit_end = jitEnd
+
+		// Detect whether the JIT is emitting frame pointers.
+		// On arm64, YJIT always emits frame pointers unconditionally.
+		// On x86_64, frame pointers are only emitted with --yjit-perf or --yjit-perf=fp,
+		// which also creates a /tmp/perf-PID.map file as a side effect.
+		r.procInfo.Frame_pointers_enabled = hasJitFramePointers(pr)
+
 		if err := ebpf.UpdateProcData(libpf.Ruby, pr.PID(), unsafe.Pointer(r.procInfo)); err != nil {
 			return err
 		}
-		log.Debugf("Updated JIT region %#x-%#x in ruby proc info", jitStart, jitEnd)
+		log.Debugf("Updated JIT region %#x-%#x in ruby proc info (frame_pointers=%v)",
+			jitStart, jitEnd, r.procInfo.Frame_pointers_enabled)
 	}
 	// Remove prefixes not seen
 	for prefix, gen := range r.prefixes {
