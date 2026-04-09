@@ -478,9 +478,11 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
 
     if (last_stack_frame <= stack_ptr) {
       // We have processed all frames in the Ruby VM and can stop here.
-      // If JIT was detected, the PC is in the JIT region and native
-      // unwinding would fail, so we stop.
-      *next_unwinder = record->rubyUnwindState.jit_detected ? PROG_UNWIND_STOP : PROG_UNWIND_NATIVE;
+      // If JIT was detected or skip_native_resume is set, stop instead of
+      // resuming native unwinding to prevent re-entering the Ruby unwinder.
+      *next_unwinder = (record->rubyUnwindState.jit_detected || rubyinfo->skip_native_resume)
+                         ? PROG_UNWIND_STOP
+                         : PROG_UNWIND_NATIVE;
       goto save_state;
     } else {
       // If we aren't at the end, advance the stack pointer to continue from the next frame
