@@ -465,22 +465,25 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
 
   if (in_jit) {
     if (rubyinfo->frame_pointers_enabled) {
-      // Push a leaf JIT frame with the raw machine PC for perf-map symbolization.
-      ErrorCode jit_error =
-        push_ruby(&record->state, trace, RUBY_FRAME_TYPE_JIT, (u64)record->state.pc, 0, 0);
-      if (jit_error) {
-        return jit_error;
+      // Only push a JIT frame if this is the leaf (first frame on the stack).
+      if (trace->num_frames == 0) {
+        ErrorCode jit_error =
+          push_ruby(&record->state, trace, RUBY_FRAME_TYPE_JIT, (u64)record->state.pc, 0, 0);
+        if (jit_error) {
+          return jit_error;
+        }
       }
-
     } else {
       // No frame pointers available: push a single dummy JIT frame.
       // Mark jit_detected so that cfuncs are pushed inline and end-of-stack uses
       // PROG_UNWIND_STOP instead of PROG_UNWIND_NATIVE.
       record->rubyUnwindState.jit_detected = true;
-      ErrorCode jit_error =
-        push_ruby(&record->state, trace, RUBY_FRAME_TYPE_JIT, (u64)record->state.pc, 0, 0);
-      if (jit_error) {
-        return jit_error;
+      if (trace->num_frames == 0) {
+        ErrorCode jit_error =
+          push_ruby(&record->state, trace, RUBY_FRAME_TYPE_JIT, (u64)record->state.pc, 0, 0);
+        if (jit_error) {
+          return jit_error;
+        }
       }
       in_jit = false;
     }
