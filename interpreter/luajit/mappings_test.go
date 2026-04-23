@@ -12,6 +12,7 @@ package luajit
 
 import (
 	"debug/elf"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -30,13 +31,20 @@ type prefixKey struct {
 // ebpfMapsMockup implements the ebpf interface as test mockup
 type ebpfMapsMockup struct {
 	interpreter.EbpfHandlerStubs
-	prefixes map[prefixKey]lpm.Prefix
+	prefixes      map[prefixKey]lpm.Prefix
+	updateCalls   int
+	failOnUpdate  int
+	updateFailure error
 }
 
 var _ interpreter.EbpfHandler = &ebpfMapsMockup{}
 
 func (m *ebpfMapsMockup) UpdatePidInterpreterMapping(pid libpf.PID,
 	pfx lpm.Prefix, _ uint8, _ host.FileID, _ uint64) error {
+	m.updateCalls++
+	if m.failOnUpdate != 0 && m.updateCalls == m.failOnUpdate {
+		return m.updateFailure
+	}
 	m.prefixes[prefixKey{pid: pid, pfx: pfx}] = pfx
 	return nil
 }
@@ -80,4 +88,31 @@ func TestSynchronizeMappings(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, ebpf.prefixes)
 	}
+}
+
+func TestAddTraceRollbackOnFailure(t *testing.T) {
+	ebpf := &ebpfMapsMockup{
+		prefixes:      make(map[prefixKey]lpm.Prefix),
+		failOnUpdate:  2,
+		updateFailure: errors.New("update failed"),
+	}
+	lj := &luajitInstance{}
+
+	_, err := lj.addTrace(ebpf, 123, trace{mcode: 10, szmcode: 12}, 456, 0)
+	require.ErrorIs(t, err, ebpf.updateFailure)
+	require.Empty(t, ebpf.prefixes)
+}
+
+func TestAddJITRegionRollbackOnFailure(t *testing.T) {
+	ebpf := &ebpfMapsMockup{
+		prefixes:      make(map[prefixKey]lpm.Prefix),
+		failOnUpdate:  2,
+		updateFailure: errors.New("update failed"),
+	}
+	lj := &luajitInstance{prefixes: make(map[regionKey][]lpm.Prefix)}
+
+	err := lj.addJITRegion(ebpf, 123, 10, 22)
+	require.ErrorIs(t, err, ebpf.updateFailure)
+	require.Empty(t, ebpf.prefixes)
+	require.Empty(t, lj.prefixes)
 }

@@ -194,6 +194,12 @@ func (l *luajitInstance) getVMList() []libpf.Address {
 	return gs
 }
 
+func rollbackPrefixes(ebpf interpreter.EbpfHandler, pid libpf.PID, prefixes []lpm.Prefix) {
+	for _, prefix := range prefixes {
+		_ = ebpf.DeletePidInterpreterMapping(pid, prefix)
+	}
+}
+
 func (l *luajitInstance) addJITRegion(ebpf interpreter.EbpfHandler, pid libpf.PID,
 	start, end uint64) error {
 	prefixes, err := lpm.CalculatePrefixList(start, end)
@@ -202,16 +208,19 @@ func (l *luajitInstance) addJITRegion(ebpf interpreter.EbpfHandler, pid libpf.PI
 		return err
 	}
 	logf("lj: add JIT region pid(%v) %#x:%#x", pid, start, end)
+	inserted := make([]lpm.Prefix, 0, len(prefixes))
 	for _, prefix := range prefixes {
 		// TODO: fix these: WARN[0267] Failed to lookup file ID 0x2a00000000
 		fileID := support.LJFileId << 32
 		if err := ebpf.UpdatePidInterpreterMapping(pid, prefix, support.ProgUnwindLuaJIT,
 			host.FileID(fileID), 0); err != nil {
+			rollbackPrefixes(ebpf, pid, inserted)
 			return err
 		}
+		inserted = append(inserted, prefix)
 	}
 	k := regionKey{start: start, end: end}
-	l.prefixes[k] = prefixes
+	l.prefixes[k] = inserted
 	return nil
 }
 
@@ -224,14 +233,17 @@ func (l *luajitInstance) addTrace(ebpf interpreter.EbpfHandler, pid libpf.PID, t
 		return nil, err
 	}
 	logf("lj: add trace mapping for pid(%v) %x:%x", pid, start, end)
+	inserted := make([]lpm.Prefix, 0, len(prefixes))
 	for _, prefix := range prefixes {
 		fileID := support.LJFileId<<32 | spadjust
 		if err := ebpf.UpdatePidInterpreterMapping(pid, prefix, support.ProgUnwindLuaJIT,
 			host.FileID(fileID), g); err != nil {
+			rollbackPrefixes(ebpf, pid, inserted)
 			return nil, err
 		}
+		inserted = append(inserted, prefix)
 	}
-	return prefixes, nil
+	return inserted, nil
 }
 
 func (l *luajitInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
