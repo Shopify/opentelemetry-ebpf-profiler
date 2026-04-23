@@ -53,6 +53,10 @@ func (m *EbpfHandlerStubs) DeletePidInterpreterMapping(_ libpf.PID, _ lpm.Prefix
 	return nil
 }
 
+func (m *EbpfHandlerStubs) GetPidPageToMappingInfoStats(libpf.PID) PidPageToMappingInfoStats {
+	return PidPageToMappingInfoStats{}
+}
+
 func (m *EbpfHandlerStubs) CoredumpTest() bool {
 	return false
 }

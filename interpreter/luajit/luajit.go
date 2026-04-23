@@ -32,6 +32,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/util"
+	"golang.org/x/sys/unix"
 )
 
 // Records all the "global" pointers we've seen.
@@ -44,6 +45,14 @@ type regionMap map[process.RawMapping]int
 type regionKey struct {
 	start, end uint64
 }
+
+const (
+	// Prefer dropping exact LuaJIT trace overlays for a VM over exhausting the
+	// shared pid_page_to_mapping_info map and starving the whole node of profiles.
+	luajitTracePrefixBudgetPerVM         = 1 << 17 // 131072
+	luajitTracePrefixBudgetPerPID        = 1 << 18 // 262144
+	pidPageToMappingInfoSoftLimitPercent = 50
+)
 
 type luajitData struct {
 	// The distance from the "g" pointer in the GG_State struct to the start of the dispatch table.
@@ -200,6 +209,18 @@ func rollbackPrefixes(ebpf interpreter.EbpfHandler, pid libpf.PID, prefixes []lp
 	}
 }
 
+func formatPidPageToMappingInfoStats(stats interpreter.PidPageToMappingInfoStats) string {
+	return fmt.Sprintf("approx_entries=%d approx_entries_for_pid=%d max_entries=%d",
+		stats.ApproxEntries, stats.ApproxEntriesForPID, stats.MaxEntries)
+}
+
+func pidPageToMappingInfoSoftLimit(stats interpreter.PidPageToMappingInfoStats) uint64 {
+	if stats.MaxEntries == 0 {
+		return 0
+	}
+	return uint64(stats.MaxEntries) * pidPageToMappingInfoSoftLimitPercent / 100
+}
+
 func (l *luajitInstance) clearTraceMappings(ebpf interpreter.EbpfHandler, pid libpf.PID,
 	g libpf.Address) {
 	rollbackPrefixes(ebpf, pid, l.prefixesByG[g])
@@ -231,15 +252,18 @@ func (l *luajitInstance) addJITRegion(ebpf interpreter.EbpfHandler, pid libpf.PI
 	return nil
 }
 
-func (l *luajitInstance) addTrace(ebpf interpreter.EbpfHandler, pid libpf.PID, t trace, g,
-	spadjust uint64) ([]lpm.Prefix, error) {
+func traceMappingPrefixes(t trace) ([]lpm.Prefix, error) {
 	start, end := t.mcode, t.mcode+uint64(t.szmcode)
 	prefixes, err := lpm.CalculatePrefixList(start, end)
 	if err != nil {
 		logf("lj: failed to calculate lpm: %v", err)
 		return nil, err
 	}
-	logf("lj: add trace mapping for pid(%v) %x:%x", pid, start, end)
+	return prefixes, nil
+}
+
+func (l *luajitInstance) mapTracePrefixes(ebpf interpreter.EbpfHandler, pid libpf.PID,
+	prefixes []lpm.Prefix, g, spadjust uint64) ([]lpm.Prefix, error) {
 	inserted := make([]lpm.Prefix, 0, len(prefixes))
 	for _, prefix := range prefixes {
 		fileID := support.LJFileId<<32 | spadjust
@@ -251,6 +275,16 @@ func (l *luajitInstance) addTrace(ebpf interpreter.EbpfHandler, pid libpf.PID, t
 		inserted = append(inserted, prefix)
 	}
 	return inserted, nil
+}
+
+func (l *luajitInstance) addTrace(ebpf interpreter.EbpfHandler, pid libpf.PID, t trace, g,
+	spadjust uint64) ([]lpm.Prefix, error) {
+	prefixes, err := traceMappingPrefixes(t)
+	if err != nil {
+		return nil, err
+	}
+	logf("lj: add trace mapping for pid(%v) %x:%x", pid, t.mcode, t.mcode+uint64(t.szmcode))
+	return l.mapTracePrefixes(ebpf, pid, prefixes, g, spadjust)
 }
 
 func (l *luajitInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
@@ -313,11 +347,24 @@ func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID)
 		}
 
 		// We don't bother trying to keep things in sync, just delete them all and re-add them.
-		prefixes := l.prefixesByG[g]
+		removedPrefixes := len(l.prefixesByG[g])
 		l.clearTraceMappings(ebpf, pid, g)
 
+		baseStats := ebpf.GetPidPageToMappingInfoStats(pid)
+		softLimit := pidPageToMappingInfoSoftLimit(baseStats)
+
 		newPrefixes := []lpm.Prefix{}
-		hadErrors := false
+		seenPrefixes := make(map[lpm.Prefix]struct{})
+		duplicatePrefixes := 0
+		invalidTraces := 0
+		otherAddErrors := 0
+		keyExistsErrors := 0
+		noSpaceErrors := 0
+		mappedTraces := 0
+		fallbackReason := ""
+		fallbackTrace := uint16(0)
+		var firstAddErr error
+
 	traceLoop:
 		for i := range traces {
 			t := traces[i]
@@ -329,6 +376,7 @@ func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID)
 					end := t.mcode + uint64(t.szmcode)
 					if end > reg.Vaddr+reg.Length {
 						log.Errorf("trace %v end goes beyond JIT region, bad szmcode", t)
+						invalidTraces++
 						continue traceLoop
 					}
 					break
@@ -337,7 +385,49 @@ func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID)
 
 			if !foundRegion {
 				log.Errorf("trace %v not in a JIT region", t)
+				invalidTraces++
 				continue
+			}
+
+			prefixes, err := traceMappingPrefixes(t)
+			if err != nil {
+				otherAddErrors++
+				if firstAddErr == nil {
+					firstAddErr = fmt.Errorf("trace(%d): %w", t.traceno, err)
+				}
+				continue
+			}
+
+			uniqueTracePrefixes := make([]lpm.Prefix, 0, len(prefixes))
+			for _, prefix := range prefixes {
+				if _, ok := seenPrefixes[prefix]; ok {
+					duplicatePrefixes++
+					continue
+				}
+				prospectiveVMEntries := uint64(len(newPrefixes) + len(uniqueTracePrefixes) + 1)
+				prospectivePIDEntries := baseStats.ApproxEntriesForPID + prospectiveVMEntries
+				prospectiveTotalEntries := baseStats.ApproxEntries + prospectiveVMEntries
+				switch {
+				case prospectiveVMEntries > luajitTracePrefixBudgetPerVM:
+					fallbackReason = fmt.Sprintf("exact LuaJIT trace prefix budget per VM exceeded (%d > %d)",
+						prospectiveVMEntries, luajitTracePrefixBudgetPerVM)
+				case prospectivePIDEntries > luajitTracePrefixBudgetPerPID:
+					fallbackReason = fmt.Sprintf("exact LuaJIT trace prefix budget per PID exceeded (%d > %d)",
+						prospectivePIDEntries, luajitTracePrefixBudgetPerPID)
+				case softLimit > 0 && prospectiveTotalEntries > softLimit:
+					fallbackReason = fmt.Sprintf("pid_page_to_mapping_info soft limit exceeded (%d > %d)",
+						prospectiveTotalEntries, softLimit)
+				}
+				if fallbackReason != "" {
+					fallbackTrace = t.traceno
+					break
+				}
+				uniqueTracePrefixes = append(uniqueTracePrefixes, prefix)
+			}
+			if fallbackReason != "" {
+				rollbackPrefixes(ebpf, pid, newPrefixes)
+				newPrefixes = nil
+				break
 			}
 
 			stackDelta := uint64(t.spadjust) + uint64(cframeSizeJIT)
@@ -347,20 +437,56 @@ func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID)
 			if t.root != 0 && traces[t.root].spadjust != t.spadjust {
 				stackDelta += uint64(traces[t.root].spadjust) + uint64(cframeSizeJIT)
 			}
-			p, err := l.addTrace(ebpf, pid, t, uint64(g), stackDelta)
+			inserted, err := l.mapTracePrefixes(ebpf, pid, uniqueTracePrefixes, uint64(g), stackDelta)
 			if err != nil {
-				hadErrors = true
-				log.Errorf("Error adding trace(%d): %v", t.traceno, err)
+				switch {
+				case errors.Is(err, unix.ENOSPC):
+					noSpaceErrors++
+					fallbackReason = fmt.Sprintf("map full while adding trace(%d): %v", t.traceno, err)
+					fallbackTrace = t.traceno
+					rollbackPrefixes(ebpf, pid, newPrefixes)
+					newPrefixes = nil
+					break traceLoop
+				case errors.Is(err, unix.EEXIST):
+					keyExistsErrors++
+				default:
+					otherAddErrors++
+					if firstAddErr == nil {
+						firstAddErr = fmt.Errorf("trace(%d): %w", t.traceno, err)
+					}
+				}
 				continue
 			}
-			newPrefixes = append(newPrefixes, p...)
+			for _, prefix := range inserted {
+				seenPrefixes[prefix] = struct{}{}
+			}
+			newPrefixes = append(newPrefixes, inserted...)
+			mappedTraces++
 		}
 
-		log.Infof("LuaJIT traces for pid(%v) g(%v) added: %d with %d prefixes and removed %d prefixes",
-			pid, g, len(traces), len(newPrefixes), len(prefixes))
+		stats := ebpf.GetPidPageToMappingInfoStats(pid)
+		if fallbackReason != "" {
+			log.Warnf("LuaJIT exact trace mappings skipped for pid(%v) g(%v): traces=%d mapped=%d unique_prefixes=%d duplicate_prefixes=%d invalid_traces=%d removed_prefixes=%d fallback_trace=%d reason=%s (%s)",
+				pid, g, len(traces), mappedTraces, len(newPrefixes), duplicatePrefixes,
+				invalidTraces, removedPrefixes, fallbackTrace, fallbackReason,
+				formatPidPageToMappingInfoStats(stats))
+			l.traceHashes[g] = hash
+			continue
+		}
+
+		if keyExistsErrors > 0 || noSpaceErrors > 0 || otherAddErrors > 0 {
+			log.Warnf("LuaJIT traces for pid(%v) g(%v) added: %d mapped=%d unique_prefixes=%d duplicate_prefixes=%d invalid_traces=%d removed_prefixes=%d key_exists=%d no_space=%d other_errors=%d first_error=%v (%s)",
+				pid, g, len(traces), mappedTraces, len(newPrefixes), duplicatePrefixes,
+				invalidTraces, removedPrefixes, keyExistsErrors, noSpaceErrors,
+				otherAddErrors, firstAddErr, formatPidPageToMappingInfoStats(stats))
+		} else {
+			log.Infof("LuaJIT traces for pid(%v) g(%v) added: %d mapped=%d with %d unique prefixes (%d duplicate prefixes skipped) and removed %d prefixes (%s)",
+				pid, g, len(traces), mappedTraces, len(newPrefixes), duplicatePrefixes,
+				removedPrefixes, formatPidPageToMappingInfoStats(stats))
+		}
 
 		l.prefixesByG[g] = newPrefixes
-		if !hadErrors {
+		if otherAddErrors == 0 {
 			l.traceHashes[g] = hash
 		}
 	}

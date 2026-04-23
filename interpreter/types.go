@@ -44,6 +44,14 @@ var (
 	ErrLJRestart = errors.New("lj_restart")
 )
 
+// PidPageToMappingInfoStats contains lightweight diagnostic information about
+// the pid_page_to_mapping_info map occupancy.
+type PidPageToMappingInfoStats struct {
+	ApproxEntries       uint64
+	ApproxEntriesForPID uint64
+	MaxEntries          uint32
+}
+
 // The following function Loader and interfaces Data and Instance work together
 // as an abstraction to support language specific eBPF unwinding and host agent side symbolization
 // of frames.
@@ -110,6 +118,10 @@ type EbpfHandler interface {
 	// DeletePidInterpreterMapping removes the element specified by pid, prefix
 	// rom the eBPF map pid_page_to_mapping_info.
 	DeletePidInterpreterMapping(libpf.PID, lpm.Prefix) error
+
+	// GetPidPageToMappingInfoStats returns approximate occupancy diagnostics for
+	// pid_page_to_mapping_info, both globally and for the specified PID.
+	GetPidPageToMappingInfoStats(pid libpf.PID) PidPageToMappingInfoStats
 
 	// CoredumpTest returns whether the unwinder needs special behavior for
 	// coredump mode to work.

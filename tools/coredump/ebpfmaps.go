@@ -157,6 +157,10 @@ func (emc *ebpfMapsCoredump) DeletePidInterpreterMapping(pid libpf.PID,
 	return nil
 }
 
+func (emc *ebpfMapsCoredump) GetPidPageToMappingInfoStats(libpf.PID) interpreter.PidPageToMappingInfoStats {
+	return interpreter.PidPageToMappingInfoStats{}
+}
+
 // Stack delta management
 func (emc *ebpfMapsCoredump) UpdateUnwindInfo(index uint16, info sdtypes.UnwindInfo) error {
 	if index >= support.UnwindInfoMaxEntries {

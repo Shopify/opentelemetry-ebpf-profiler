@@ -54,6 +54,10 @@ func (m *ebpfMapsMockup) DeletePidInterpreterMapping(pid libpf.PID, pfx lpm.Pref
 	return nil
 }
 
+func (m *ebpfMapsMockup) GetPidPageToMappingInfoStats(libpf.PID) interpreter.PidPageToMappingInfoStats {
+	return interpreter.PidPageToMappingInfoStats{ApproxEntries: uint64(len(m.prefixes)), MaxEntries: 1 << 20}
+}
+
 // TestSynchronizeMappings tests that if a mapping is realloc'd we do the right thing.
 func TestSynchronizeMappings(t *testing.T) {
 	for _, tc := range []struct {

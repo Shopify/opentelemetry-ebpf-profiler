@@ -72,6 +72,11 @@ func isPIDLive(pid libpf.PID) (bool, error) {
 	return true, err
 }
 
+func formatPidPageToMappingInfoStats(stats interpreter.PidPageToMappingInfoStats) string {
+	return fmt.Sprintf("approx_entries=%d approx_entries_for_pid=%d max_entries=%d",
+		stats.ApproxEntries, stats.ApproxEntriesForPID, stats.MaxEntries)
+}
+
 // assignLibcInfo updates the LibcInfo for the Interpreters on given PID.
 // Caller must hold pm.mu write lock.
 func (pm *ProcessManager) assignLibcInfo(pid libpf.PID, libcInfo *libc.LibcInfo) {
@@ -126,6 +131,9 @@ func (pm *ProcessManager) getPidInformation(pid libpf.PID, pr process.Process,
 	// Insert a dummy page into the eBPF map pid_page_to_mapping_info that provides the eBPF
 	// a quick way to check if we know something about this particular process.
 	if err := pm.ebpf.UpdatePidPageMappingInfo(pid, dummyPrefix, 0, 0); err != nil {
+		stats := pm.ebpf.GetPidPageToMappingInfoStats(pid)
+		log.Errorf("Failed to add dummy pid_page_to_mapping_info entry for PID %d: %v (%s)",
+			pid, err, formatPidPageToMappingInfoStats(stats))
 		return nil
 	}
 
@@ -275,8 +283,9 @@ func (pm *ProcessManager) processNewMapping(pid libpf.PID, m *Mapping) uint64 {
 	fileID := uint64(host.FileIDFromLibpf(mf.File.Value().FileID))
 	for _, prefix := range prefixes {
 		if err = pm.ebpf.UpdatePidPageMappingInfo(pid, prefix, fileID, bias); err != nil {
-			log.Errorf("Failed to update pid_page_to_mapping_info (pid: %d, page: 0x%x/%d): %v",
-				pid, prefix.Key, prefix.Length, err)
+			stats := pm.ebpf.GetPidPageToMappingInfoStats(pid)
+			log.Errorf("Failed to update pid_page_to_mapping_info (pid: %d, page: 0x%x/%d): %v (%s)",
+				pid, prefix.Key, prefix.Length, err, formatPidPageToMappingInfoStats(stats))
 			break
 		}
 		added++
@@ -294,7 +303,9 @@ func (pm *ProcessManager) processRemovedMapping(pid libpf.PID, m *Mapping) uint6
 
 	deleted, err := pm.ebpf.DeletePidPageMappingInfo(pid, prefixes)
 	if err != nil {
-		log.Errorf("Failed to delete mappings for PID %d: %v", pid, err)
+		stats := pm.ebpf.GetPidPageToMappingInfoStats(pid)
+		log.Errorf("Failed to delete mappings for PID %d: %v (%s)",
+			pid, err, formatPidPageToMappingInfoStats(stats))
 	}
 
 	fileID := host.FileIDFromLibpf(mf.File.Value().FileID)

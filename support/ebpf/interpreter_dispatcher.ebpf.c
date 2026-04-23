@@ -88,9 +88,10 @@ struct pid_page_to_mapping_info_t {
   __uint(type, BPF_MAP_TYPE_LPM_TRIE);
   __type(key, PIDPage);
   __type(value, PIDPageMappingInfo);
-  // LuaJIT exact-trace mappings can consume tens of thousands of prefixes per PID,
-  // so keep ample headroom for multi-worker runtimes in addition to normal mappings.
-  __uint(max_entries, 2097152); // 2^21
+  // LuaJIT exact-trace mappings can consume tens of thousands of prefixes per PID on
+  // ingress/OpenResty nodes. Keep substantially more headroom so pathological LuaJIT
+  // workloads do not starve native mappings for the rest of the node.
+  __uint(max_entries, 8388608); // 2^23
   __uint(map_flags, BPF_F_NO_PREALLOC);
 } pid_page_to_mapping_info SEC(".maps");
 
