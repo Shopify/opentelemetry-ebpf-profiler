@@ -116,3 +116,31 @@ func TestAddJITRegionRollbackOnFailure(t *testing.T) {
 	require.Empty(t, ebpf.prefixes)
 	require.Empty(t, lj.prefixes)
 }
+
+func TestRemoveVMsClearsStaleTraceMappings(t *testing.T) {
+	g := libpf.Address(0x1234)
+	prefixes := []lpm.Prefix{
+		{Key: 0x1000, Length: 52},
+		{Key: 0x2000, Length: 52},
+	}
+	ebpf := &ebpfMapsMockup{prefixes: make(map[prefixKey]lpm.Prefix)}
+	for _, prefix := range prefixes {
+		ebpf.prefixes[prefixKey{pid: 123, pfx: prefix}] = prefix
+	}
+
+	lj := &luajitInstance{
+		prefixesByG: map[libpf.Address][]lpm.Prefix{g: prefixes},
+		traceHashes: map[libpf.Address]uint64{g: 99},
+		vms:         vmMap{g: struct{}{}},
+	}
+
+	lj.removeVMs(ebpf, 123, []libpf.Address{g})
+
+	require.Empty(t, ebpf.prefixes)
+	_, ok := lj.prefixesByG[g]
+	require.False(t, ok)
+	_, ok = lj.traceHashes[g]
+	require.False(t, ok)
+	_, ok = lj.vms[g]
+	require.False(t, ok)
+}

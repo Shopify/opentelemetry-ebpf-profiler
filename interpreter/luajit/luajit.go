@@ -200,6 +200,13 @@ func rollbackPrefixes(ebpf interpreter.EbpfHandler, pid libpf.PID, prefixes []lp
 	}
 }
 
+func (l *luajitInstance) clearTraceMappings(ebpf interpreter.EbpfHandler, pid libpf.PID,
+	g libpf.Address) {
+	rollbackPrefixes(ebpf, pid, l.prefixesByG[g])
+	delete(l.prefixesByG, g)
+	delete(l.traceHashes, g)
+}
+
 func (l *luajitInstance) addJITRegion(ebpf interpreter.EbpfHandler, pid libpf.PID,
 	start, end uint64) error {
 	prefixes, err := lpm.CalculatePrefixList(start, end)
@@ -307,12 +314,10 @@ func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID)
 
 		// We don't bother trying to keep things in sync, just delete them all and re-add them.
 		prefixes := l.prefixesByG[g]
-		l.prefixesByG[g] = nil
-		for _, prefix := range prefixes {
-			_ = ebpf.DeletePidInterpreterMapping(pid, prefix)
-		}
+		l.clearTraceMappings(ebpf, pid, g)
 
 		newPrefixes := []lpm.Prefix{}
+		hadErrors := false
 	traceLoop:
 		for i := range traces {
 			t := traces[i]
@@ -344,23 +349,30 @@ func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID)
 			}
 			p, err := l.addTrace(ebpf, pid, t, uint64(g), stackDelta)
 			if err != nil {
+				hadErrors = true
 				log.Errorf("Error adding trace(%d): %v", t.traceno, err)
 				continue
 			}
 			newPrefixes = append(newPrefixes, p...)
 		}
 
-		log.Infof("LuaJIT traces for pid(%v) added: %d with %d prefixes and removed %d prefixes",
-			pid, len(traces), len(newPrefixes), len(prefixes))
+		log.Infof("LuaJIT traces for pid(%v) g(%v) added: %d with %d prefixes and removed %d prefixes",
+			pid, g, len(traces), len(newPrefixes), len(prefixes))
 
 		l.prefixesByG[g] = newPrefixes
-		l.traceHashes[g] = hash
+		if !hadErrors {
+			l.traceHashes[g] = hash
+		}
 	}
-	l.removeVMs(badVMs)
+	l.removeVMs(ebpf, pid, badVMs)
 	return nil
 }
 
-func (l *luajitInstance) removeVMs(gs []libpf.Address) {
+func (l *luajitInstance) removeVMs(ebpf interpreter.EbpfHandler, pid libpf.PID, gs []libpf.Address) {
+	for _, g := range gs {
+		l.clearTraceMappings(ebpf, pid, g)
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, g := range gs {
