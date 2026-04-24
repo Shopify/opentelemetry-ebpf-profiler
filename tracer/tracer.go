@@ -616,7 +616,7 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	const (
 		// The following sizes X are used as 2^X, and determined empirically.
 		// 1 million executable pages / 4GB of executable address space
-		pidPageMappingInfoSize   = 20
+		pidPageMappingInfoSize   = 22
 		stackDeltaPageToInfoSize = 16
 		exeIDToStackDeltasSize   = 16
 	)
