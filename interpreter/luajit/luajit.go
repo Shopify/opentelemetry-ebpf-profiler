@@ -288,6 +288,18 @@ func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID)
 			badVMs = append(badVMs, g)
 			continue
 		}
+		// Pre-cache GCproto objects from trace startpt pointers.
+		// This reads the proto data while the VM state is stable (during sync),
+		// avoiding the race where protos get GC'd between eBPF sample capture
+		// and Go-side symbolization.
+		for _, t := range traces {
+			if t.startpt != 0 {
+				if _, err := l.getGCproto(t.startpt); err != nil {
+					logf("lj: pre-cache proto %x for trace %d: %v", t.startpt, t.traceno, err)
+				}
+			}
+		}
+
 		// Don't do anything if nothing changed.
 		if hash == l.traceHashes[g] {
 			continue
