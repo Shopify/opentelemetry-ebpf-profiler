@@ -88,7 +88,10 @@ struct pid_page_to_mapping_info_t {
   __uint(type, BPF_MAP_TYPE_LPM_TRIE);
   __type(key, PIDPage);
   __type(value, PIDPageMappingInfo);
-  __uint(max_entries, 524288); // 2^19
+  // Raise from 2^19 to 2^22 for LuaJIT: each nginx worker's JIT trace
+  // prefixes consume ~65K entries; 16+ workers need ~1M entries plus
+  // headroom for native process mappings.
+  __uint(max_entries, 4194304); // 2^22
   __uint(map_flags, BPF_F_NO_PREALLOC);
 } pid_page_to_mapping_info SEC(".maps");
 
