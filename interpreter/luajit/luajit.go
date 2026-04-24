@@ -49,9 +49,15 @@ type regionKey struct {
 const (
 	// Prefer dropping exact LuaJIT trace overlays for a VM over exhausting the
 	// shared pid_page_to_mapping_info map and starving the whole node of profiles.
-	luajitTracePrefixBudgetPerVM         = 1 << 17 // 131072
-	luajitTracePrefixBudgetPerPID        = 1 << 18 // 262144
-	pidPageToMappingInfoSoftLimitPercent = 50
+	luajitTracePrefixBudgetPerVM  = 1 << 17 // 131072
+	luajitTracePrefixBudgetPerPID = 1 << 18 // 262144
+
+	// Reserve the top 75% of the map for native process mappings.
+	// LuaJIT trace prefixes can only use up to 25% of pid_page_to_mapping_info.
+	// At the default 4M entries this gives LuaJIT ~1M entries, which is enough
+	// for ~15 nginx workers with ~65K prefixes each while leaving ~3M entries
+	// for native page mappings that the eBPF unwinder needs for every process.
+	pidPageToMappingInfoSoftLimitPercent = 25
 )
 
 type luajitData struct {
