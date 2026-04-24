@@ -145,7 +145,24 @@ func (r *OTLPReporter) reportOTLPProfile(ctx context.Context) error {
 		return nil
 	}
 
-	log.Infof("Reporter cycle: exporting %d profile samples", profiles.SampleCount())
+	// Diagnostic: dump profile structure
+	wireBytes, marshalErr := pprofileotlp.NewExportRequestFromProfiles(profiles).MarshalProto()
+	if marshalErr == nil {
+		dic := profiles.Dictionary()
+		nStrs := dic.StringTable().Len()
+		firstStr := ""
+		if nStrs > 0 {
+			firstStr = dic.StringTable().At(0)
+		}
+		log.Infof("Reporter cycle: exporting %d profile samples, %d bytes, %d strings (first=%q), %d functions, %d locations, %d mappings, %d stacks, %d resource_profiles",
+			profiles.SampleCount(), len(wireBytes), nStrs, firstStr,
+			dic.FunctionTable().Len(), dic.LocationTable().Len(),
+			dic.MappingTable().Len(), dic.StackTable().Len(),
+			profiles.ResourceProfiles().Len())
+	} else {
+		log.Errorf("Reporter cycle: marshal error: %v", marshalErr)
+	}
+
 	req := pprofileotlp.NewExportRequestFromProfiles(profiles)
 
 	reqCtx, ctxCancel := context.WithTimeout(ctx, r.pkgGRPCOperationTimeout)
