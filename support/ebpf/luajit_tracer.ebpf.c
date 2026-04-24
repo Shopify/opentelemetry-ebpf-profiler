@@ -25,7 +25,10 @@ struct luajit_procs_t {
 } luajit_procs SEC(".maps");
 
 // The number of LuaJIT frames to unwind per frame-unwinding eBPF program.
-#define FRAMES_PER_WALK_LUAJIT_STACK 15
+// Keep this low enough that the later-kernel verifier does not blow the
+// processed-instruction budget in walk_luajit_stack; deeper Lua stacks are
+// handled by tail-calling back into PROG_UNWIND_LUAJIT for another chunk.
+#define FRAMES_PER_WALK_LUAJIT_STACK 8
 
 #if defined(__x86_64__)
   #define DISPATCH r14

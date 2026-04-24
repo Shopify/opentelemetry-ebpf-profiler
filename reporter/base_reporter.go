@@ -6,8 +6,10 @@ package reporter // import "go.opentelemetry.io/ebpf-profiler/reporter"
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/pdata"
@@ -38,6 +40,9 @@ type baseReporter struct {
 	// Initialized when Start() is called. The duration of the first profile may be
 	// slightly overestimated as it includes tracer setup time before samples arrive.
 	collectionStartTime time.Time
+
+	// traceEventCount tracks how many ReportTraceEvent calls have been made for diagnostics.
+	traceEventCount atomic.Int64
 }
 
 var errUnknownOrigin = errors.New("unknown trace origin")
@@ -47,6 +52,11 @@ func (b *baseReporter) Stop() {
 }
 
 func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {
+	n := b.traceEventCount.Add(1)
+	if n == 1 || n%1000 == 0 {
+		log.Infof("ReportTraceEvent #%d: pid=%d origin=%d frames=%d",
+			n, meta.PID, meta.Origin, len(trace.Frames))
+	}
 	switch meta.Origin {
 	case support.TraceOriginSampling:
 	case support.TraceOriginOffCPU:

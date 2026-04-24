@@ -86,6 +86,8 @@ func (r *OTLPReporter) Start(ctx context.Context) error {
 		return err
 	}
 	r.client = pprofileotlp.NewGRPCClient(otlpGrpcConn)
+	log.Infof("OTLP reporter connected to %s, report interval %v",
+		r.cfg.CollAgentAddr, r.cfg.ReportInterval)
 
 	r.runLoop.Start(ctx, r.cfg.ReportInterval, r.cfg.ReportJitter, func() {
 		if err := r.reportOTLPProfile(ctx); err != nil {
@@ -121,6 +123,17 @@ func (r *OTLPReporter) reportOTLPProfile(ctx context.Context) error {
 	r.collectionStartTime = collectionEndTime
 	r.traceEvents.WUnlock(&traceEventsPtr)
 
+	// Count events for diagnostics
+	nResources := len(reportedEvents)
+	nSamples := 0
+	for _, rtp := range reportedEvents {
+		for _, events := range rtp.Events {
+			nSamples += len(events)
+		}
+	}
+	log.Infof("Reporter cycle: %d resources, %d trace events queued",
+		nResources, nSamples)
+
 	profiles, err := r.pdata.Generate(reportedEvents, r.name, r.version,
 		collectionStartTime, collectionEndTime)
 	if err != nil {
@@ -128,15 +141,21 @@ func (r *OTLPReporter) reportOTLPProfile(ctx context.Context) error {
 		return nil
 	}
 	if profiles.SampleCount() == 0 {
-		log.Debugf("Skip sending of OTLP profile with no samples")
+		log.Infof("Reporter cycle: skip sending, 0 samples after pdata.Generate")
 		return nil
 	}
 
+	log.Infof("Reporter cycle: exporting %d profile samples", profiles.SampleCount())
 	req := pprofileotlp.NewExportRequestFromProfiles(profiles)
 
 	reqCtx, ctxCancel := context.WithTimeout(ctx, r.pkgGRPCOperationTimeout)
 	defer ctxCancel()
 	_, err = r.client.Export(reqCtx, req, gzipOption)
+	if err != nil {
+		log.Errorf("Reporter cycle: export failed: %v", err)
+	} else {
+		log.Infof("Reporter cycle: export succeeded")
+	}
 	return err
 }
 
