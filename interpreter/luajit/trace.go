@@ -27,6 +27,10 @@ import (
 // $7 = (uint16_t *) 0x50
 const tracePartOffset = 0x50
 
+// Offset of GCtrace.startpt (GCRef) — the prototype this trace was compiled from.
+// (gdb) p &((GCtrace*)0)->startpt = 0x40
+const traceStartPtOffset = 0x40
+
 // Definition:
 // https://github.com/openresty/luajit2/blob/7952882d/src/lj_jit.h#L423
 type jitStatePart struct {
@@ -50,6 +54,9 @@ type trace struct {
 	traceno  uint16 /* Trace number. */
 	_        uint16 /* Linked trace (or self for loops). */
 	root     uint16 /* Root trace of side trace (or 0 for root traces). */
+
+	// Not part of the struct read at tracePartOffset — read separately.
+	startpt libpf.Address // GCRef startpt at offset 0x40
 }
 
 // key == traceId
@@ -92,13 +99,40 @@ func loadTraces(tracesAddr libpf.Address, rm remotememory.RemoteMemory) (uint64,
 	traces := traceMap{}
 	for _, addr := range traceAddrs {
 		t := trace{}
-		if err := rm.Read(addr+tracePartOffset, pfunsafe.FromPointer(&t)); err != nil {
+		// Read the packed fields starting at tracePartOffset (0x50).
+		// We read into a temporary to avoid including the startpt field.
+		type tracePacked struct {
+			_        uint32
+			Szmcode  uint32
+			Mcode    uint64
+			_        uint32
+			_        uint16
+			Spadjust uint16
+			Traceno  uint16
+			_        uint16
+			Root     uint16
+		}
+		var tp tracePacked
+		if err := rm.Read(addr+tracePartOffset, pfunsafe.FromPointer(&tp)); err != nil {
 			return 0, nil, err
+		}
+		t.szmcode = tp.Szmcode
+		t.mcode = tp.Mcode
+		t.spadjust = tp.Spadjust
+		t.traceno = tp.Traceno
+		t.root = tp.Root
+		// Read startpt (GCRef at offset 0x40) separately — it's before tracePartOffset.
+		var startptRef uint64
+		if err := rm.Read(addr+traceStartPtOffset, pfunsafe.FromPointer(&startptRef)); err != nil {
+			// Non-fatal: we can still use the trace for mapping, just without proto pre-caching.
+			logf("lj: failed to read startpt for trace at %x: %v", addr, err)
+		} else {
+			t.startpt = libpf.Address(startptRef)
 		}
 		if t.traceno > uint16(sztrace) {
 			return 0, nil, errors.New("invalid traceno")
 		}
-		logf("lj: added trace(%d) from %x", t.traceno, tracesAddr)
+		logf("lj: added trace(%d) from %x startpt=%x", t.traceno, tracesAddr, t.startpt)
 		traces[t.traceno] = t
 	}
 	return h, traces, nil
