@@ -89,24 +89,34 @@ func newProto(rm remotememory.RemoteMemory, pt libpf.Address) (*proto, error) {
 		return nil, err
 	}
 
-	// reading memory from a remote process is always dicey, validate
-	// we're looking at a GCproto object by checking that the debugging
+	// Try to read the chunkname first — this is the most useful piece of
+	// information and survives even if the debug-info pointers are stale.
+	if p.chunkname != 0 {
+		p.name = rm.String(p.chunkname + sizeofGCstr)
+		if !utf8.ValidString(p.name) {
+			p.name = ""
+		}
+	}
+
+	// Validate the GCproto object by checking that the debugging
 	// info pointers are valid internal pointers or NULL.
 	end := pt + libpf.Address(p.sizept)
 	bad := func(addr libpf.Address) bool {
 		return addr != 0 && (addr < pt || addr >= end)
 	}
 	if bad(p.lineinfo) || bad(p.uvinfo) || bad(p.varinfo) {
+		// If chunkname is still readable, return a degraded proto that
+		// provides file-name attribution even without line info.
+		if p.name != "" {
+			p.lineinfo = 0
+			p.uvinfo = 0
+			p.varinfo = 0
+			p.sizebc = 0
+			return p, nil
+		}
 		return nil, errors.New("invalid GCproto object")
 	}
 
-	// string data is stored after the GCstr object
-	p.name = rm.String(p.chunkname + sizeofGCstr)
-	if !utf8.ValidString(p.name) {
-		return nil, errors.New("invalid chunkname string")
-	}
-
-	// This should never be empty string.
 	if p.name == "" {
 		return nil, errors.New("invalid chunkname string")
 	}
