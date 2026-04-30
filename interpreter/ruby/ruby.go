@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"os"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -1278,16 +1279,118 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 	return libpf.Intern(profileLabel)
 }
 
+const rubyJITMiB = 1024 * 1024
+
+func defaultRubyYJITReservationSize(version uint32) uint64 {
+	switch {
+	case version >= rubyVersion(3, 4, 0):
+		return 128 * rubyJITMiB
+	case version >= rubyVersion(3, 3, 1):
+		return 48 * rubyJITMiB
+	case version >= rubyVersion(3, 2, 0):
+		return 64 * rubyJITMiB
+	case version >= rubyVersion(3, 1, 0):
+		return 256 * rubyJITMiB
+	default:
+		return 128 * rubyJITMiB
+	}
+}
+
+func defaultRubyZJITReservationSize() uint64 {
+	return 64 * rubyJITMiB
+}
+
+func parseJITMemSizeMiB(value string) (uint64, bool) {
+	mib, err := strconv.ParseUint(value, 10, 32)
+	if err != nil || mib == 0 {
+		return 0, false
+	}
+	return mib * rubyJITMiB, true
+}
+
+func parseJITMemSizeOption(args []string, names ...string) (uint64, bool) {
+	for idx, arg := range args {
+		for _, name := range names {
+			if arg == name && idx+1 < len(args) {
+				if size, ok := parseJITMemSizeMiB(args[idx+1]); ok {
+					return size, true
+				}
+			}
+			if value, ok := strings.CutPrefix(arg, name+"="); ok {
+				if size, ok := parseJITMemSizeMiB(value); ok {
+					return size, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func hasJITOption(args []string, prefix string) bool {
+	for _, arg := range args {
+		if arg == prefix || strings.HasPrefix(arg, prefix+"-") || strings.HasPrefix(arg, prefix+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func rubyJITReservationSize(version uint32, args []string) uint64 {
+	size := defaultRubyYJITReservationSize(version)
+	hasYJIT := hasJITOption(args, "--yjit")
+	hasZJIT := hasJITOption(args, "--zjit")
+
+	if hasZJIT && !hasYJIT {
+		size = defaultRubyZJITReservationSize()
+	}
+
+	// For YJIT, --yjit-mem-size is the default executable reservation size unless
+	// --yjit-exec-mem-size overrides it. ZJIT keeps --zjit-mem-size separate from
+	// --zjit-exec-mem-size, so only the explicit ZJIT exec option changes the
+	// reservation.
+	if yjitMemSize, ok := parseJITMemSizeOption(args, "--yjit-mem-size"); ok {
+		size = yjitMemSize
+	}
+	if zjitExecMemSize, ok := parseJITMemSizeOption(args, "--zjit-exec-mem-size"); ok && !hasYJIT {
+		size = zjitExecMemSize
+	}
+	if yjitExecMemSize, ok := parseJITMemSizeOption(args, "--yjit-exec-mem-size"); ok {
+		size = yjitExecMemSize
+	}
+	return size
+}
+
+func readRubyJITProcessArgs(pr process.Process) []string {
+	if _, isCoredump := pr.(*process.CoredumpProcess); isCoredump {
+		return nil
+	}
+
+	pid := pr.PID()
+	var args []string
+	if cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil && len(cmdline) > 0 {
+		args = append(args, strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")...)
+	}
+	if environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid)); err == nil && len(environ) > 0 {
+		for env := range strings.SplitSeq(strings.TrimRight(string(environ), "\x00"), "\x00") {
+			if rubyOpt, ok := strings.CutPrefix(env, "RUBYOPT="); ok {
+				args = append(args, strings.Fields(rubyOpt)...)
+			}
+		}
+	}
+	return args
+}
+
 // findJITRegion detects the Ruby JIT code reservation from process memory mappings.
 // Ruby reserves a single contiguous address range via rb_jit_reserve_addr_space()
 // and then uses mprotect to activate pages as r-x or temporarily rw. Code GC can
 // turn pages back into PROT_NONE, so the reservation may appear as multiple VMAs.
 // On systems with CONFIG_ANON_VMA_NAME, Ruby labels the region via prctl(PR_SET_VMA)
 // giving it a path like "[anon:Ruby:rb_jit_reserve_addr_space]". Otherwise we use
-// the first anonymous executable mapping as the start of the reservation and
-// extend through contiguous anonymous VMAs.
+// the first anonymous executable mapping as the start of the reservation, extend
+// through contiguous anonymous VMAs when they are available, and fall back to the
+// expected reservation size from Ruby defaults and command-line options.
 // Returns (start, end, found).
-func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
+func findJITRegion(mappings []process.RawMapping, reservationSize uint64) (uint64, uint64, bool) {
 	var jitStart, jitEnd uint64
 	labelFound := false
 
@@ -1318,14 +1421,24 @@ func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
 
 		jitStart = m.Vaddr
 		jitEnd = m.Vaddr + m.Length
+		sawProtNone := m.Flags == 0
 		for nextIdx := idx + 1; nextIdx < len(mappings); nextIdx++ {
 			nextMapping := &mappings[nextIdx]
 			if !nextMapping.IsAnonymous() || nextMapping.Vaddr != jitEnd {
 				break
 			}
+			if nextMapping.Flags == 0 {
+				sawProtNone = true
+			}
 			jitEnd = nextMapping.Vaddr + nextMapping.Length
 		}
 
+		if reservationSize > 0 && !sawProtNone {
+			reservationEnd := jitStart + reservationSize
+			if reservationEnd > jitEnd {
+				jitEnd = reservationEnd
+			}
+		}
 		return jitStart, jitEnd, true
 	}
 
@@ -1342,7 +1455,8 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 	// Detect the JIT region once and register interpreter prefixes for the whole
 	// reservation. PROT_NONE gaps are safe to include because they cannot execute,
 	// and covering the full range avoids churn as Ruby mprotects new code pages.
-	jitStart, jitEnd, jitFound := findJITRegion(mappings)
+	reservationSize := rubyJITReservationSize(r.r.version, readRubyJITProcessArgs(pr))
+	jitStart, jitEnd, jitFound := findJITRegion(mappings, reservationSize)
 	if jitFound {
 		prefixes, err := lpm.CalculatePrefixList(jitStart, jitEnd)
 		if err != nil {
