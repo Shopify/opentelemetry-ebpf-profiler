@@ -280,11 +280,12 @@ func TestFindJITRegion(t *testing.T) {
 	}
 
 	tests := []struct {
-		name      string
-		mappings  []process.RawMapping
-		wantStart uint64
-		wantEnd   uint64
-		wantFound bool
+		name            string
+		mappings        []process.RawMapping
+		reservationSize uint64
+		wantStart       uint64
+		wantEnd         uint64
+		wantFound       bool
 	}{
 		{
 			name:      "no mappings",
@@ -329,9 +330,10 @@ func TestFindJITRegion(t *testing.T) {
 				execAnon(0x7f17d9b19000, 0x118000),
 				protNoneAnon(0x7f17d9c31000, 0x7d88000),
 			},
-			wantStart: 0x7f17d99b9000,
-			wantEnd:   0x7f17d9c31000 + 0x7d88000,
-			wantFound: true,
+			reservationSize: 128 * rubyJITMiB,
+			wantStart:       0x7f17d99b9000,
+			wantEnd:         0x7f17d9c31000 + 0x7d88000,
+			wantFound:       true,
 		},
 		{
 			name: "heuristic fallback stops at gap before another anonymous executable mapping without size hint",
@@ -344,14 +346,26 @@ func TestFindJITRegion(t *testing.T) {
 			wantFound: true,
 		},
 		{
+			name: "heuristic fallback uses reservation size when only executable mappings are available",
+			mappings: []process.RawMapping{
+				execAnon(0x7f84e7a23000, 0x7f84e7a5f000-0x7f84e7a23000),
+				execAnon(0x7f84e7a60000, 0x7f84e7a62000-0x7f84e7a60000),
+			},
+			reservationSize: 4 * rubyJITMiB,
+			wantStart:       0x7f84e7a23000,
+			wantEnd:         0x7f84e7e23000,
+			wantFound:       true,
+		},
+		{
 			name: "labeled takes precedence over heuristic",
 			mappings: []process.RawMapping{
 				execAnon(0x1000000, 0x4000),
 				labeled(0x7f0000000000, 0x3000000, 0),
 			},
-			wantStart: 0x7f0000000000,
-			wantEnd:   0x7f0000000000 + 0x3000000,
-			wantFound: true,
+			reservationSize: 128 * rubyJITMiB,
+			wantStart:       0x7f0000000000,
+			wantEnd:         0x7f0000000000 + 0x3000000,
+			wantFound:       true,
 		},
 		{
 			name: "ruby --yjit --yjit-mem-size=4 with rw holes and PROT_NONE tail",
@@ -370,15 +384,16 @@ func TestFindJITRegion(t *testing.T) {
 				protNoneAnon(0x7f84e7a63000, 0x7f84e7e23000-0x7f84e7a63000),
 				rwAnon(0x7f84e8110000, 0x7f84e8200000-0x7f84e8110000),
 			},
-			wantStart: 0x7f84e7a23000,
-			wantEnd:   0x7f84e7e23000,
-			wantFound: true,
+			reservationSize: 4 * rubyJITMiB,
+			wantStart:       0x7f84e7a23000,
+			wantEnd:         0x7f84e7e23000,
+			wantFound:       true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			start, end, found := findJITRegion(tt.mappings)
+			start, end, found := findJITRegion(tt.mappings, tt.reservationSize)
 			if found != tt.wantFound {
 				t.Errorf("found = %v, want %v", found, tt.wantFound)
 				return
@@ -392,6 +407,83 @@ func TestFindJITRegion(t *testing.T) {
 			if end != tt.wantEnd {
 				t.Errorf("end = %#x, want %#x", end, tt.wantEnd)
 			}
+		})
+	}
+}
+
+func TestRubyJITReservationSize(t *testing.T) {
+	tests := []struct {
+		name    string
+		version uint32
+		args    []string
+		want    uint64
+	}{
+		{
+			name:    "ruby 3.4 yjit default",
+			version: rubyVersion(3, 4, 9),
+			want:    128 * rubyJITMiB,
+		},
+		{
+			name:    "ruby 3.3.1 yjit default",
+			version: rubyVersion(3, 3, 10),
+			want:    48 * rubyJITMiB,
+		},
+		{
+			name:    "ruby 3.3.0 yjit default",
+			version: rubyVersion(3, 3, 0),
+			want:    64 * rubyJITMiB,
+		},
+		{
+			name:    "ruby 3.2 yjit default",
+			version: rubyVersion(3, 2, 9),
+			want:    64 * rubyJITMiB,
+		},
+		{
+			name:    "ruby 3.1 yjit default",
+			version: rubyVersion(3, 1, 4),
+			want:    256 * rubyJITMiB,
+		},
+		{
+			name:    "yjit mem size sets default exec reservation",
+			version: rubyVersion(3, 4, 9),
+			args:    []string{"ruby", "--yjit", "--yjit-mem-size=4", "app.rb"},
+			want:    4 * rubyJITMiB,
+		},
+		{
+			name:    "yjit exec mem size overrides mem size",
+			version: rubyVersion(3, 4, 9),
+			args:    []string{"ruby", "--yjit-mem-size=4", "--yjit-exec-mem-size=12"},
+			want:    12 * rubyJITMiB,
+		},
+		{
+			name:    "yjit split option value",
+			version: rubyVersion(3, 4, 9),
+			args:    []string{"ruby", "--yjit-exec-mem-size", "16"},
+			want:    16 * rubyJITMiB,
+		},
+		{
+			name:    "zjit default",
+			version: rubyVersion(4, 1, 0),
+			args:    []string{"ruby", "--zjit"},
+			want:    64 * rubyJITMiB,
+		},
+		{
+			name:    "zjit mem size does not change exec reservation",
+			version: rubyVersion(4, 1, 0),
+			args:    []string{"ruby", "--zjit", "--zjit-mem-size=4"},
+			want:    64 * rubyJITMiB,
+		},
+		{
+			name:    "zjit exec mem size overrides default",
+			version: rubyVersion(4, 1, 0),
+			args:    []string{"ruby", "--zjit", "--zjit-exec-mem-size=32"},
+			want:    32 * rubyJITMiB,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, rubyJITReservationSize(tt.version, tt.args))
 		})
 	}
 }
