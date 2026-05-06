@@ -305,7 +305,7 @@ type RubyProcInfo struct {
 	Cme_method_def               uint8
 	Size_of_value                uint8
 	Running_ec                   uint16
-	Pad_cgo_0                    [2]byte
+	Pad_cgo_0                    [4]byte
 }
 type V8ProcInfo struct {
 	Version                      uint32
@@ -337,7 +337,7 @@ const (
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4
 	sizeof_PHPProcInfo    = 0x18
-	sizeof_RubyProcInfo   = 0x48
+	sizeof_RubyProcInfo   = 0x60
 )
 
 const (
