@@ -677,37 +677,59 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 	return nil
 }
 
-// setOriginIDs assigns an origin ID to every kind of sample the tracer's
-// eBPF programs can produce and writes each ID into the corresponding
-// RODATA variable. Sampling is always active. Off-CPU and probe profiling
-// only get one if enabled.
-// TODO: this is a temporary helper and will be removed once tracer manages
-// custom probes.
+// setOriginIDs assigns an origin ID to every enabled built-in sample source and
+// writes each ID into the corresponding RODATA variable. Custom probes register
+// their origins independently through ProbeRegistrar.
 func setOriginIDs(coll *cebpf.CollectionSpec, cfg *Config, origins *originRegistry) error {
-	sampling, err := origins.Register(&samples.TypeMetadata{
-		PeriodType: "cpu",
-		PeriodUnit: "nanoseconds",
-		SampleType: "samples",
-		SampleUnit: "count",
-	})
-	if err != nil {
-		return err
-	}
-	if err := coll.Variables["origin_id_sampling"].Set(sampling); err != nil {
-		return fmt.Errorf("failed to set origin_id_sampling: %v", err)
-	}
-
-	if cfg.OffCPUThreshold > 0 {
-		offCPU, err := origins.Register(&samples.TypeMetadata{
-			SampleType:   "off_cpu",
-			SampleUnit:   "nanoseconds",
-			ReportValues: true,
-		})
+	register := func(variable string, metadata *samples.TypeMetadata) error {
+		origin, err := origins.Register(metadata)
 		if err != nil {
 			return err
 		}
-		if err := coll.Variables["origin_id_off_cpu"].Set(uint16(offCPU)); err != nil {
-			return fmt.Errorf("failed to set origin_id_off_cpu: %v", err)
+		if err := coll.Variables[variable].Set(origin); err != nil {
+			return fmt.Errorf("failed to set %s: %v", variable, err)
+		}
+		return nil
+	}
+
+	if cfg.EnableSWCPUClock {
+		if err := register("origin_id_sampling", &samples.TypeMetadata{
+			PeriodType: "cpu",
+			PeriodUnit: "nanoseconds",
+			SampleType: "samples",
+			SampleUnit: "count",
+		}); err != nil {
+			return err
+		}
+	}
+
+	if cfg.EnableHWCPUCycles {
+		if err := register("origin_id_hw_cpu_cycles", &samples.TypeMetadata{
+			PeriodType: "cpu",
+			PeriodUnit: "cycles",
+			SampleType: "samples",
+			SampleUnit: "count",
+		}); err != nil {
+			return err
+		}
+	}
+
+	if cfg.EnableHWCPUCycles && cfg.EnableBranchSampling {
+		if err := register("origin_id_amd_brs", &samples.TypeMetadata{
+			SampleType: "branches",
+			SampleUnit: "count",
+		}); err != nil {
+			return err
+		}
+	}
+
+	if cfg.OffCPUThreshold > 0 {
+		if err := register("origin_id_off_cpu", &samples.TypeMetadata{
+			SampleType:   "off_cpu",
+			SampleUnit:   "nanoseconds",
+			ReportValues: true,
+		}); err != nil {
+			return err
 		}
 	}
 

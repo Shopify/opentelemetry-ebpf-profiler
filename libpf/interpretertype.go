@@ -37,6 +37,9 @@ const (
 	Go InterpreterType = support.FrameMarkerGo
 	// BEAM identifies the BEAM interpreter.
 	BEAM InterpreterType = support.FrameMarkerBEAM
+	// LBR identifies a Last Branch Record entry. It is not an interpreter,
+	// but uses the frame/interpreter type plumbing for profile export.
+	LBR InterpreterType = support.FrameMarkerLBR
 )
 
 // Pseudo-interpreters without a corresponding frame type.
@@ -74,6 +77,7 @@ var interpreterTypeToString = map[InterpreterType]string{
 	APMInt:  "apm-integration",
 	LuaJIT:  "luajit",
 	Go:      "go",
+	LBR:     "lbr",
 }
 
 var stringToInterpreterType = make(map[string]InterpreterType, len(interpreterTypeToString))

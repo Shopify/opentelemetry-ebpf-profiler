@@ -66,6 +66,7 @@ func StartTracer(ctx context.Context, t *testing.T, interpretersConfig interpret
 		ProbabilisticThreshold: 100,
 		OffCPUThreshold:        uint32(math.MaxUint32 / 100),
 		VerboseMode:            true,
+		EnableSWCPUClock:       true,
 	})
 	require.NoError(t, err)
 

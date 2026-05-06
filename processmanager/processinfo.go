@@ -792,11 +792,28 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 
 	// Sort and publish the new mappings and meta.
 	slices.SortFunc(mappings, compareMapping)
+	// Build a secondary index ordered by runtime virtual address. LBR branch
+	// endpoints are runtime addresses rather than file virtual addresses.
+	mappingsByVaddr := make([]int, len(mappings))
+	for i := range mappingsByVaddr {
+		mappingsByVaddr[i] = i
+	}
+	slices.SortFunc(mappingsByVaddr, func(a, b int) int {
+		switch {
+		case mappings[a].Vaddr < mappings[b].Vaddr:
+			return -1
+		case mappings[a].Vaddr > mappings[b].Vaddr:
+			return 1
+		default:
+			return 0
+		}
+	})
 
 	info = pm.getOrCreateProcessInfo(pid, pr)
 	pm.mu.Lock()
 	if info != nil {
 		info.mappings = mappings
+		info.mappingsByVaddr = mappingsByVaddr
 		if updateProcessMeta {
 			info.meta = meta
 		}
@@ -872,31 +889,49 @@ func (pm *ProcessManager) metaForPID(pid libpf.PID) process.Meta {
 	return process.Meta{}
 }
 
-// findMappingForTrace locates the mapping for a given host trace.
-func (pm *ProcessManager) findMappingForTrace(pid libpf.PID, fid host.FileID,
-	addr libpf.Address) libpf.FrameMapping {
+// findMapping locates a mapping in one of two modes:
+//
+//   - fid != nil: addr is a file virtual address, for native stack frames.
+//   - fid == nil: addr is a runtime virtual address, for LBR endpoints.
+//
+// The returned runtime start address is used to translate LBR runtime addresses
+// into file virtual addresses. On no match, the returned mapping is invalid.
+func (pm *ProcessManager) findMapping(pid libpf.PID, fid *host.FileID,
+	addr libpf.Address) (libpf.FrameMapping, libpf.Address) {
 	var maps []Mapping
+	var mapsByVaddr []int
 
 	pm.mu.RLock()
 	if procInfo, ok := pm.pidToProcessInfo[pid]; ok {
 		maps = procInfo.mappings
+		mapsByVaddr = procInfo.mappingsByVaddr
 	}
 	pm.mu.RUnlock()
 	if maps == nil {
-		return libpf.FrameMapping{}
+		return libpf.FrameMapping{}, 0
 	}
 
-	// Binary search for the potentially matching 'maps' entry. The search
-	// lambda makes 'sort.Search' return the first entry that is larger
-	// than the fid/addr pair. Thus -1 is needed to get index for the first
-	// entry which is equal or less than fid/addr pair.
+	if fid == nil {
+		// Find the last mapping whose runtime start is no greater than addr.
+		j := sort.Search(len(mapsByVaddr), func(i int) bool {
+			return maps[mapsByVaddr[i]].Vaddr > addr
+		}) - 1
+		if j >= 0 {
+			m := &maps[mapsByVaddr[j]]
+			if m.Vaddr <= addr && addr < m.Vaddr+libpf.Address(m.Length) {
+				return m.FrameMapping, m.Vaddr
+			}
+		}
+		return libpf.FrameMapping{}, 0
+	}
+
+	// Find the last entry no greater than the file ID/address pair.
 	i := sort.Search(len(maps), func(i int) bool {
 		entry := &maps[i]
 		fm := entry.FrameMapping.Value()
-		f := fm.File.Value()
-		entryFid := host.FileIDFromLibpf(f.FileID)
-		if entryFid != fid {
-			return entryFid >= fid
+		entryFid := host.FileIDFromLibpf(fm.File.Value().FileID)
+		if entryFid != *fid {
+			return entryFid >= *fid
 		}
 		return fm.Start >= addr
 	}) - 1
@@ -904,14 +939,12 @@ func (pm *ProcessManager) findMappingForTrace(pid libpf.PID, fid host.FileID,
 	if i >= 0 {
 		entry := &maps[i]
 		fm := entry.FrameMapping.Value()
-		f := fm.File.Value()
-		entryFid := host.FileIDFromLibpf(f.FileID)
-		// Validate that the candidate 'maps' entry is a true match.
-		if entryFid == fid && fm.Start <= addr && addr < fm.End {
-			return entry.FrameMapping
+		entryFid := host.FileIDFromLibpf(fm.File.Value().FileID)
+		if entryFid == *fid && fm.Start <= addr && addr < fm.End {
+			return entry.FrameMapping, entry.Vaddr
 		}
 	}
-	return libpf.FrameMapping{}
+	return libpf.FrameMapping{}, 0
 }
 
 func (pm *ProcessManager) ProcessedUntil(traceCaptureKTime times.KTime) {

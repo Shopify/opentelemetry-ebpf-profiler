@@ -26,6 +26,7 @@ import (
 	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/elastic/go-perf"
+	"github.com/klauspost/cpuid/v2"
 	"go.opentelemetry.io/ebpf-profiler/internal/linux"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
@@ -135,6 +136,16 @@ type Tracer struct {
 	// probabilisticThreshold holds the threshold for probabilistic profiling.
 	probabilisticThreshold uint
 
+	// enableSWCPUClock enables software cpu-clock perf events for sampling.
+	enableSWCPUClock bool
+
+	// enableHWCPUCycles enables hardware cpu-cycles perf events for sampling.
+	enableHWCPUCycles bool
+
+	// enableBranchSampling requests branch records for hardware cycle samples.
+	// Failure to enable branch sampling does not disable other event types.
+	enableBranchSampling bool
+
 	// customLabels validates custom label keys/values pulled from eBPF and
 	// tracks how many were dropped due to invalid UTF-8.
 	customLabels customLabelValidator
@@ -208,6 +219,12 @@ type Config struct {
 	BPFFSRoot string
 	// OBIProcessCtx enable the use of a known shared eBPF map with OBI.
 	OBIProcessCtx bool
+	// EnableSWCPUClock enables software cpu-clock perf events for sampling.
+	EnableSWCPUClock bool
+	// EnableHWCPUCycles enables hardware cpu-cycles perf events for sampling.
+	EnableHWCPUCycles bool
+	// EnableBranchSampling enables optional LBR/BRS capture for cycle samples.
+	EnableBranchSampling bool
 	// ProcessMetaEnrichers are optional hooks for enriching process metadata at
 	// process discovery time. Multiple enrichers are called in order.
 	ProcessMetaEnrichers []process.MetaEnricher
@@ -319,6 +336,9 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		samplesPerSecond:       cfg.SamplesPerSecond,
 		probabilisticInterval:  cfg.ProbabilisticInterval,
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
+		enableSWCPUClock:       cfg.EnableSWCPUClock,
+		enableHWCPUCycles:      cfg.EnableHWCPUCycles,
+		enableBranchSampling:   cfg.EnableBranchSampling,
 		done:                   make(chan libpf.Void),
 		origins:                origins,
 		sysConfigVars:          sysConfigVars,
@@ -497,7 +517,8 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *orig
 	}
 
 	if err = loadPerfUnwinders(coll, ebpfProgs, ebpfMaps["perf_progs"], tailCallProgs,
-		cfg.BPFVerifierLogLevel); err != nil {
+		cfg.BPFVerifierLogLevel, cfg.EnableSWCPUClock, cfg.EnableHWCPUCycles,
+		cfg.EnableBranchSampling); err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to load perf eBPF programs: %v", err)
 	}
 
@@ -800,14 +821,15 @@ func schedTimesSize(threshold uint32) uint32 {
 // loadPerfUnwinders loads all perf eBPF Programs and their tail call targets.
 func loadPerfUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.Program,
 	tailcallMap *cebpf.Map, tailCallProgs []ProgLoaderHelper,
-	bpfVerifierLogLevel uint32,
+	bpfVerifierLogLevel uint32, enableSWCPUClock, enableHWCPUCycles,
+	enableBranchSampling bool,
 ) error {
 	programOptions := cebpf.ProgramOptions{
 		LogLevel: cebpf.LogLevel(bpfVerifierLogLevel),
 	}
 
-	progs := make([]ProgLoaderHelper, len(tailCallProgs)+3)
-	copy(progs, tailCallProgs)
+	progs := make([]ProgLoaderHelper, 0, len(tailCallProgs)+5)
+	progs = append(progs, tailCallProgs...)
 
 	schedProcessFree := schedProcessFreeHookName(libpf.MapKeysToSet(coll.Programs))
 	progs = append(progs,
@@ -822,9 +844,19 @@ func loadPerfUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.P
 			Enable:           true,
 		},
 		ProgLoaderHelper{
-			Name:             "native_tracer_entry",
+			Name:             "native_tracer_entry_sw_cpu_clock",
 			NoTailCallTarget: true,
-			Enable:           true,
+			Enable:           enableSWCPUClock,
+		},
+		ProgLoaderHelper{
+			Name:             "native_tracer_entry_hw_cpu_cycles",
+			NoTailCallTarget: true,
+			Enable:           enableHWCPUCycles,
+		},
+		ProgLoaderHelper{
+			Name:             "native_tracer_entry_amd_brs",
+			NoTailCallTarget: true,
+			Enable:           enableHWCPUCycles && enableBranchSampling,
 		})
 
 	for _, unwindProg := range progs {
@@ -1138,6 +1170,11 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 	// manager splits and symbolizes them so all frame processing shares one cache.
 	copy(trace.FrameData, ptr.Frame_data[:frameDataWords])
 
+	// Branch records are carried in a dedicated fixed-size array before frame_data.
+	nrBranchRecords := min(int(ptr.Nr_branch_records), len(ptr.Perf_branch_records))
+	trace.LBR = trace.LBRBuf[:nrBranchRecords]
+	copy(trace.LBR, ptr.Perf_branch_records[:nrBranchRecords])
+
 	return trace, nil
 }
 
@@ -1212,21 +1249,10 @@ func terminatePerfEvents(events []*perf.Event) {
 	}
 }
 
-// AttachTracer attaches the main tracer entry point to the perf interrupt events. The tracer
-// entry point is always the native tracer. The native tracer will determine when to invoke the
-// interpreter tracers based on address range information.
+// AttachTracer attaches each enabled sampling source to the selected CPUs. Event
+// types are independent: an unsupported source is skipped if another source can
+// be attached successfully.
 func (t *Tracer) AttachTracer(targetCPUs []int) error {
-	tracerProg, ok := t.ebpfProgs["native_tracer_entry"]
-	if !ok {
-		return errors.New("entry program is not available")
-	}
-
-	perfAttribute := new(perf.Attr)
-	perfAttribute.SetSampleFreq(uint64(t.samplesPerSecond))
-	if err := perf.CPUClock.Configure(perfAttribute); err != nil {
-		return fmt.Errorf("failed to configure software perf event: %v", err)
-	}
-
 	onlineCPUs, err := onlineCPUsOnce()
 	if err != nil {
 		return fmt.Errorf("failed to get online cpus: %w", err)
@@ -1243,19 +1269,188 @@ func (t *Tracer) AttachTracer(targetCPUs []int) error {
 
 	events := t.perfEntrypoints.WLock()
 	defer t.perfEntrypoints.WUnlock(&events)
-	for _, id := range targetCPUs {
-		perfEvent, err := perf.Open(perfAttribute, perf.AllThreads, id, nil)
-		if err != nil {
-			terminatePerfEvents(*events)
-			return fmt.Errorf("failed to attach to perf event on CPU %d: %v", id, err)
+
+	var attachErrs []error
+	if t.enableSWCPUClock {
+		if err := t.attachPerfEvents(events, targetCPUs,
+			"native_tracer_entry_sw_cpu_clock", perf.CPUClock); err != nil {
+			wrapped := fmt.Errorf("software cpu-clock: %w", err)
+			attachErrs = append(attachErrs, wrapped)
+			log.Infof("Failed to attach %v; skipping", wrapped)
 		}
-		if err := perfEvent.SetBPF(uint32(tracerProg.FD())); err != nil {
-			terminatePerfEvents(*events)
-			return fmt.Errorf("failed to attach eBPF program to perf event: %v", err)
-		}
-		*events = append(*events, perfEvent)
 	}
 
+	if t.enableHWCPUCycles {
+		enabledLBR, err := t.attachHWCPUCyclesPerfEvents(
+			events, targetCPUs, t.enableBranchSampling)
+		if err != nil {
+			wrapped := fmt.Errorf("hardware cpu-cycles: %w", err)
+			attachErrs = append(attachErrs, wrapped)
+			log.Infof("Failed to attach %v; skipping", wrapped)
+		} else if t.enableBranchSampling && !enabledLBR {
+			// AMD BRS is a separate event. Attempt it only after the cycle event
+			// itself was attached successfully.
+			if err := t.attachAMDBRSPerfEvents(events, targetCPUs); err != nil {
+				wrapped := fmt.Errorf("AMD BRS: %w", err)
+				attachErrs = append(attachErrs, wrapped)
+				log.Infof("Failed to attach %v; continuing without branch sampling", wrapped)
+			}
+		}
+	}
+
+	if len(*events) == 0 {
+		if err := errors.Join(attachErrs...); err != nil {
+			return fmt.Errorf("no perf events could be attached for profiling: %w", err)
+		}
+		return errors.New("no perf events enabled for profiling")
+	}
+	return nil
+}
+
+// perfEventConfigurer is implemented by go-perf's predefined event types.
+type perfEventConfigurer interface {
+	Configure(*perf.Attr) error
+}
+
+// attachPerfEvents attaches one eBPF entry program to an event on every selected CPU.
+func (t *Tracer) attachPerfEvents(events *[]*perf.Event, cpuIDs []int,
+	progName string, eventType perfEventConfigurer) error {
+	tracerProg, ok := t.ebpfProgs[progName]
+	if !ok {
+		return fmt.Errorf("entry program %q is not available", progName)
+	}
+
+	perfAttribute := new(perf.Attr)
+	perfAttribute.SetSampleFreq(uint64(t.samplesPerSecond))
+	if err := eventType.Configure(perfAttribute); err != nil {
+		return fmt.Errorf("failed to configure perf event: %w", err)
+	}
+
+	evs := make([]*perf.Event, 0, len(cpuIDs))
+	for _, id := range cpuIDs {
+		perfEvent, err := perf.Open(perfAttribute, perf.AllThreads, id, nil)
+		if err != nil {
+			terminatePerfEvents(evs)
+			return fmt.Errorf("failed to open perf event on CPU %d: %w", id, err)
+		}
+		if err := perfEvent.SetBPF(uint32(tracerProg.FD())); err != nil {
+			_ = perfEvent.Close()
+			terminatePerfEvents(evs)
+			return fmt.Errorf("failed to attach eBPF program on CPU %d: %w", id, err)
+		}
+		evs = append(evs, perfEvent)
+	}
+
+	*events = append(*events, evs...)
+	return nil
+}
+
+// attachHWCPUCyclesPerfEvents attaches hardware cpu-cycles events. When branch
+// sampling is unavailable, it falls back to plain cycles and reports LBR disabled.
+func (t *Tracer) attachHWCPUCyclesPerfEvents(
+	events *[]*perf.Event, cpuIDs []int, enableBranchSampling bool) (bool, error) {
+	const progName = "native_tracer_entry_hw_cpu_cycles"
+
+	// Family 0x19 AMD CPUs use the separate BRS event for branch sampling.
+	if !enableBranchSampling || (cpuid.CPU.VendorID == cpuid.AMD && cpuid.CPU.Family == 0x19) {
+		return false, t.attachPerfEvents(events, cpuIDs, progName, perf.CPUCycles)
+	}
+
+	tracerProg, ok := t.ebpfProgs[progName]
+	if !ok {
+		return false, fmt.Errorf("entry program %q is not available", progName)
+	}
+
+	lbrAttr := new(perf.Attr)
+	lbrAttr.SetSampleFreq(uint64(t.samplesPerSecond))
+	if err := perf.CPUCycles.Configure(lbrAttr); err != nil {
+		return false, fmt.Errorf("failed to configure hardware cpu-cycles event: %w", err)
+	}
+	lbrAttr.SampleFormat.BranchStack = true
+	lbrAttr.BranchSampleFormat = perf.BranchSampleFormat{
+		Privilege: perf.BranchPrivilegeUser,
+		Sample:    perf.BranchSampleAny,
+	}
+
+	evs := make([]*perf.Event, 0, len(cpuIDs))
+	for _, id := range cpuIDs {
+		perfEvent, err := perf.Open(lbrAttr, perf.AllThreads, id, nil)
+		if err == nil {
+			err = perfEvent.SetBPF(uint32(tracerProg.FD()))
+		}
+		if err == nil {
+			// Some kernels reject branch sampling only when the event is enabled.
+			err = perfEvent.Enable()
+		}
+		if err == nil {
+			err = perfEvent.Disable()
+		}
+		if err != nil {
+			if perfEvent != nil {
+				_ = perfEvent.Close()
+			}
+			terminatePerfEvents(evs)
+			log.Infof("LBR unavailable on CPU %d, falling back to plain cycles: %v", id, err)
+			if fallbackErr := t.attachPerfEvents(events, cpuIDs, progName, perf.CPUCycles); fallbackErr != nil {
+				return false, fmt.Errorf("plain cpu-cycles fallback failed: %w", fallbackErr)
+			}
+			return false, nil
+		}
+		evs = append(evs, perfEvent)
+	}
+
+	*events = append(*events, evs...)
+	return true, nil
+}
+
+// attachAMDBRSPerfEvents attaches AMD's separate branch-record event on family 0x19.
+func (t *Tracer) attachAMDBRSPerfEvents(events *[]*perf.Event, cpuIDs []int) error {
+	if !(cpuid.CPU.VendorID == cpuid.AMD && cpuid.CPU.Family == 0x19) {
+		return nil
+	}
+
+	tracerProg, ok := t.ebpfProgs["native_tracer_entry_amd_brs"]
+	if !ok {
+		return errors.New("entry program \"native_tracer_entry_amd_brs\" is not available")
+	}
+
+	perfAttribute := new(perf.Attr)
+	perfAttribute.Type = perf.RawEvent
+	perfAttribute.Config = 0xc4 // RETIRED_BRANCH_INSTRUCTIONS
+	// AMD BRS requires period sampling and PERF_SAMPLE_BRANCH_STACK.
+	perfAttribute.SetSamplePeriod(1000003)
+	perfAttribute.SampleFormat.BranchStack = true
+	perfAttribute.BranchSampleFormat = perf.BranchSampleFormat{
+		Privilege: perf.BranchPrivilegeUser,
+		Sample:    perf.BranchSampleAny,
+	}
+
+	evs := make([]*perf.Event, 0, len(cpuIDs))
+	for _, id := range cpuIDs {
+		perfEvent, err := perf.Open(perfAttribute, perf.AllThreads, id, nil)
+		if err != nil {
+			terminatePerfEvents(evs)
+			return fmt.Errorf("failed to open perf event on CPU %d: %w", id, err)
+		}
+		if err := perfEvent.SetBPF(uint32(tracerProg.FD())); err != nil {
+			_ = perfEvent.Close()
+			terminatePerfEvents(evs)
+			return fmt.Errorf("failed to attach eBPF program on CPU %d: %w", id, err)
+		}
+		// Validate support now, then leave the event disabled until profiling starts.
+		if err := perfEvent.Enable(); err != nil {
+			_ = perfEvent.Close()
+			terminatePerfEvents(evs)
+			return fmt.Errorf("failed to enable validation event on CPU %d: %w", id, err)
+		}
+		if err := perfEvent.Disable(); err != nil {
+			_ = perfEvent.Close()
+			terminatePerfEvents(evs)
+			return fmt.Errorf("failed to disable validation event on CPU %d: %w", id, err)
+		}
+		evs = append(evs, perfEvent)
+	}
+	*events = append(*events, evs...)
 	return nil
 }
 

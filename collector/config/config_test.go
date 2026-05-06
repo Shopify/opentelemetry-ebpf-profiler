@@ -22,6 +22,7 @@ func validConfig() *Config {
 		ProbabilisticThreshold: 100,
 		NoKernelVersionCheck:   true,
 		ErrorMode:              PropagateError,
+		EnableSWCPUClock:       true,
 	}
 }
 
@@ -76,6 +77,29 @@ func TestValidateFrameCacheSize(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestValidateSamplingEvents(t *testing.T) {
+	cfg := validConfig()
+	cfg.EnableSWCPUClock = false
+
+	err := confmap.Validate(cfg)
+	require.EqualError(t, err,
+		"at least one perf event type must be enabled: use --enable-sw-cpu-clock and/or --enable-hw-cpu-cycles")
+
+	cfg.EnableHWCPUCycles = true
+	require.NoError(t, confmap.Validate(cfg))
+}
+
+func TestValidateBranchSamplingRequiresCycles(t *testing.T) {
+	cfg := validConfig()
+	cfg.EnableBranchSampling = true
+
+	err := confmap.Validate(cfg)
+	require.EqualError(t, err, "branch sampling requires hardware cpu-cycles")
+
+	cfg.EnableHWCPUCycles = true
+	require.NoError(t, confmap.Validate(cfg))
 }
 
 func TestUnmarshalText(t *testing.T) {

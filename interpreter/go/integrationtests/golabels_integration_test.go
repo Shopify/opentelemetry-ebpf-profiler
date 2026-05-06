@@ -106,6 +106,7 @@ func Test_Golabels(t *testing.T) {
 				ProbabilisticThreshold: 100,
 				OffCPUThreshold:        uint32(math.MaxUint32 / 100),
 				VerboseMode:            true,
+				EnableSWCPUClock:       true,
 			})
 			require.NoError(t, err)
 			defer trc.Close()

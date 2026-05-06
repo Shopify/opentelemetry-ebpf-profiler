@@ -110,6 +110,7 @@ func TestTracerErrorPropagation(t *testing.T) {
 		ProbabilisticThreshold: 100,
 		OffCPUThreshold:        1 * math.MaxUint32,
 		VerboseMode:            true,
+		EnableSWCPUClock:       true,
 	})
 	require.NoError(t, err)
 	defer tr.Close()
@@ -153,6 +154,7 @@ func TestTracerMapMonitorsError(t *testing.T) {
 		ProbabilisticThreshold: 100,
 		OffCPUThreshold:        1 * math.MaxUint32,
 		VerboseMode:            true,
+		EnableSWCPUClock:       true,
 	})
 	require.NoError(t, err)
 	defer tr.Close()
@@ -180,6 +182,7 @@ func TestTraceTransmissionAndParsing(t *testing.T) {
 		ProbabilisticThreshold: 100,
 		OffCPUThreshold:        1 * math.MaxUint32,
 		VerboseMode:            true,
+		EnableSWCPUClock:       true,
 	})
 	require.NoError(t, err)
 	defer tr.Close()
@@ -282,6 +285,7 @@ func TestAllTracers(t *testing.T) {
 				OffCPUThreshold:         uint32(math.MaxUint32 / 100),
 				VerboseMode:             true,
 				PIDNamespaceTranslation: tc.enablePIDNamespaceTranslation,
+				EnableSWCPUClock:        true,
 			})
 			require.NoError(t, err)
 			defer tr.Close()

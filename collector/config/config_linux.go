@@ -86,6 +86,16 @@ type Config struct {
 	TargetCPUIDs            string                   `mapstructure:"pin_cpu_ids"`
 	Probes                  []Probe                  `mapstructure:"probes"`
 
+	// EnableSWCPUClock enables software cpu-clock perf events for sampling.
+	// This is the default event type used for profiling.
+	EnableSWCPUClock bool `mapstructure:"enable_sw_cpu_clock"`
+	// EnableHWCPUCycles enables hardware cpu-cycles perf events for sampling.
+	// When enabled with EnableSWCPUClock, both event types are collected concurrently.
+	EnableHWCPUCycles bool `mapstructure:"enable_hw_cpu_cycles"`
+	// EnableBranchSampling enables LBR for Intel/Zen 4+ or AMD BRS for older Zen.
+	// Branch sampling is optional and is only used with hardware cpu-cycles.
+	EnableBranchSampling bool `mapstructure:"enable_branch_sampling"`
+
 	// Configuration options that users can not set directly:
 	//
 	// PinnedCPUIDs is derived from TargetCPUIDs during Validate
@@ -142,6 +152,16 @@ func (cfg *Config) Validate() error {
 		return errors.New(
 			"invalid argument for reporter-jitter. The value " +
 				"should be in the range [0..1]. 0 disables jitter")
+	}
+
+	if !cfg.EnableSWCPUClock && !cfg.EnableHWCPUCycles {
+		return errors.New(
+			"at least one perf event type must be enabled: " +
+				"use --enable-sw-cpu-clock and/or --enable-hw-cpu-cycles")
+	}
+
+	if cfg.EnableBranchSampling && !cfg.EnableHWCPUCycles {
+		return errors.New("branch sampling requires hardware cpu-cycles")
 	}
 
 	if cfg.TargetCPUIDs != "" {

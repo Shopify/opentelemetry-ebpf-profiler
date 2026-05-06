@@ -655,6 +655,19 @@ typedef struct CustomLabelsArray {
   CustomLabel labels[MAX_CUSTOM_LABELS];
 } CustomLabelsArray;
 
+// LBREntry is the on-the-wire representation of a branch record. Its layout
+// matches the kernel perf_branch_entry leading fields so
+// bpf_read_branch_records() can write directly into this array.
+typedef struct LBREntry {
+  u64 from;
+  u64 to;
+  u64 flags;
+} LBREntry;
+
+_Static_assert(
+  sizeof(LBREntry) == sizeof(struct perf_branch_entry),
+  "LBREntry must match the kernel perf_branch_entry ABI size");
+
 // Container for a stack trace
 typedef struct Trace {
   // The process ID
@@ -691,6 +704,12 @@ typedef struct Trace {
 
   // The CPU that captured this trace.
   u32 cpu_id;
+
+  // The number of valid entries in perf_branch_records.
+  u32 nr_branch_records;
+
+  // Branch records captured through bpf_read_branch_records().
+  LBREntry perf_branch_records[MAX_BRANCH_RECORDS];
 
   // The frame data of the stack trace. Each frame is variable length.
   // Frame is currently 2-3 entries long. This array size limits the

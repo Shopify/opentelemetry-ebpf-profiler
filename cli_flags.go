@@ -86,7 +86,13 @@ var (
 		"captured profiling samples."
 	frameCacheSizeHelp = fmt.Sprintf("Set the maximum number of entries in the frame cache. "+
 		"Default is %d.", defaultArgFrameCacheSize)
-	probeLinkHelper = "Attach a probe to a symbol of an executable. " +
+	enableSWCPUClockHelp = "Enable software cpu-clock perf events for sampling. " +
+		"At least one of --enable-sw-cpu-clock or --enable-hw-cpu-cycles must be enabled."
+	enableHWCPUCyclesHelp = "Enable hardware cpu-cycles perf events for sampling. " +
+		"Hardware events may not be available in all environments (e.g., VMs without PMU passthrough). " +
+		"At least one of --enable-sw-cpu-clock or --enable-hw-cpu-cycles must be enabled."
+	enableBranchSamplingHelp = "Enable branch sampling for supported CPUs. Requires hardware cpu-cycles."
+	probeLinkHelper          = "Attach a probe to a symbol of an executable. " +
 		"Expected format: probe_type:target[:symbol]. probe_type can be kprobe, kretprobe, uprobe, or uretprobe."
 	bpffsHelp = fmt.Sprintf("Set the root BPF FS path for pinned maps. Only used for OBI span/trace ID communication. Default is %s",
 		defaultBPFFSRoot)
@@ -171,6 +177,10 @@ func parseArgs() (*controller.Config, error) {
 		defaultOffCPUThreshold, offCPUThresholdHelp)
 
 	fs.StringVar(&args.IncludeEnvVars, "env-vars", defaultEnvVarsValue, envVarsHelp)
+
+	fs.BoolVar(&args.EnableSWCPUClock, "enable-sw-cpu-clock", true, enableSWCPUClockHelp)
+	fs.BoolVar(&args.EnableHWCPUCycles, "enable-hw-cpu-cycles", false, enableHWCPUCyclesHelp)
+	fs.BoolVar(&args.EnableBranchSampling, "enable-branch-sampling", false, enableBranchSamplingHelp)
 
 	fs.StringVar(&args.BPFFSRoot, "bpffs-root", defaultBPFFSRoot, bpffsHelp)
 
