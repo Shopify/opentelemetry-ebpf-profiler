@@ -14,6 +14,11 @@ struct ruby_procs_t {
   __uint(max_entries, 1024);
 } ruby_procs SEC(".maps");
 
+// ruby_skip_native_resume is set during load time. When enabled, cfunc frames
+// are pushed inline without transitioning back to the native unwinder. This
+// saves tail calls at the cost of losing native frames within cfuncs.
+BPF_RODATA_VAR(bool, ruby_skip_native_resume, false)
+
 // The number of Ruby frames to unwind per frame-unwinding eBPF program. If
 // we start running out of instructions in the walk_ruby_stack program, one
 // option is to adjust this number downwards.
@@ -270,8 +275,8 @@ static EBPF_INLINE ErrorCode read_ruby_frame(
         // continue unwinding Ruby VM frames. Due to this issue, the ordering of Ruby and native
         // frames will almost certainly be incorrect for Ruby versions < 2.6.
         frame_type = RUBY_FRAME_TYPE_CME_CFUNC;
-      } else if (record->rubyUnwindState.jit_detected || rubyinfo->skip_native_resume) {
-        // JIT code and skip_native_resume both push cfuncs inline instead of
+      } else if (record->rubyUnwindState.jit_detected || ruby_skip_native_resume) {
+        // JIT code and ruby_skip_native_resume both push cfuncs inline instead of
         // handing off to the native unwinder.
         frame_type = RUBY_FRAME_TYPE_CME_CFUNC;
       } else {
@@ -483,9 +488,9 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
     if (last_stack_frame <= stack_ptr) {
       // We have processed all frames in the Ruby VM and can stop here.
       // If JIT was detected, the PC is in the JIT region and native
-      // unwinding would fail, so we stop. If skip_native_resume is set, stop
-      // instead of resuming native unwinding.
-      *next_unwinder = record->rubyUnwindState.jit_detected || rubyinfo->skip_native_resume
+      // unwinding would fail, so we stop. If ruby_skip_native_resume is set,
+      // stop instead of resuming native unwinding.
+      *next_unwinder = record->rubyUnwindState.jit_detected || ruby_skip_native_resume
                          ? PROG_UNWIND_STOP
                          : PROG_UNWIND_NATIVE;
       goto save_state;
