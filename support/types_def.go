@@ -333,10 +333,7 @@ var MetricsTranslation = []metrics.MetricID{
 	C.metricID_UnwindNativeErrUnsupportedAnonymousMapping: metrics.IDUnwindNativeErrUnsupportedAnonymousMapping,
 	C.metricID_UnwindNativeErrNonExecutableVMA:            metrics.IDUnwindNativeErrNonExecutableVMA,
 	C.metricID_UnwindThreadContextErrReadTsdBase:          metrics.IDUnwindThreadContextErrReadTsdBase,
-	C.metricID_UnwindThreadContextErrReadThreadCtxBufPtr:  metrics.IDUnwindThreadContextErrReadThreadCtxBufPtr,
 	C.metricID_UnwindThreadContextErrReadThreadCtxBuf:     metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
 	C.metricID_UnwindThreadContextErrReadThreadCtxAttrs:   metrics.IDUnwindThreadContextErrReadThreadCtxAttrs,
-	C.metricID_UnwindThreadContextErrReadDtvPtr:           metrics.IDUnwindThreadContextErrReadDtvPtr,
-	C.metricID_UnwindThreadContextErrReadModuleTlsBase:    metrics.IDUnwindThreadContextErrReadModuleTlsBase,
 	C.metricID_UnwindThreadContextReadSuccesses:           metrics.IDUnwindThreadContextReadSuccesses,
 }
