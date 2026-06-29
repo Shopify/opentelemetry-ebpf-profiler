@@ -135,9 +135,11 @@ func GetLoader(_ Config) interpreter.Loader {
 
 func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
 	base := path.Base(info.FileName())
+	// tarantool (shopkv) statically links LuaJIT into the main `tarantool`
+	// binary, so there is no separate libluajit-5.1.so mapping to match on.
 	if !strings.HasPrefix(base, "libluajit-5.1.so") &&
 		!strings.HasPrefix(base, "luajit") &&
-		base != "nginx" && base != "openresty" {
+		base != "nginx" && base != "openresty" && base != "tarantool" {
 		return nil, nil
 	}
 
