@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -127,19 +128,25 @@ func (l *luajitInstance) Detach(ebpf interpreter.EbpfHandler, pid libpf.PID) err
 	return ebpf.DeleteProcData(libpf.LuaJIT, pid)
 }
 
-func GetLoader(_ Config) interpreter.Loader {
-	return interpreter.NewLoader(loader, []interpreter.InterpreterResource{
-		{MapName: BPFMapName, ProgID: uint32(support.ProgUnwindLuaJIT), ProgName: "unwind_luajit"},
-	})
+// embedsLuaJIT reports whether the executable base name ships or statically
+// links the LuaJIT runtime. The built-in set covers the LuaJIT shared library
+// (libluajit-5.1.so*, luajit*) and the well-known hosts nginx/openresty.
+// extraExecutables is an operator-configured list of additional binaries that
+// statically link LuaJIT (e.g. "tarantool"), so embedders can opt in via
+// configuration without a code change to this allowlist.
+func embedsLuaJIT(base string, extraExecutables []string) bool {
+	if strings.HasPrefix(base, "libluajit-5.1.so") ||
+		strings.HasPrefix(base, "luajit") ||
+		base == "nginx" || base == "openresty" {
+		return true
+	}
+	return slices.Contains(extraExecutables, base)
 }
 
-func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
+func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
+	extraExecutables []string) (interpreter.Data, error) {
 	base := path.Base(info.FileName())
-	// tarantool (shopkv) statically links LuaJIT into the main `tarantool`
-	// binary, so there is no separate libluajit-5.1.so mapping to match on.
-	if !strings.HasPrefix(base, "libluajit-5.1.so") &&
-		!strings.HasPrefix(base, "luajit") &&
-		base != "nginx" && base != "openresty" && base != "tarantool" {
+	if !embedsLuaJIT(base, extraExecutables) {
 		return nil, nil
 	}
 
