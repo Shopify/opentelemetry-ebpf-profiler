@@ -496,25 +496,34 @@ func calcRipRelativeAddr(a1 x86asm.Mem, baseAddr, ip int64) int64 {
 
 // If we're dealing with 32bit values compilers will use R or E prefix
 // interchangeably (E refs are just zero padded).
+// reg64 maps a 32-bit general-purpose register to its 64-bit counterpart so a
+// register loaded with a 32-bit MOV compares equal to its 64-bit use. Tarantool's
+// x86 (non-GC64) LuaJIT loads the global_State pointer with `movl 0x8(%rdi),%ebp`
+// (32-bit GCRef) and then addresses it as %rbp, so EBP must equal RBP. The legacy
+// eight GPRs are mapped; any other register is returned unchanged.
+func reg64(r x86asm.Reg) x86asm.Reg {
+	switch r {
+	case x86asm.EAX:
+		return x86asm.RAX
+	case x86asm.ECX:
+		return x86asm.RCX
+	case x86asm.EDX:
+		return x86asm.RDX
+	case x86asm.EBX:
+		return x86asm.RBX
+	case x86asm.ESP:
+		return x86asm.RSP
+	case x86asm.EBP:
+		return x86asm.RBP
+	case x86asm.ESI:
+		return x86asm.RSI
+	case x86asm.EDI:
+		return x86asm.RDI
+	default:
+		return r
+	}
+}
+
 func sameReg(r1, r2 x86asm.Reg) bool {
-	if r1 == r2 {
-		return true
-	}
-	f := func(r1, r2 x86asm.Reg) bool {
-		switch r1 {
-		case x86asm.EAX:
-			return r2 == x86asm.RAX
-		case x86asm.ECX:
-			return r2 == x86asm.RCX
-		case x86asm.EDX:
-			return r2 == x86asm.RDX
-		case x86asm.EBX:
-			return r2 == x86asm.RBX
-		case x86asm.ESI:
-			return r2 == x86asm.RSI
-		default:
-			return false
-		}
-	}
-	return f(r1, r2) || f(r2, r1)
+	return r1 == r2 || reg64(r1) == reg64(r2)
 }
