@@ -230,8 +230,12 @@ DeltasLoop:
 				continue
 			}
 
-			if asmBegin != 0 && dAddr == asmBegin {
-				return util.Range{Start: dAddr, End: nextAddr}, nil
+			// The VM asm is one large delta interval, but its start can sit a few
+			// bytes below lj_vm_asm_begin. Match the interval containing the symbol,
+			// then start the range exactly at the symbol.
+			if asmBegin != 0 && dAddr <= asmBegin && asmBegin < nextAddr &&
+				nextAddr-asmBegin > minInterpreterSize {
+				return util.Range{Start: asmBegin, End: nextAddr}, nil
 			}
 			if nextAddr-dAddr <= minInterpreterSize {
 				continue
