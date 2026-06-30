@@ -159,9 +159,12 @@ func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 	// to it: the stack-delta heuristic alone can match an unrelated large gap
 	// (observed on x86 tarantool — it matched 0x164469 instead of the real
 	// lj_vm_asm_begin 0x261ca0, then failed the start-address sanity check).
+	// lj_vm_asm_begin is a hidden .symtab symbol; raw ef.LookupSymbol only finds
+	// dynamic symbols, so use scanSymbols (which reads .symtab via VisitSymbols),
+	// matching how extractOffsets resolves it.
 	var asmBegin uint64
-	if s, e := ef.LookupSymbol("lj_vm_asm_begin"); e == nil {
-		asmBegin = uint64(s.Address)
+	if sym, ok := scanSymbols(ef)[libpf.SymbolName("lj_vm_asm_begin")]; ok {
+		asmBegin = uint64(sym.Address)
 	}
 
 	luaInterp, err := extractInterpreterBounds(info.Deltas(), cframeSize, asmBegin)
