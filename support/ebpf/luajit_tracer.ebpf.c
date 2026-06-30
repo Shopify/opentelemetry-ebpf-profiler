@@ -483,14 +483,18 @@ static EBPF_INLINE ErrorCode walk_luajit_stack(
              &record->state, &record->trace, (u64)scr->prev_proto, (u64)0, scr->prev_pc, 0))) {
         return err;
       }
-      if (record->luajitUnwindState.is_jit) {
-        unwind_native_frame(info, &record->state, true);
-
-        if ((err = resolve_unwind_mapping(record, next_unwinder)) != ERR_OK) {
-          DEBUG_PRINT("lj: failed to walk over jit frame");
-          *next_unwinder = PROG_UNWIND_STOP;
-          return err;
-        }
+      // Step over the C frame that entered the VM (the interpreter gate cframe,
+      // or the trace's frame for JIT) so the native unwinder resumes in the C
+      // caller (e.g. lua_pcall) instead of re-entering the luajit-mapped
+      // interpreter region. This was previously only done for is_jit, so interp
+      // stacks (e.g. tarantool on x86, where the bottom Lua frame meets C here
+      // rather than via a FRAME_CP) never handed back to native -> ERROR_4012
+      // and the C stack below the VM (lua_pcall, main, ...) was lost.
+      unwind_native_frame(info, &record->state, record->luajitUnwindState.is_jit);
+      if ((err = resolve_unwind_mapping(record, next_unwinder)) != ERR_OK) {
+        DEBUG_PRINT("lj: failed to walk over frame at end of stack");
+        *next_unwinder = PROG_UNWIND_STOP;
+        return err;
       }
       DEBUG_PRINT("lj: end lua frame");
       *next_unwinder = PROG_UNWIND_NATIVE;
