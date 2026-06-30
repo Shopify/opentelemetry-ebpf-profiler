@@ -158,9 +158,11 @@ func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 	// When the binary is unstripped (e.g. tarantool), lj_vm_asm_begin marks the
 	// exact start of the VM interpreter. Anchor the interpreter-range detection
 	// to it: the stack-delta heuristic alone can match an unrelated large gap.
+	// lj_vm_asm_begin is a hidden .symtab symbol; raw ef.LookupSymbol only finds
+	// dynamic symbols, so use scanSymbols, matching how extractOffsets resolves it.
 	var asmBegin uint64
-	if s, lookupErr := ef.LookupSymbol(ljVMAsmBeginSym); lookupErr == nil {
-		asmBegin = uint64(s.Address)
+	if sym, ok := scanSymbols(ef)[ljVMAsmBeginSym]; ok {
+		asmBegin = uint64(sym.Address)
 	}
 
 	luaInterp, err := extractInterpreterBounds(ef.Machine, *info.Intervals(), cframeSize, asmBegin)
