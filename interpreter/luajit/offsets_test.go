@@ -66,7 +66,7 @@ func TestOffsets(t *testing.T) {
 				intervals, param, err := extractStackDeltas(target, ef)
 				require.NoError(t, err)
 
-				interp, err := extractInterpreterBounds(intervals.Deltas, param)
+				interp, err := extractInterpreterBounds(intervals.Deltas, param, 0)
 				require.NoError(t, err)
 
 				ljd := luajitData{}
@@ -225,7 +225,7 @@ func TestFiles(t *testing.T) {
 		intervals, param, err := extractStackDeltas(target, ef)
 		require.NoError(t, err)
 
-		interp, err := extractInterpreterBounds(intervals.Deltas, param)
+		interp, err := extractInterpreterBounds(intervals.Deltas, param, 0)
 		require.NoError(t, err)
 
 		err = extractOffsets(ef, &ljd, interp)
