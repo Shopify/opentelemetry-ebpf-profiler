@@ -23,10 +23,96 @@ import (
 
 	"github.com/stretchr/testify/require"
 	testcontainers "github.com/testcontainers/testcontainers-go"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind/elfunwindinfo"
 	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
+	"go.opentelemetry.io/ebpf-profiler/support"
 )
+
+// TestExtractInterpreterBoundsAnchor verifies that lj_vm_asm_begin anchoring
+// selects the VM interval without regressing the heuristic-only arm64 path.
+func TestExtractInterpreterBoundsAnchor(t *testing.T) {
+	const (
+		x86Param = int32(80)
+		armParam = int32(208)
+		bigGap   = uint64(19400)
+		asmBegin = uint64(0x261ca0)
+	)
+	type absoluteDelta struct {
+		address uint64
+		info    support.UnwindInfo
+	}
+	mk := func(addr uint64, baseReg uint8, param int32) absoluteDelta {
+		return absoluteDelta{address: addr, info: support.UnwindInfo{BaseReg: baseReg, Param: param}}
+	}
+	intervals := func(deltas ...absoluteDelta) *sdtypes.IntervalData {
+		start := deltas[0].address
+		block := sdtypes.BasicBlock{Start: start, End: deltas[len(deltas)-1].address + 1}
+		for _, delta := range deltas {
+			block.Deltas = append(block.Deltas, sdtypes.StackDelta{
+				Offset: uint32(delta.address - start),
+				Info:   delta.info,
+			})
+		}
+		return &sdtypes.IntervalData{Blocks: []*sdtypes.BasicBlock{&block}}
+	}
+
+	t.Run("x86-decoy-gap-before-vm-asm", func(t *testing.T) {
+		data := intervals(
+			mk(0x1000, support.UnwindRegSp, x86Param),
+			mk(0x1000+15000, 0, 0),
+			mk(asmBegin, support.UnwindRegSp, x86Param),
+			mk(asmBegin+bigGap, 0, 0),
+		)
+		h, err := extractInterpreterBounds(data, x86Param, 0)
+		require.NoError(t, err)
+		require.Equal(t, uint64(0x1000), h.Start)
+		a, err := extractInterpreterBounds(data, x86Param, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin, a.Start)
+		require.Equal(t, asmBegin+bigGap, a.End)
+	})
+
+	t.Run("arm64-fp-vm-asm-no-regression", func(t *testing.T) {
+		data := intervals(
+			mk(0x2000, support.UnwindRegSp, armParam),
+			mk(0x2100, 0, 0),
+			mk(asmBegin, support.UnwindRegFp, 16),
+			mk(asmBegin+bigGap, 0, 0),
+		)
+		h, err := extractInterpreterBounds(data, armParam, 0)
+		require.NoError(t, err)
+		a, err := extractInterpreterBounds(data, armParam, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, h, a)
+	})
+
+	t.Run("vm-asm-delta-starts-below-symbol", func(t *testing.T) {
+		data := intervals(
+			mk(asmBegin-4, support.UnwindRegFp, 16),
+			mk(asmBegin-4+bigGap, 0, 0),
+		)
+		h, err := extractInterpreterBounds(data, armParam, 0)
+		require.NoError(t, err)
+		a, err := extractInterpreterBounds(data, armParam, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin, a.Start)
+		require.Equal(t, h.End, a.End)
+	})
+
+	t.Run("falls-back-when-symbol-not-in-large-interval", func(t *testing.T) {
+		data := intervals(
+			mk(asmBegin, support.UnwindRegSp, x86Param),
+			mk(asmBegin+100, 0, 0),
+			mk(asmBegin+0x10000, support.UnwindRegSp, x86Param),
+			mk(asmBegin+0x10000+bigGap, 0, 0),
+		)
+		a, err := extractInterpreterBounds(data, x86Param, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin+0x10000, a.Start)
+	})
+}
 
 const (
 	openrestyBase = "openresty/openresty"
@@ -82,6 +168,21 @@ func TestOffsets(t *testing.T) {
 				require.NotZero(t, ljd.currentLOffset)
 				require.NotZero(t, ljd.g2Traces)
 				require.NotZero(t, ljd.g2Dispatch)
+
+				// Anchor regression guard: on these (unstripped) shared-lib builds the
+				// lj_vm_asm_begin anchor must produce a range that starts at the symbol
+				// and yields byte-identical offsets to the heuristic path, on BOTH arches.
+				if sym, ok := scanSymbols(ef)[libpf.SymbolName("lj_vm_asm_begin")]; ok {
+					interpA, errA := extractInterpreterBounds(&intervals, param, uint64(sym.Address))
+					require.NoError(t, errA)
+					require.Equal(t, uint64(sym.Address), interpA.Start)
+					require.GreaterOrEqual(t, interpA.Start, interp.Start)
+					ljdA := luajitData{}
+					require.NoError(t, extractOffsets(ef, &ljdA, interpA))
+					require.Equal(t, ljd.currentLOffset, ljdA.currentLOffset)
+					require.Equal(t, ljd.g2Traces, ljdA.g2Traces)
+					require.Equal(t, ljd.g2Dispatch, ljdA.g2Dispatch)
+				}
 
 				od := offsetData{}
 				err = od.init(ef)
