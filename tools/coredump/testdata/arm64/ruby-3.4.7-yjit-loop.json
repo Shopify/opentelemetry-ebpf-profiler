@@ -14,7 +14,8 @@
         "Range#each+0 in <cfunc>:0",
         "block in <main>+0 in /Users/dalehamel/src/github.com/Shopify/otel-ebpf-pr1102/tools/coredump/testsources/ruby/loop.rb:33",
         "Kernel#loop+0 in <internal:kernel>:168",
-        "<main>+0 in /Users/dalehamel/src/github.com/Shopify/otel-ebpf-pr1102/tools/coredump/testsources/ruby/loop.rb:32"
+        "<main>+0 in /Users/dalehamel/src/github.com/Shopify/otel-ebpf-pr1102/tools/coredump/testsources/ruby/loop.rb:32",
+        "<error ruby_jit_native_resume_unsupported>"
       ]
     },
     {
