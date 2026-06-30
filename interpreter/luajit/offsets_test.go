@@ -4,12 +4,99 @@
 package luajit
 
 import (
+	"debug/elf"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
+	"go.opentelemetry.io/ebpf-profiler/support"
 )
+
+// TestExtractInterpreterBoundsAnchor verifies that lj_vm_asm_begin anchoring
+// selects the VM interval without regressing the heuristic-only arm64 path.
+func TestExtractInterpreterBoundsAnchor(t *testing.T) {
+	const (
+		x86Param = int32(80)
+		armParam = int32(208)
+		bigGap   = uint64(19400)
+		asmBegin = uint64(0x261ca0)
+	)
+	type absoluteDelta struct {
+		address uint64
+		info    support.UnwindInfo
+	}
+	mk := func(addr uint64, baseReg uint8, param int32) absoluteDelta {
+		return absoluteDelta{address: addr, info: support.UnwindInfo{BaseReg: baseReg, Param: param}}
+	}
+	intervals := func(deltas ...absoluteDelta) sdtypes.IntervalData {
+		start := deltas[0].address
+		block := sdtypes.BasicBlock{Start: start, End: deltas[len(deltas)-1].address + 1}
+		for _, delta := range deltas {
+			block.Deltas = append(block.Deltas, sdtypes.StackDelta{
+				Offset: uint32(delta.address - start),
+				Info:   delta.info,
+			})
+		}
+		return sdtypes.IntervalData{Blocks: []*sdtypes.BasicBlock{&block}}
+	}
+
+	t.Run("x86-decoy-gap-before-vm-asm", func(t *testing.T) {
+		data := intervals(
+			mk(0x1000, support.UnwindRegSp, x86Param),
+			mk(0x1000+15000, 0, 0),
+			mk(asmBegin, support.UnwindRegSp, x86Param),
+			mk(asmBegin+bigGap, 0, 0),
+		)
+		h, err := extractInterpreterBounds(elf.EM_X86_64, data, x86Param, 0)
+		require.NoError(t, err)
+		require.Equal(t, uint64(0x1000), h.Start)
+		a, err := extractInterpreterBounds(elf.EM_X86_64, data, x86Param, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin, a.Start)
+		require.Equal(t, asmBegin+bigGap, a.End)
+	})
+
+	t.Run("arm64-fp-vm-asm-no-regression", func(t *testing.T) {
+		data := intervals(
+			mk(0x2000, support.UnwindRegSp, armParam),
+			mk(0x2100, 0, 0),
+			mk(asmBegin, support.UnwindRegFp, 16),
+			mk(asmBegin+bigGap, 0, 0),
+		)
+		h, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam, 0)
+		require.NoError(t, err)
+		a, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, h, a)
+	})
+
+	t.Run("vm-asm-delta-starts-below-symbol", func(t *testing.T) {
+		data := intervals(
+			mk(asmBegin-4, support.UnwindRegFp, 16),
+			mk(asmBegin-4+bigGap, 0, 0),
+		)
+		h, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam, 0)
+		require.NoError(t, err)
+		a, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin, a.Start)
+		require.Equal(t, h.End, a.End)
+	})
+
+	t.Run("falls-back-when-symbol-not-in-large-interval", func(t *testing.T) {
+		data := intervals(
+			mk(asmBegin, support.UnwindRegSp, x86Param),
+			mk(asmBegin+100, 0, 0),
+			mk(asmBegin+0x10000, support.UnwindRegSp, x86Param),
+			mk(asmBegin+0x10000+bigGap, 0, 0),
+		)
+		a, err := extractInterpreterBounds(elf.EM_X86_64, data, x86Param, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin+0x10000, a.Start)
+	})
+}
 
 func TestX86LuaClose(t *testing.T) {
 	testdata := []struct {
