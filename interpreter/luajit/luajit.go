@@ -196,6 +196,9 @@ func extractInterpreterBounds(intervals *sdtypes.IntervalData, param int32,
 	// If lj_vm_asm_begin is known, return the delta interval that starts there
 	// instead of an unrelated earlier interval matching the unwind heuristic.
 	if asmBegin != 0 {
+		// The VM asm is one large delta interval, but its start can sit a few
+		// bytes below lj_vm_asm_begin. Match the interval containing the symbol,
+		// then start the range exactly at the symbol.
 		for _, block := range intervals.Blocks {
 			for i := range block.Deltas {
 				start := block.Start + uint64(block.Deltas[i].Offset)
@@ -203,12 +206,12 @@ func extractInterpreterBounds(intervals *sdtypes.IntervalData, param int32,
 				if i+1 < len(block.Deltas) {
 					end = block.Start + uint64(block.Deltas[i+1].Offset)
 				}
-				if start == asmBegin {
-					return util.Range{Start: start, End: end}, nil
+				if start <= asmBegin && asmBegin < end && end-asmBegin > 10_000 {
+					return util.Range{Start: asmBegin, End: end}, nil
 				}
 			}
 		}
-		// Fall through to the heuristic if no interval starts at the symbol.
+		// Fall through to the heuristic if the symbol isn't in a large interval.
 	}
 
 	for _, block := range intervals.Blocks {
