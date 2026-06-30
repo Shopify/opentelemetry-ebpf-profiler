@@ -169,8 +169,10 @@ func (x *x86Extractor) findG2JitBaseFromExitHandler(
 			mem, ok0 := i.Args[0].(x86asm.Mem)
 			imm, ok1 := i.Args[1].(x86asm.Imm)
 			if ok0 && ok1 && imm == 0 && mem.Base == x86asm.R14 && mem.Index == 0 {
-				// uint64 wraparound handles the negative DISPATCH-relative disp.
-				cand := g2dispatch + uint64(mem.Disp)
+				// x86asm reports a disp32 as its unsigned value in an int64
+				// (e.g. 0xFFFFF1E0 rather than -3616), so sign-extend the low 32
+				// bits before adding. uint64 wraparound then yields g2dispatch+disp.
+				cand := g2dispatch + uint64(int64(int32(mem.Disp)))
 				if cand > curLOffset && cand <= curLOffset+0x18 {
 					return cand, nil
 				}
