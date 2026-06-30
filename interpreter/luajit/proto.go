@@ -86,6 +86,7 @@ type proto struct {
 func newProto(rm remotememory.RemoteMemory, pt libpf.Address) (*proto, error) {
 	p := &proto{ptAddr: pt}
 	if err := rm.Read(pt+8, pfunsafe.FromPointer(&p.protoRaw)); err != nil {
+		logf("lj: newProto pt=%x READ FAILED: %v", pt, err)
 		return nil, err
 	}
 
@@ -97,21 +98,26 @@ func newProto(rm remotememory.RemoteMemory, pt libpf.Address) (*proto, error) {
 		return addr != 0 && (addr < pt || addr >= end)
 	}
 	if bad(p.lineinfo) || bad(p.uvinfo) || bad(p.varinfo) {
+		logf("lj: newProto pt=%x BAD GCproto: sizept=%d sizebc=%d lineinfo=%x uvinfo=%x varinfo=%x chunkname=%x",
+			pt, p.sizept, p.sizebc, p.lineinfo, p.uvinfo, p.varinfo, p.chunkname)
 		return nil, errors.New("invalid GCproto object")
 	}
 
 	// string data is stored after the GCstr object
 	p.name = rm.String(p.chunkname + sizeofGCstr)
 	if !utf8.ValidString(p.name) {
+		logf("lj: newProto pt=%x BAD chunkname (utf8) chunkname=%x raw=%q", pt, p.chunkname, p.name)
 		return nil, errors.New("invalid chunkname string")
 	}
 
 	// This should never be empty string.
 	if p.name == "" {
+		logf("lj: newProto pt=%x EMPTY chunkname chunkname=%x", pt, p.chunkname)
 		return nil, errors.New("invalid chunkname string")
 	}
 
 	if p.sizebc == 0 || p.sizebc > byteCodeMax {
+		logf("lj: newProto pt=%x BAD sizebc=%d", pt, p.sizebc)
 		return nil, errors.New("invalid bytecode size")
 	}
 
