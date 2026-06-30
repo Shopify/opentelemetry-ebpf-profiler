@@ -124,15 +124,36 @@ func (a *armExtractor) findG2DispatchOffsetFromLjDispatchUpdate(b []byte) (uint6
 
 // findG2JitBaseFromExitHandler extracts jit_base's offset from G on arm64.
 //
-// TODO: implement the arm64 lj_vm_exit_handler scan (analogous to x86: the
-// handler stores XZR to G->jit_base on trace exit, at a DISPATCH-relative
-// offset). Until then we return 0 so offsetData.findG2JitBaseOffset falls back
-// to cur_L+8. That is correct for OpenResty/luajit2 (no mem_L) and does NOT
-// regress the arm64 interpreter path (which derives the frame from L->base, not
-// jit_base); arm64 JIT-trace frames on tarantool (which has mem_L) remain a
-// follow-up. curLOffset/g2dispatch are accepted for signature parity.
+// On trace exit lj_vm_exit_handler clears G->jit_base with a store of the zero
+// register, e.g.:
+//
+//	str xzr, [x22, #0x1f0]   ; G->jit_base = NULL
+//
+// Unlike x86 (where jit_base is addressed relative to DISPATCH), arm64 holds G
+// itself in a register (x22), so the store's immediate offset IS jit_base's
+// offset from G (g2dispatch is unused here). This is the same instruction shape
+// as setgcrefnull(g->cur_L) in lua_close. We validate the candidate sits just
+// after cur_L (cur_L+8 without mem_L, cur_L+0x10 with tarantool's mem_L) to
+// disambiguate from cur_L itself / any other zeroed field.
 func (a *armExtractor) findG2JitBaseFromExitHandler(
-	_ []byte, _, _ uint64) (uint64, error) {
+	b []byte, _, curLOffset uint64) (uint64, error) {
+	for ; len(b) >= 4; b = b[4:] {
+		i, err := arm64asm.Decode(b)
+		if err != nil {
+			// Hand-written VM asm may contain forms arm64asm can't decode;
+			// skip (instructions are fixed 4 bytes, so we stay aligned).
+			continue
+		}
+		if i.Op == arm64asm.STR {
+			a1, ok := i.Args[1].(arm64asm.MemImmediate)
+			if ok && i.Args[0] == arm64asm.XZR {
+				disp := getImm(a1)
+				if disp > curLOffset && disp <= curLOffset+0x18 {
+					return disp, nil
+				}
+			}
+		}
+	}
 	return 0, nil
 }
 
