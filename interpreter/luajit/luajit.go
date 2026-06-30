@@ -56,6 +56,11 @@ type luajitData struct {
 	// Offset of jit_base within global_State (relative to G). Extracted separately
 	// because it is not always adjacent to cur_L (tarantool inserts mem_L between).
 	g2jitbase uint16
+	// How to step over the interpreter C frame on the native handback, taken from
+	// the interpreter region's stack delta. cframeSizeInterp is the CFA offset;
+	// interpFP is 1 when frame-pointer based (arm64) vs SP based (x86). 0 = default.
+	cframeSizeInterp uint16
+	interpFP         uint16
 }
 
 type luajitInstance struct {
@@ -92,10 +97,12 @@ var (
 func (d *luajitData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, _ libpf.Address,
 	rm remotememory.RemoteMemory) (interpreter.Instance, error) {
 	cdata := support.LuaJITProcInfo{
-		G2dispatch:      d.g2Dispatch,
-		Cur_L_offset:    d.currentLOffset,
-		Cframe_size_jit: uint16(cframeSizeJIT),
-		G2jitbase:       d.g2jitbase,
+		G2dispatch:         d.g2Dispatch,
+		Cur_L_offset:       d.currentLOffset,
+		Cframe_size_jit:    uint16(cframeSizeJIT),
+		G2jitbase:          d.g2jitbase,
+		Cframe_size_interp: d.cframeSizeInterp,
+		Interp_fp:          d.interpFP,
 	}
 	if err := ebpf.UpdateProcData(libpf.LuaJIT, pid, unsafe.Pointer(&cdata)); err != nil {
 		return nil, err
@@ -180,6 +187,15 @@ func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 		return nil, err
 	}
 
+	// Derive how to step over the interpreter's C frame on the native handback
+	// from the interpreter region's own stack delta (correct per build/arch),
+	// rather than the hardcoded LUAJIT_CFRAME_SPACE which is wrong for tarantool.
+	if p, fp, ok := interpCframeUnwind(info.Deltas(), luaInterp.Start); ok {
+		ljd.cframeSizeInterp = p
+		ljd.interpFP = fp
+		logf("lj: interp cframe size %d fp %d", p, fp)
+	}
+
 	logf("lj: offsets %+v", ljd)
 
 	if err = ebpf.UpdateInterpreterOffsets(support.ProgUnwindLuaJIT, info.FileID(),
@@ -261,6 +277,29 @@ DeltasLoop:
 		return fallback, nil
 	}
 	return util.Range{}, errors.New("failed to find interpreter range")
+}
+
+// interpCframeUnwind returns how to step over the interpreter's C frame when the
+// luajit unwinder hands back to the native unwinder. It reads the interpreter
+// region's own stack delta (the one covering interpStart): param is the CFA
+// offset and fp is 1 when that delta is frame-pointer based (CFA = fp + param,
+// as on arm64) vs stack-pointer based (CFA = sp + param, as on x86). This is
+// authoritative per build/arch, unlike the hardcoded LUAJIT_CFRAME_SPACE which
+// is wrong for tarantool (x86 wants 96 not 80; arm64 is fp-based +16 not 208).
+func interpCframeUnwind(deltas sdtypes.StackDeltaArray, interpStart uint64) (param, fp uint16, ok bool) {
+	for i := 0; i < len(deltas)-1; i++ {
+		if deltas[i].Address <= interpStart && interpStart < deltas[i+1].Address {
+			p := deltas[i].Info.Param
+			if p <= 0 || p > 0xffff {
+				return 0, 0, false
+			}
+			if deltas[i].Info.BaseReg == support.UnwindRegFp {
+				return uint16(p), 1, true
+			}
+			return uint16(p), 0, true
+		}
+	}
+	return 0, 0, false
 }
 
 func (l *luajitInstance) getVMList() []libpf.Address {
