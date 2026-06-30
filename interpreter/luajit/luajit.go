@@ -493,7 +493,7 @@ func (l *luajitInstance) symbolizeFrame(funcName string, ptAddr libpf.Address,
 	pc uint32, frames *libpf.Frames) error {
 	pt, err := l.getGCproto(ptAddr)
 	if err != nil {
-		logf("lj: symbolizeFrame calleePT=%x getGCproto FAILED: %v", ptAddr, err)
+		logf("lj: callee proto %x: %v", ptAddr, err)
 		return err
 	}
 	line := pt.getLine(pc)
@@ -532,13 +532,10 @@ func (l *luajitInstance) Symbolize(frame libpf.EbpfFrame, frames *libpf.Frames, 
 			return errors.New("LuaJIT normal frame not large enough")
 		}
 		callerPT := libpf.Address(frame.Variable(1))
-		calleePT0 := libpf.Address(frame.Variable(0))
-		logf("lj: NORMALFRAME callerPT=%x calleePT=%x var2=%x",
-			callerPT, calleePT0, frame.Variable(2))
 
 		pt, err := l.getGCproto(callerPT)
 		if err != nil {
-			logf("lj: NORMALFRAME callerPT=%x getGCproto FAILED: %v", callerPT, err)
+			logf("lj: caller proto %x: %v", callerPT, err)
 			return err
 		}
 
