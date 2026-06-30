@@ -200,12 +200,18 @@ func extractInterpreterBounds(deltas sdtypes.StackDeltaArray, param int32,
 	// rather than the first large gap matching the unwind pattern, which can be
 	// an unrelated function on some builds (x86 tarantool).
 	if asmBegin != 0 {
+		// The VM asm is one large delta interval, but its start can sit a few
+		// bytes below lj_vm_asm_begin (the preceding function's unwind info
+		// extends to just before the symbol). Match the interval that CONTAINS
+		// the symbol and is large (the interpreter), then start the range exactly
+		// at the symbol so it matches the lj_vm_asm_begin sanity check.
 		for i := 0; i < len(deltas)-1; i++ {
-			if deltas[i].Address == asmBegin {
-				return util.Range{Start: deltas[i].Address, End: deltas[i+1].Address}, nil
+			if deltas[i].Address <= asmBegin && asmBegin < deltas[i+1].Address &&
+				deltas[i+1].Address-asmBegin > 10_000 {
+				return util.Range{Start: asmBegin, End: deltas[i+1].Address}, nil
 			}
 		}
-		// Fall through to the heuristic if no delta starts exactly at the symbol.
+		// Fall through to the heuristic if the symbol isn't in a large interval.
 	}
 	for i := 0; i < len(deltas)-1; i++ {
 		d, next := &deltas[i], &deltas[i+1]
