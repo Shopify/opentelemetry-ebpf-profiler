@@ -97,6 +97,8 @@ func (h *testEbpfHandler) DeletePidInterpreterMapping(libpf.PID, lpm.Prefix) err
 
 func (h *testEbpfHandler) RemoveReportedPID(libpf.PID) {}
 
+func (h *testEbpfHandler) CoredumpTest() bool { return false }
+
 func (h *testEbpfHandler) UpdateUnwindInfo(uint16, sdtypes.UnwindInfo) error {
 	return nil
 }
