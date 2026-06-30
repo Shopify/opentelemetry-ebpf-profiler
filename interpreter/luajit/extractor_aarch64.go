@@ -122,6 +122,20 @@ func (a *armExtractor) findG2DispatchOffsetFromLjDispatchUpdate(b []byte) (uint6
 	return 0, errors.New("g to dispatch offset not found")
 }
 
+// findG2JitBaseFromExitHandler extracts jit_base's offset from G on arm64.
+//
+// TODO: implement the arm64 lj_vm_exit_handler scan (analogous to x86: the
+// handler stores XZR to G->jit_base on trace exit, at a DISPATCH-relative
+// offset). Until then we return 0 so offsetData.findG2JitBaseOffset falls back
+// to cur_L+8. That is correct for OpenResty/luajit2 (no mem_L) and does NOT
+// regress the arm64 interpreter path (which derives the frame from L->base, not
+// jit_base); arm64 JIT-trace frames on tarantool (which has mem_L) remain a
+// follow-up. curLOffset/g2dispatch are accepted for signature parity.
+func (a *armExtractor) findG2JitBaseFromExitHandler(
+	_ []byte, _, _ uint64) (uint64, error) {
+	return 0, nil
+}
+
 func (a *armExtractor) findLjDispatchUpdateAddr(b []byte, addr uint64) (uint64, error) {
 	var ip int64
 	for len(b) > 0 {

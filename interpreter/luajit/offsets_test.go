@@ -168,6 +168,13 @@ func TestOffsets(t *testing.T) {
 				require.NotZero(t, ljd.g2Traces)
 				require.NotZero(t, ljd.g2Dispatch)
 
+				// OpenResty/luajit2 has no mem_L field, so jit_base sits immediately
+				// after cur_L. This guards against the tarantool mem_L fix regressing
+				// the dynamically-linked OpenResty path (whether g2jitbase is extracted
+				// from lj_vm_exit_handler or falls back to cur_L+8, it must be cur_L+8).
+				require.Equal(t, ljd.currentLOffset+8, ljd.g2jitbase,
+					"openresty jit_base must be cur_L+8 (no mem_L)")
+
 				// Anchor regression guard: on these (unstripped) shared-lib builds the
 				// lj_vm_asm_begin anchor must produce a range that starts at the symbol
 				// and yields byte-identical offsets to the heuristic path, on BOTH arches.
