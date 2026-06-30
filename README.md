@@ -27,7 +27,7 @@ coredump new -core core.tarantool-arm64 -sysroot <sysroot> \
 ```
 
 ## jit-off interpreter cores (used by the committed tests)
-`cores/core.tarantool-arm64-jitoff.gz` — captured with `jit.off(true,true)` (interpreter
+`cores/core.tarantool-{amd64,arm64}-jitoff.gz` — captured with `jit.off(true,true)` (interpreter
 execution). This is the core behind the committed `testdata/arm64/luajit-tarantool-arm64.json`
 (skipped pending upload). Regenerate the test + module bundle deterministically with:
 `coredump new -core <core> -sysroot <tarantool+libs> -luajit-executables tarantool -name luajit-tarantool-arm64`,
