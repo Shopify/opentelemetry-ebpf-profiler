@@ -25,3 +25,10 @@ gunzip -k cores/core.tarantool-arm64.gz
 coredump new -core core.tarantool-arm64 -sysroot <sysroot> \
   -luajit-executables tarantool -name luajit-tarantool-arm64
 ```
+
+## jit-off interpreter cores (used by the committed tests)
+`cores/core.tarantool-arm64-jitoff.gz` — captured with `jit.off(true,true)` (interpreter
+execution). This is the core behind the committed `testdata/arm64/luajit-tarantool-arm64.json`
+(skipped pending upload). Regenerate the test + module bundle deterministically with:
+`coredump new -core <core> -sysroot <tarantool+libs> -luajit-executables tarantool -name luajit-tarantool-arm64`,
+then `coredump upload -all` and remove the test's `skip`.
