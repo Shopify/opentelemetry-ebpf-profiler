@@ -143,6 +143,46 @@ func (x *x86Extractor) findG2DispatchOffsetFromLjDispatchUpdate(b []byte) (uint6
 	return 0, nil
 }
 
+// findG2JitBaseFromExitHandler extracts the offset of jit_base from G.
+//
+// On trace exit, lj_vm_exit_handler restores BASE/L from G and then NULLs out
+// G->jit_base. All these accesses are relative to the DISPATCH register (r14 on
+// x86, where DISPATCH = G + g2dispatch), e.g.:
+//
+//	movq -0xE30(%r14), %rbp   ; rbp = G->cur_L
+//	movq -0xE20(%r14), %rdx   ; rdx = G->jit_base   (restore BASE)
+//	movq $0,  -0xE20(%r14)    ; G->jit_base = NULL  <-- we match this
+//
+// The clear is a 64-bit store of immediate 0 to DISPATCH+disp, so
+// g2jitbase = g2dispatch + disp. We validate the candidate sits just after
+// cur_L (cur_L+8 without mem_L, cur_L+0x10 with tarantool's mem_L) to
+// disambiguate from any other zeroed field.
+func (x *x86Extractor) findG2JitBaseFromExitHandler(
+	b []byte, g2dispatch, curLOffset uint64) (uint64, error) {
+	b, _ = amd.SkipEndBranch(b) //nolint:errcheck
+	for len(b) > 0 {
+		i, err := x86asm.Decode(b, 64)
+		if err != nil {
+			return 0, err
+		}
+		if i.Op == x86asm.MOV {
+			mem, ok0 := i.Args[0].(x86asm.Mem)
+			imm, ok1 := i.Args[1].(x86asm.Imm)
+			if ok0 && ok1 && imm == 0 && mem.Base == x86asm.R14 && mem.Index == 0 {
+				// x86asm reports a disp32 as its unsigned value in an int64
+				// (e.g. 0xFFFFF1E0 rather than -3616), so sign-extend the low 32
+				// bits before adding. uint64 wraparound then yields g2dispatch+disp.
+				cand := g2dispatch + uint64(int64(int32(mem.Disp)))
+				if cand > curLOffset && cand <= curLOffset+0x18 {
+					return cand, nil
+				}
+			}
+		}
+		b = b[i.Len:]
+	}
+	return 0, nil
+}
+
 // Find first or second call address, the one whose first argument is 0x10 off of
 // sym's first argument.
 // libluajit-5.1.so`luaopen_jit:
@@ -496,25 +536,34 @@ func calcRipRelativeAddr(a1 x86asm.Mem, baseAddr, ip int64) int64 {
 
 // If we're dealing with 32bit values compilers will use R or E prefix
 // interchangeably (E refs are just zero padded).
+// reg64 maps a 32-bit general-purpose register to its 64-bit counterpart so a
+// register loaded with a 32-bit MOV compares equal to its 64-bit use. Tarantool's
+// x86 (non-GC64) LuaJIT loads the global_State pointer with `movl 0x8(%rdi),%ebp`
+// (32-bit GCRef) and then addresses it as %rbp, so EBP must equal RBP. The legacy
+// eight GPRs are mapped; any other register is returned unchanged.
+func reg64(r x86asm.Reg) x86asm.Reg {
+	switch r {
+	case x86asm.EAX:
+		return x86asm.RAX
+	case x86asm.ECX:
+		return x86asm.RCX
+	case x86asm.EDX:
+		return x86asm.RDX
+	case x86asm.EBX:
+		return x86asm.RBX
+	case x86asm.ESP:
+		return x86asm.RSP
+	case x86asm.EBP:
+		return x86asm.RBP
+	case x86asm.ESI:
+		return x86asm.RSI
+	case x86asm.EDI:
+		return x86asm.RDI
+	default:
+		return r
+	}
+}
+
 func sameReg(r1, r2 x86asm.Reg) bool {
-	if r1 == r2 {
-		return true
-	}
-	f := func(r1, r2 x86asm.Reg) bool {
-		switch r1 {
-		case x86asm.EAX:
-			return r2 == x86asm.RAX
-		case x86asm.ECX:
-			return r2 == x86asm.RCX
-		case x86asm.EDX:
-			return r2 == x86asm.RDX
-		case x86asm.EBX:
-			return r2 == x86asm.RBX
-		case x86asm.ESI:
-			return r2 == x86asm.RSI
-		default:
-			return false
-		}
-	}
-	return f(r1, r2) || f(r2, r1)
+	return r1 == r2 || reg64(r1) == reg64(r2)
 }

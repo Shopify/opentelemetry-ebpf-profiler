@@ -23,10 +23,95 @@ import (
 
 	"github.com/stretchr/testify/require"
 	testcontainers "github.com/testcontainers/testcontainers-go"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind/elfunwindinfo"
 	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
+	"go.opentelemetry.io/ebpf-profiler/support"
 )
+
+// TestExtractInterpreterBoundsAnchor verifies the lj_vm_asm_begin anchoring (added
+// for statically-linked, multi-function binaries like x86 tarantool) is correct
+// AND does not regress the heuristic-only path that arm64 relies on (frame-pointer
+// VM asm). It is hermetic (synthetic deltas) so it runs identically on amd64+arm64.
+func TestExtractInterpreterBoundsAnchor(t *testing.T) {
+	const (
+		x86Param = int32(80)  // LJ_GC64 x86-ish cframe param
+		armParam = int32(208) // arm64
+		bigGap   = uint64(19400)
+		asmBegin = uint64(0x261ca0)
+	)
+	mk := func(addr uint64, basereg uint8, param int32) sdtypes.StackDelta {
+		return sdtypes.StackDelta{Address: addr, Info: support.UnwindInfo{BaseReg: basereg, Param: param}}
+	}
+
+	t.Run("x86-decoy-gap-before-vm-asm", func(t *testing.T) {
+		// A large SP/param gap (an unrelated big function) precedes the real VM asm.
+		// The heuristic is fooled by the decoy; the anchor must pick the VM asm.
+		deltas := sdtypes.StackDeltaArray{
+			mk(0x1000, support.UnwindRegSp, x86Param),   // decoy start (matches pattern)
+			mk(0x1000+15000, 0, 0),                      // decoy end (no pattern)
+			mk(asmBegin, support.UnwindRegSp, x86Param), // real VM asm start
+			mk(asmBegin+bigGap, 0, 0),                   // VM asm end
+		}
+		h, err := extractInterpreterBounds(deltas, x86Param, 0)
+		require.NoError(t, err)
+		require.Equal(t, uint64(0x1000), h.Start, "heuristic picks the decoy (the x86 bug)")
+		a, err := extractInterpreterBounds(deltas, x86Param, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin, a.Start, "anchor lands exactly on lj_vm_asm_begin")
+		require.Equal(t, asmBegin+bigGap, a.End)
+	})
+
+	t.Run("arm64-fp-vm-asm-no-regression", func(t *testing.T) {
+		// arm64: VM asm uses frame-pointer unwind (BaseReg=Fp, Param=16), one big gap
+		// starting exactly at the symbol. Anchor and heuristic MUST agree.
+		deltas := sdtypes.StackDeltaArray{
+			mk(0x2000, support.UnwindRegSp, armParam),
+			mk(0x2100, 0, 0),
+			mk(asmBegin, support.UnwindRegFp, 16), // VM asm (frame pointer)
+			mk(asmBegin+bigGap, 0, 0),
+		}
+		h, err := extractInterpreterBounds(deltas, armParam, 0)
+		require.NoError(t, err)
+		a, err := extractInterpreterBounds(deltas, armParam, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, h, a, "anchor must match heuristic on the arm64 layout")
+		require.Equal(t, asmBegin, a.Start)
+		require.Equal(t, asmBegin+bigGap, a.End)
+	})
+
+	t.Run("vm-asm-delta-starts-below-symbol", func(t *testing.T) {
+		// The VM asm delta can start a few bytes below lj_vm_asm_begin (the preceding
+		// function's unwind info extends past the symbol). The anchor must still START
+		// at the symbol (so the offsets.go sanity check passes) and keep the same END.
+		deltas := sdtypes.StackDeltaArray{
+			mk(asmBegin-4, support.UnwindRegFp, 16),
+			mk(asmBegin-4+bigGap, 0, 0),
+		}
+		h, err := extractInterpreterBounds(deltas, armParam, 0)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin-4, h.Start)
+		a, err := extractInterpreterBounds(deltas, armParam, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin, a.Start, "anchor starts exactly at the symbol")
+		require.Equal(t, h.End, a.End, "same end as the heuristic")
+	})
+
+	t.Run("falls-back-when-symbol-not-in-large-interval", func(t *testing.T) {
+		// If lj_vm_asm_begin sits in a SMALL interval, the anchor must fall through to
+		// the heuristic rather than returning a bogus tiny range.
+		deltas := sdtypes.StackDeltaArray{
+			mk(asmBegin, support.UnwindRegSp, x86Param), // small interval at symbol
+			mk(asmBegin+100, 0, 0),
+			mk(asmBegin+0x10000, support.UnwindRegSp, x86Param), // real big gap
+			mk(asmBegin+0x10000+bigGap, 0, 0),
+		}
+		a, err := extractInterpreterBounds(deltas, x86Param, asmBegin)
+		require.NoError(t, err)
+		require.Equal(t, asmBegin+0x10000, a.Start, "fell back to heuristic big-gap")
+	})
+}
 
 const (
 	openrestyBase = "openresty/openresty"
@@ -66,7 +151,7 @@ func TestOffsets(t *testing.T) {
 				intervals, param, err := extractStackDeltas(target, ef)
 				require.NoError(t, err)
 
-				interp, err := extractInterpreterBounds(intervals.Deltas, param)
+				interp, err := extractInterpreterBounds(intervals.Deltas, param, 0)
 				require.NoError(t, err)
 
 				ljd := luajitData{}
@@ -82,6 +167,28 @@ func TestOffsets(t *testing.T) {
 				require.NotZero(t, ljd.currentLOffset)
 				require.NotZero(t, ljd.g2Traces)
 				require.NotZero(t, ljd.g2Dispatch)
+
+				// OpenResty/luajit2 has no mem_L field, so jit_base sits immediately
+				// after cur_L. This guards against the tarantool mem_L fix regressing
+				// the dynamically-linked OpenResty path (whether g2jitbase is extracted
+				// from lj_vm_exit_handler or falls back to cur_L+8, it must be cur_L+8).
+				require.Equal(t, ljd.currentLOffset+8, ljd.g2jitbase,
+					"openresty jit_base must be cur_L+8 (no mem_L)")
+
+				// Anchor regression guard: on these (unstripped) shared-lib builds the
+				// lj_vm_asm_begin anchor must produce a range that starts at the symbol
+				// and yields byte-identical offsets to the heuristic path, on BOTH arches.
+				if sym, ok := scanSymbols(ef)[libpf.SymbolName("lj_vm_asm_begin")]; ok {
+					interpA, errA := extractInterpreterBounds(intervals.Deltas, param, uint64(sym.Address))
+					require.NoError(t, errA)
+					require.Equal(t, uint64(sym.Address), interpA.Start)
+					require.GreaterOrEqual(t, interpA.Start, interp.Start)
+					ljdA := luajitData{}
+					require.NoError(t, extractOffsets(ef, &ljdA, interpA))
+					require.Equal(t, ljd.currentLOffset, ljdA.currentLOffset)
+					require.Equal(t, ljd.g2Traces, ljdA.g2Traces)
+					require.Equal(t, ljd.g2Dispatch, ljdA.g2Dispatch)
+				}
 
 				od := offsetData{}
 				err = od.init(ef)
@@ -225,7 +332,7 @@ func TestFiles(t *testing.T) {
 		intervals, param, err := extractStackDeltas(target, ef)
 		require.NoError(t, err)
 
-		interp, err := extractInterpreterBounds(intervals.Deltas, param)
+		interp, err := extractInterpreterBounds(intervals.Deltas, param, 0)
 		require.NoError(t, err)
 
 		err = extractOffsets(ef, &ljd, interp)

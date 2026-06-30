@@ -296,3 +296,34 @@ add references to this map manually to this package. This is because we do not
 currently support adding maps in an  automated fashion. The best way to do this
 is to look through existing code in this package and to see where existing code 
 refers to particular BPF maps.
+
+## LuaJIT (tarantool) coredumps
+
+The `luajit-tarantool-*` cases exercise the LuaJIT unwinder on a statically-linked,
+GC64 tarantool (shopkv's test fib/churn workload). A few specifics differ from the
+other interpreters and are intentional:
+
+- **Captured with `jit.off(true, true)`** so execution stays in the bytecode
+  interpreter. A single-pass coredump cannot run the live
+  `report_pid → SynchronizeMappings` loop that bootstraps the JIT-trace mapping
+  (`text_section_bias = G`), so a JIT-mcode leaf can't resolve `G` from the
+  dispatch register in a one-shot dump. The interpreter path reads `L` from the
+  stack and unwinds deterministically. The JIT path is covered by live profiling.
+- Created with **`coredump new -luajit-executables tarantool`** — tarantool
+  statically links LuaJIT and is not in the built-in host allowlist, so it must be
+  probed explicitly (the flag is persisted into the test case's `interpreters`).
+- The single **`?+0x0`** frame at the native↔Lua boundary is expected: the
+  unwinder maps the interpreter range (`lj_vm_asm_begin..end`) to a luajit token
+  FileID to route it into the Lua unwinder, and this tool's symbolizer renders
+  that token frame as `?+0x0` (the live prophiler resolves it to `tarantool+off`).
+  It is **not** a coredump-filter problem (verified: `0x3f`/`0xff` are identical)
+  and the Lua frames themselves resolve correctly.
+- On **arm64** the unwind ends with `<unwinding aborted … native_stack_delta_invalid>`:
+  tarantool's fiber context-switch trampoline (a CFI gap in the fiber asm), not
+  LuaJIT. On **amd64** the native stack unwinds fully to the fiber entry
+  (`coro_init` has valid CFI there); the outermost Lua frame (`main`) may be
+  absent on amd64 — a cosmetic frame-emission asymmetry, also harmless.
+
+The core + bundled modules are large and live in the module store; until they are
+uploaded there the test carries a `skip`. Raw cores are backed up on the
+`dale/luajit-coredump-data` branch.

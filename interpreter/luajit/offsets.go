@@ -31,6 +31,7 @@ func scanSymbols(ef *pfelf.File) map[libpf.SymbolName]libpf.Symbol {
 		"lua_pushcclosure":         {},
 		"luaopen_jit":              {},
 		"lua_close":                {},
+		"lj_vm_exit_handler":       {},
 	}
 
 	foundSymbols := map[libpf.SymbolName]libpf.Symbol{}
@@ -105,12 +106,48 @@ func extractOffsets(ef *pfelf.File, ljd *luajitData, ir util.Range) error {
 	}
 	ljd.g2Dispatch = uint16(g2dispatch)
 
+	g2jitbase, err := oft.findG2JitBaseOffset(uint64(curLOffset), g2dispatch)
+	if err != nil {
+		return err
+	}
+	if g2jitbase > 0xffff {
+		return fmt.Errorf("lj: g to jit_base offset %v is too large", g2jitbase)
+	}
+	ljd.g2jitbase = uint16(g2jitbase)
+
 	// If we have symbols we can check that the start address is correct.
 	if s, e := oft.lookupSymbol("lj_vm_asm_begin"); e == nil && ir.Start != uint64(s.Address) {
 		return fmt.Errorf("lj: unexpected start address %x, expected %x", s.Address, ir.Start)
 	}
 
 	return nil
+}
+
+// findG2JitBaseOffset returns the offset of jit_base within global_State
+// (relative to G). jit_base is not always adjacent to cur_L: tarantool's LuaJIT
+// inserts a mem_L field between them, so we cannot simply assume cur_L+8.
+//
+// We extract it from lj_vm_exit_handler (which clears g->jit_base via the
+// DISPATCH register) when that symbol is available. On stripped binaries the
+// symbol is absent; we then fall back to cur_L+8, which is correct for
+// OpenResty/luajit2 (no mem_L) — the only stripped case we care about.
+func (o *offsetData) findG2JitBaseOffset(curLOffset, g2dispatch uint64) (uint64, error) {
+	fallback := curLOffset + 8
+	sym, err := o.lookupSymbol("lj_vm_exit_handler")
+	if err != nil {
+		log.Debugf("lj: no lj_vm_exit_handler symbol, assuming jit_base at cur_L+8")
+		return fallback, nil
+	}
+	b, err := o.readSym(sym)
+	if err != nil {
+		return fallback, nil
+	}
+	g2jitbase, err := o.e.findG2JitBaseFromExitHandler(b, g2dispatch, curLOffset)
+	if err != nil || g2jitbase == 0 {
+		log.Debugf("lj: could not extract jit_base offset (%v), assuming cur_L+8", err)
+		return fallback, nil
+	}
+	return g2jitbase, nil
 }
 
 type extractor interface {
@@ -156,6 +193,16 @@ type extractor interface {
 	find3rdArgToLibPreregCall(b []byte, baseAddr int64) (uint64, error)
 
 	find4thArgToLibRegCall(b []byte, baseAddr int64) (int64, error)
+
+	// lj_vm_exit_handler restores the interpreter state on trace exit. Among
+	// other things it loads BASE and L from G->jit_base / G->cur_L and then
+	// clears jit_base. Those accesses are relative to the DISPATCH register
+	// (DISPATCH = G + g2dispatch), so the displacement of the jit_base access
+	// gives us jit_base's offset from G (g2jitbase = g2dispatch + disp). We need
+	// this because jit_base is NOT always adjacent to cur_L (tarantool inserts a
+	// mem_L field in between). curLOffset is used to disambiguate/validate the
+	// candidate (jit_base sits just after cur_L). Returns 0 if not found.
+	findG2JitBaseFromExitHandler(b []byte, g2dispatch, curLOffset uint64) (uint64, error)
 }
 
 func newExtractor(ef *pfelf.File) extractor {
