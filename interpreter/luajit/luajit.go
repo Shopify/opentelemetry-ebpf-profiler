@@ -154,7 +154,15 @@ func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 		return nil, err
 	}
 
-	luaInterp, err := extractInterpreterBounds(info.Intervals(), cframeSize)
+	// When the binary is unstripped (e.g. tarantool), lj_vm_asm_begin marks the
+	// exact start of the VM interpreter. Anchor the interpreter-range detection
+	// to it: the stack-delta heuristic alone can match an unrelated large gap.
+	var asmBegin uint64
+	if s, e := ef.LookupSymbol("lj_vm_asm_begin"); e == nil {
+		asmBegin = uint64(s.Address)
+	}
+
+	luaInterp, err := extractInterpreterBounds(info.Intervals(), cframeSize, asmBegin)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +191,26 @@ func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 // big and has a somewhat unique FDE we can pick out. We could tighten this up by looking for
 // direct jumps to the start of the interpreter (one can be found lj_dispatch_update) but we'd
 // still need to consult the stack deltas to get the end of the interpreter.
-func extractInterpreterBounds(intervals *sdtypes.IntervalData, param int32) (util.Range, error) {
+func extractInterpreterBounds(intervals *sdtypes.IntervalData, param int32,
+	asmBegin uint64) (util.Range, error) {
+	// If lj_vm_asm_begin is known, return the delta interval that starts there
+	// instead of an unrelated earlier interval matching the unwind heuristic.
+	if asmBegin != 0 {
+		for _, block := range intervals.Blocks {
+			for i := range block.Deltas {
+				start := block.Start + uint64(block.Deltas[i].Offset)
+				end := block.End
+				if i+1 < len(block.Deltas) {
+					end = block.Start + uint64(block.Deltas[i+1].Offset)
+				}
+				if start == asmBegin {
+					return util.Range{Start: start, End: end}, nil
+				}
+			}
+		}
+		// Fall through to the heuristic if no interval starts at the symbol.
+	}
+
 	for _, block := range intervals.Blocks {
 		for i := range block.Deltas {
 			delta := &block.Deltas[i]
