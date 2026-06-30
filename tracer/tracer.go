@@ -445,6 +445,11 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 			name:   "unwind_beam",
 			enable: !cfg.InterpretersConfig.BEAM.IsDisabled(),
 		},
+		{
+			progID: uint32(support.ProgUnwindLuaJIT),
+			name:   "unwind_luajit",
+			enable: !cfg.InterpretersConfig.LuaJIT.IsDisabled(),
+		},
 	}
 
 	if err = loadPerfUnwinders(coll, ebpfProgs, ebpfMaps["perf_progs"], tailCallProgs,

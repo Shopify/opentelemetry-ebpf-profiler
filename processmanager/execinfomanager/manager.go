@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/interpreter/golabels"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/hotspot"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/luajit"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/nodev8"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/perl"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/php"
@@ -125,6 +126,9 @@ func NewExecutableInfoManager(
 	if !interpretersConfig.BEAM.IsDisabled() {
 		loaders = append(loaders, beam.GetLoader(interpretersConfig.BEAM))
 	}
+	if !interpretersConfig.LuaJIT.IsDisabled() {
+		loaders = append(loaders, luajit.GetLoader(interpretersConfig.LuaJIT))
+	}
 
 	loaders = append(loaders, apmint.Loader)
 	if !interpretersConfig.Labels.IsDisabled() {
@@ -226,7 +230,7 @@ func (mgr *ExecutableInfoManager) AddOrIncRef(fileID host.FileID,
 	}
 
 	// Create the LoaderInfo for interpreter detection
-	loaderInfo := interpreter.NewLoaderInfo(fileID, elfRef)
+	loaderInfo := interpreter.NewLoaderInfo(fileID, elfRef, intervalData.Deltas)
 
 	// Detect and load interpreter data
 	interpData := state.detectAndLoadInterpData(loaderInfo)
