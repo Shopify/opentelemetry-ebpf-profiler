@@ -200,6 +200,15 @@ func extractInterpreterBounds(deltas sdtypes.StackDeltaArray, param int32,
 	// rather than the first large gap matching the unwind pattern, which can be
 	// an unrelated function on some builds (x86 tarantool).
 	if asmBegin != 0 {
+		// DIAGNOSTIC: dump the actual provider deltas around lj_vm_asm_begin so we
+		// can see how the VM asm region is represented (gated on LUA_DEBUG).
+		for i := 0; i < len(deltas)-1; i++ {
+			if deltas[i].Address >= asmBegin-0x80 && deltas[i].Address < asmBegin+0x6000 {
+				logf("lj: delta[%d] addr=%x basereg=%d param=%d gap=%d",
+					i, deltas[i].Address, deltas[i].Info.BaseReg,
+					deltas[i].Info.Param, deltas[i+1].Address-deltas[i].Address)
+			}
+		}
 		// The VM asm is one large delta interval, but its start can sit a few
 		// bytes below lj_vm_asm_begin (the preceding function's unwind info
 		// extends to just before the symbol). Match the interval that CONTAINS
