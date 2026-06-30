@@ -234,7 +234,6 @@ func parseTracers(tracers string) (interpreterconfig.Config, error) {
 		case "beam":
 			cfg.BEAM.Disabled = false
 		case "luajit":
-			log.Warn("The LuaJIT interpreter is incomplete and may not work properly")
 			cfg.LuaJIT.Disabled = false
 		case "native":
 			log.Warn("Enabling the `native` tracer explicitly is deprecated (it's always-on)")
