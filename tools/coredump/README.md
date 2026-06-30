@@ -318,8 +318,11 @@ other interpreters and are intentional:
   that token frame as `?+0x0` (the live prophiler resolves it to `tarantool+off`).
   It is **not** a coredump-filter problem (verified: `0x3f`/`0xff` are identical)
   and the Lua frames themselves resolve correctly.
-- The trailing `<unwinding aborted … native_stack_delta_invalid>` is tarantool's
-  arm64 fiber context-switch trampoline (a CFI gap in the fiber asm), not LuaJIT.
+- On **arm64** the unwind ends with `<unwinding aborted … native_stack_delta_invalid>`:
+  tarantool's fiber context-switch trampoline (a CFI gap in the fiber asm), not
+  LuaJIT. On **amd64** the native stack unwinds fully to the fiber entry
+  (`coro_init` has valid CFI there); the outermost Lua frame (`main`) may be
+  absent on amd64 — a cosmetic frame-emission asymmetry, also harmless.
 
 The core + bundled modules are large and live in the module store; until they are
 uploaded there the test carries a `skip`. Raw cores are backed up on the
