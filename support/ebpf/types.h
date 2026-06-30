@@ -301,6 +301,18 @@ enum {
   // number of failures to unwind code object due to its large size
   metricID_UnwindDotnetErrCodeTooLarge,
 
+  // number of attempts to unwind LuaJIT
+  metricID_UnwindLuaJITAttempts,
+
+  // number of failures to read LuaJIT proc info
+  metricID_UnwindLuaJITErrNoProcInfo,
+
+  // number of failures to read LuaJIT context pointer
+  metricID_UnwindLuaJITErrNoContext,
+
+  // number of failures in context pointer validity check
+  metricID_UnwindLuaJITErrLMismatch,
+
   // number of attempts to read Go custom labels
   metricID_UnwindGoLabelsAttempts,
 
@@ -502,6 +514,9 @@ typedef struct RubyProcInfo {
   // is reading gc state from objspace supported for this version?
   bool has_objspace;
 
+  // JIT regions, for detecting if a native PC was JIT
+  u64 jit_start, jit_end;
+
   // Offsets and sizes of Ruby internal structs
 
   // rb_execution_context_struct offsets:
@@ -556,6 +571,23 @@ typedef struct BEAMProcInfo {
   // Introspection Struct Offsets
   u8 ranges_sizeof;
 } BEAMProcInfo;
+
+typedef struct LuaJITProcInfo {
+  u16 g2dispatch;
+  u16 cur_L_offset;
+  u16 cframe_size_jit;
+  // Offset of jit_base within global_State (relative to G). NOT necessarily
+  // adjacent to cur_L: some LuaJIT builds (e.g. tarantool) insert a mem_L field
+  // between cur_L and jit_base. OpenResty/luajit2 has jit_base right after cur_L.
+  u16 g2jitbase;
+  // How to step over the interpreter's C frame on the native handback, taken
+  // from the interpreter region's own stack delta (.eh_frame) instead of the
+  // hardcoded LUAJIT_CFRAME_SPACE (which is wrong for tarantool). cframe_size_interp
+  // is the CFA offset (param); interp_fp is 1 when it is frame-pointer based
+  // (arm64: CFA = fp + param) vs SP based (x86: CFA = sp + param). 0 = use default.
+  u16 cframe_size_interp;
+  u16 interp_fp;
+} LuaJITProcInfo;
 
 // COMM_LEN defines the maximum length we will receive for the comm of a task.
 #define COMM_LEN 16
@@ -676,9 +708,9 @@ typedef struct UnwindState {
       // The per-CPU registers which are not unwound, but needed to be accessed
       // on leaf frames.
 #if defined(__x86_64__)
-      u64 rax, rdi, r8, r9, r11, r13, r15;
+      u64 rax, rdi, r8, r9, r11, r13, r14, r15;
 #elif defined(__aarch64__)
-      u64 r20, r22, r28;
+      u64 r7, r20, r22, r28;
 #endif
     };
   };
@@ -749,7 +781,62 @@ typedef struct RubyUnwindState {
   void *last_stack_frame;
   // Frame for last cfunc before we switched to native unwinder
   u64 cfunc_saved_frame;
+  // Detect if JIT code ran in the process (at any time)
+  bool jit_detected;
 } RubyUnwindState;
+
+typedef u64 TValue;
+
+// This layout hasn't changed over LuaJIT versions.
+typedef struct LJState {
+  void *glref;
+  void *dummy3;
+  TValue *base;     /* Base of currently executing function. */
+  TValue *top;      /* First free slot in the stack. */
+  TValue *maxstack; /* Last free slot in the stack. */
+  TValue *stack;    /* Stack base. */
+  void *openupval;  /* List of open upvalues in the stack. */
+  void *env;        /* Thread environment (table of globals). */
+  void *cframe;     /* End of C stack frame chain. */
+} LJState;
+
+// These two are always adjacent, cur_L offset comes from HA.
+typedef struct LJGlobalPart {
+  void *cur_L;
+  TValue *jit_base;
+} LJGlobalPart;
+
+// Part of a function we need access to, skips first 8 bytes.  Again
+// this layout (from GCfuncL type) hasn't changed in the history of openresty.
+typedef struct LJFuncPart {
+  u8 marked;
+  u8 gct;
+  u8 ffid;
+  u8 nupvalues;
+  u32 dummy;
+  void *env;
+  void *gclist;
+  void *pc; // BCIns* to end of GCproto (i.e. startpc)
+} LJFuncPart;
+
+typedef struct LJScratchSpace {
+  LJState L;
+  LJGlobalPart G;
+  LJFuncPart f;
+  void *G_to_report;
+  u32 *prev_proto;
+  u32 prev_pc;
+} LJScratchSpace;
+
+typedef struct LJUnwindState {
+  TValue *frame;
+  TValue *prevframe;
+  void *L_ptr;
+  // If we have intertwined interpreter and native frames use cframe to track we have more
+  // jumps back to native unwinder to do.
+  void *cframe;
+  bool is_jit;
+} LJUnwindState;
 
 // Container for additional scratch space needed by the HotSpot unwinder.
 typedef struct DotnetUnwindScratchSpace {
@@ -835,6 +922,8 @@ typedef struct PerCPURecord {
   PHPUnwindState phpUnwindState;
   // The current Ruby unwinder state.
   RubyUnwindState rubyUnwindState;
+  // The current LuaJIT unwinder state.
+  LJUnwindState luajitUnwindState;
   // State for Go and Native custom labels
   CustomLabelsState customLabelsState;
   union {
@@ -846,6 +935,8 @@ typedef struct PerCPURecord {
     V8UnwindScratchSpace v8UnwindScratch;
     // Scratch space for the Python unwinder
     PythonUnwindScratchSpace pythonUnwindScratch;
+    // Scratch space for the LuaJIT unwinder
+    LJScratchSpace luajitUnwindScratch;
     // Go labels scratch
     GoMapBucket goMapBucket;
     // Scratch for Go 1.24 labels
@@ -869,6 +960,8 @@ typedef struct PerCPURecord {
   // usesAnonymousMappings is copied from the per-PID marker in
   // pid_page_to_mapping_info during trace initialization.
   bool usesAnonymousMappings;
+
+  int initialUnwinder;
 } PerCPURecord;
 
 // https://github.com/torvalds/linux/blob/e9a6fb0bcdd7609be6969112f3fbfcce3b1d4a7c/include/linux/percpu.h#L24C39-L24C47

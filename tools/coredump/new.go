@@ -12,10 +12,12 @@ import (
 	"os/exec"
 	"path"
 	"strconv"
+	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
+	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/process"
@@ -29,13 +31,14 @@ type newCmd struct {
 	store *modulestore.Store
 
 	// User-specified command line arguments.
-	coredumpPath     string
-	sysroot          string
-	pid              uint64
-	name             string
-	importThreadInfo string
-	debugEbpf        bool
-	noModuleBundling bool
+	coredumpPath      string
+	sysroot           string
+	pid               uint64
+	name              string
+	importThreadInfo  string
+	debugEbpf         bool
+	noModuleBundling  bool
+	luajitExecutables string
 }
 
 type trackedCoredump struct {
@@ -126,6 +129,10 @@ func newNewCmd(store *modulestore.Store) *ffcli.Command {
 	set.BoolVar(&args.noModuleBundling, "no-module-bundling", false,
 		"Don't bundle binaries from local disk with the testcase. Should be avoided in general, "+
 			"but can be useful when importing coredumps from other systems.")
+	set.StringVar(&args.luajitExecutables, "luajit-executables", "",
+		"Comma-separated executable base names that statically link LuaJIT (e.g. \"tarantool\"). "+
+			"Persisted into the test case so the LuaJIT unwinder probes them during extraction "+
+			"and replay.")
 
 	return &ffcli.Command{
 		Name:       "new",
@@ -169,7 +176,15 @@ func (cmd *newCmd) exec(context.Context, []string) (err error) {
 
 	testCase := &CoredumpTestCase{}
 
-	testCase.Threads, err = ExtractTraces(context.Background(), core, cmd.debugEbpf, nil, nil)
+	interpCfg := interpreterconfig.AllInterpreters()
+	if cmd.luajitExecutables != "" {
+		interpCfg.LuaJIT.Executables = strings.Split(cmd.luajitExecutables, ",")
+		// Persist the config so the test harness probes the same hosts on replay.
+		testCase.Interpreters = &interpCfg
+	}
+
+	testCase.Threads, err = ExtractTracesWithInterpreters(context.Background(), core,
+		cmd.debugEbpf, nil, nil, interpCfg)
 	if err != nil {
 		return fmt.Errorf("failed to extract traces: %w", err)
 	}

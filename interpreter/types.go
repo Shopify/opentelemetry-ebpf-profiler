@@ -39,6 +39,9 @@ var (
 	UnknownFunctionName = libpf.Intern("<unknown>")
 
 	ErrMismatchInterpreterType = errors.New("mismatched interpreter type")
+
+	// Special coredump-only error used to restart ConvertTrace processing
+	ErrLJRestart = errors.New("lj_restart")
 )
 
 // The following function Loader and interfaces Data and Instance work together
@@ -107,6 +110,10 @@ type EbpfHandler interface {
 	// DeletePidInterpreterMapping removes the element specified by pid, prefix
 	// rom the eBPF map pid_page_to_mapping_info.
 	DeletePidInterpreterMapping(libpf.PID, lpm.Prefix) error
+
+	// CoredumpTest returns whether the unwinder needs special behavior for
+	// coredump mode to work.
+	CoredumpTest() bool
 }
 
 // Loader is a function to detect and load data from given interpreter ELF file.
@@ -134,7 +141,7 @@ type Data interface {
 // Instance is the interface to operate on per-PID data.
 type Instance interface {
 	// UsesAnonymousMappings returns true if this interpreter needs anonymous
-	// executable mappings from the process manager.
+	// mappings from the process manager.
 	//
 	// This value must not change during the lifetime of the instance.
 	UsesAnonymousMappings() bool
@@ -145,9 +152,9 @@ type Instance interface {
 
 	// SynchronizeMappings is called when the processmanager has reread process
 	// memory mappings. The mappings slice contains only the subset of mappings
-	// that are relevant to interpreters: executable anonymous mappings (for JIT
-	// engines like HotSpot, V8, BEAM) and DLL file-backed mappings (for .NET
-	// PE assemblies). The processmanager decides which mappings are included;
+	// that are relevant to interpreters: anonymous mappings (for JIT engines like
+	// HotSpot, V8, BEAM, Ruby) and DLL file-backed mappings (for .NET PE assemblies).
+	// The processmanager decides which mappings are included;
 	// this can be made more dynamic in the future if needed.
 	//
 	// The mappings are in /proc/PID/maps order (ascending by virtual address)

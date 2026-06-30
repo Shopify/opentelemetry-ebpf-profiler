@@ -1,0 +1,601 @@
+// Copyright 2024 The Parca Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+package luajit // import "go.opentelemetry.io/ebpf-profiler/interpreter/luajit"
+
+import (
+	"errors"
+	"fmt"
+	"path"
+	"slices"
+	"strings"
+	"sync"
+	"unsafe"
+
+	"go.opentelemetry.io/ebpf-profiler/host"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/interpreter"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/lpm"
+	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
+	"go.opentelemetry.io/ebpf-profiler/process"
+	"go.opentelemetry.io/ebpf-profiler/remotememory"
+	"go.opentelemetry.io/ebpf-profiler/reporter"
+	"go.opentelemetry.io/ebpf-profiler/support"
+	"go.opentelemetry.io/ebpf-profiler/util"
+)
+
+// Records all the "global" pointers we've seen.
+type vmMap map[libpf.Address]struct{}
+
+// Records all the JIT regions we've seen, value is SynchronizeMappings
+// generation.
+type regionMap map[process.RawMapping]int
+
+type regionKey struct {
+	start, end uint64
+}
+
+type luajitData struct {
+	// The distance from the "g" pointer in the GG_State struct to the start of the dispatch table.
+	g2Dispatch uint16
+	// The distance from the "g" pointer in the GG_State struct to the start of the trace array
+	// in the jit_State struct.
+	g2Traces uint16
+	// Offset of cur_L field in the global_State struct.
+	currentLOffset uint16
+	// Offset of jit_base within global_State (relative to G). Extracted separately
+	// because it is not always adjacent to cur_L (tarantool inserts mem_L between).
+	g2jitbase uint16
+	// How to step over the interpreter C frame on the native handback, taken from
+	// the interpreter region's stack delta. cframeSizeInterp is the CFA offset;
+	// interpFP is 1 when frame-pointer based (arm64) vs SP based (x86). 0 = default.
+	cframeSizeInterp uint16
+	interpFP         uint16
+	// Size to step over a JIT trace's C frame on the native handback (gate cframe
+	// + the interp->trace transition frame). Derived from cframeSizeInterp on x86.
+	cframeSizeJIT uint16
+}
+
+type luajitInstance struct {
+	interpreter.InstanceStubs
+
+	rm         remotememory.RemoteMemory
+	protos     map[libpf.Address]*proto
+	jitRegions regionMap
+	pid        libpf.PID
+	ebpf       interpreter.EbpfHandler
+	// Map of g's we've seen, populated by the symbolizer goroutine and
+	// consumed in SynchronizeMappings so needs to be protected by a mutex.
+	mu  sync.Mutex
+	vms vmMap
+
+	// Currently mapped prefixes for each vms traces
+	prefixesByG map[libpf.Address][]lpm.Prefix
+
+	// Currently mapped prefixes for entire memory regions
+	prefixes map[regionKey][]lpm.Prefix
+
+	// Hash of the traces for each vm
+	traceHashes map[libpf.Address]uint64
+	cycle       int
+
+	g2Traces      uint16
+	cframeSizeJIT uint16
+}
+
+var (
+	_ interpreter.Data     = &luajitData{}
+	_ interpreter.Instance = &luajitInstance{}
+)
+
+func (d *luajitData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, _ libpf.Address,
+	rm remotememory.RemoteMemory) (interpreter.Instance, error) {
+	cdata := support.LuaJITProcInfo{
+		G2dispatch:         d.g2Dispatch,
+		Cur_L_offset:       d.currentLOffset,
+		Cframe_size_jit:    d.cframeSizeJIT,
+		G2jitbase:          d.g2jitbase,
+		Cframe_size_interp: d.cframeSizeInterp,
+		Interp_fp:          d.interpFP,
+	}
+	if err := ebpf.UpdateProcData(libpf.LuaJIT, pid, unsafe.Pointer(&cdata)); err != nil {
+		return nil, err
+	}
+
+	return &luajitInstance{rm: rm,
+		pid:           pid,
+		ebpf:          ebpf,
+		protos:        make(map[libpf.Address]*proto),
+		jitRegions:    make(regionMap),
+		prefixes:      make(map[regionKey][]lpm.Prefix),
+		prefixesByG:   make(map[libpf.Address][]lpm.Prefix),
+		vms:           make(vmMap),
+		traceHashes:   make(map[libpf.Address]uint64),
+		g2Traces:      d.g2Traces,
+		cframeSizeJIT: d.cframeSizeJIT,
+	}, nil
+}
+
+func (d *luajitData) Unload(_ interpreter.EbpfHandler) {}
+
+func (l *luajitInstance) Detach(ebpf interpreter.EbpfHandler, pid libpf.PID) error {
+	// Clear memory ranges
+	for _, prefixes := range l.prefixes {
+		for _, prefix := range prefixes {
+			_ = ebpf.DeletePidInterpreterMapping(pid, prefix)
+		}
+	}
+	// Clear trace ranges
+	for _, prefixes := range l.prefixesByG {
+		for _, prefix := range prefixes {
+			_ = ebpf.DeletePidInterpreterMapping(pid, prefix)
+		}
+	}
+	return ebpf.DeleteProcData(libpf.LuaJIT, pid)
+}
+
+// embedsLuaJIT reports whether the executable base name ships or statically
+// links the LuaJIT runtime. The built-in set covers the LuaJIT shared library
+// (libluajit-5.1.so*, luajit*) and the well-known hosts nginx/openresty.
+// extraExecutables is an operator-configured list of additional binaries that
+// statically link LuaJIT (e.g. "tarantool"), so embedders can opt in via
+// configuration without a code change to this allowlist.
+func embedsLuaJIT(base string, extraExecutables []string) bool {
+	if strings.HasPrefix(base, "libluajit-5.1.so") ||
+		strings.HasPrefix(base, "luajit") ||
+		base == "nginx" || base == "openresty" {
+		return true
+	}
+	return slices.Contains(extraExecutables, base)
+}
+
+func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
+	extraExecutables []string) (interpreter.Data, error) {
+	base := path.Base(info.FileName())
+	if !embedsLuaJIT(base, extraExecutables) {
+		return nil, nil
+	}
+
+	ef, err := info.GetELF()
+	if err != nil {
+		return nil, err
+	}
+
+	// When the binary is unstripped (e.g. tarantool), lj_vm_asm_begin marks the
+	// exact start of the VM interpreter. Anchor the interpreter-range detection
+	// to it: the stack-delta heuristic alone can match an unrelated large gap
+	// (observed on x86 tarantool — it matched 0x164469 instead of the real
+	// lj_vm_asm_begin 0x261ca0, then failed the start-address sanity check).
+	// lj_vm_asm_begin is a hidden .symtab symbol; raw ef.LookupSymbol only finds
+	// dynamic symbols, so use scanSymbols (which reads .symtab via VisitSymbols),
+	// matching how extractOffsets resolves it.
+	var asmBegin uint64
+	if sym, ok := scanSymbols(ef)[libpf.SymbolName("lj_vm_asm_begin")]; ok {
+		asmBegin = uint64(sym.Address)
+	}
+
+	luaInterp, err := extractInterpreterBounds(info.Deltas(), cframeSize, asmBegin)
+	if err != nil {
+		return nil, err
+	}
+	logf("lj: interp range %v", luaInterp)
+
+	ljd := &luajitData{}
+	// Derive how to step over the interpreter's C frame on the native handback
+	// from the interpreter region's own stack delta (correct per build/arch),
+	// rather than the hardcoded LUAJIT_CFRAME_SPACE which is wrong for tarantool.
+	if p, fp, ok := interpCframeUnwind(info.Deltas(), luaInterp.Start); ok {
+		ljd.cframeSizeInterp = p
+		ljd.interpFP = fp
+		logf("lj: interp cframe size %d fp %d", p, fp)
+	}
+	// The JIT trace runs in the VM gate's C frame plus a small interp->trace
+	// transition frame (16 bytes). On SP-based builds (x86) the gate cframe is the
+	// extracted interp cframe, which differs from the hardcoded LJCframeSpace
+	// (tarantool 96 vs OpenResty 80) -- using the wrong base left the JIT native
+	// handback 16 bytes short, resuming in the fiber stack instead of the C
+	// caller (ERROR_4012). FP-based (arm64) keeps the arch constant. Falls back to
+	// the constant when the interp cframe couldn't be extracted.
+	ljd.cframeSizeJIT = uint16(cframeSizeJIT)
+	if ljd.cframeSizeInterp != 0 && ljd.interpFP == 0 {
+		ljd.cframeSizeJIT = ljd.cframeSizeInterp + 16
+	}
+	logf("lj: cframe size jit %d", ljd.cframeSizeJIT)
+
+	if err = extractOffsets(ef, ljd, luaInterp); err != nil {
+		return nil, err
+	}
+
+	logf("lj: offsets %+v", ljd)
+
+	if err = ebpf.UpdateInterpreterOffsets(support.ProgUnwindLuaJIT, info.FileID(),
+		[]util.Range{luaInterp}); err != nil {
+		return nil, err
+	}
+
+	return ljd, nil
+}
+
+// LuaJIT's interpreter isn't a function, its a raw chunk of assembly code with direct threaded
+// jumps at end of each opcode. The public entrypoints (lua_pcall/lua_resume) call the lj_vm_pcall
+// function at the end of this blob which set up the interpreter and starts executing.
+// Even though its not a normal function an eh_frame entry is created for it, its really
+// big and has a somewhat unique FDE we can pick out. We could tighten this up by looking for
+// direct jumps to the start of the interpreter (one can be found lj_dispatch_update) but we'd
+// still need to consult the stack deltas to get the end of the interpreter.
+func extractInterpreterBounds(deltas sdtypes.StackDeltaArray, param int32,
+	asmBegin uint64) (util.Range, error) {
+	// If lj_vm_asm_begin is known (unstripped binary), the interpreter range
+	// starts exactly at that symbol. Return the delta gap that starts there
+	// rather than the first large gap matching the unwind pattern, which can be
+	// an unrelated function on some builds (x86 tarantool).
+	if asmBegin != 0 {
+		// The VM asm is one large delta interval, but its start can sit a few
+		// bytes below lj_vm_asm_begin (the preceding function's unwind info
+		// extends to just before the symbol). Match the interval that CONTAINS
+		// the symbol and is large (the interpreter), then start the range exactly
+		// at the symbol so it matches the lj_vm_asm_begin sanity check.
+		for i := 0; i < len(deltas)-1; i++ {
+			if deltas[i].Address <= asmBegin && asmBegin < deltas[i+1].Address &&
+				deltas[i+1].Address-asmBegin > 10_000 {
+				return util.Range{Start: asmBegin, End: deltas[i+1].Address}, nil
+			}
+		}
+		// Fall through to the heuristic if the symbol isn't in a large interval.
+	}
+	for i := 0; i < len(deltas)-1; i++ {
+		d, next := &deltas[i], &deltas[i+1]
+		if next.Address-d.Address > 10_000 {
+			// The first case covers x86 w/ dwarf and old versions of luajit ARM that used dwarf and
+			// the second covers more recent arm versions that use frame pointers.
+			if d.Info.BaseReg == support.UnwindRegSp && d.Info.Param == param ||
+				d.Info.BaseReg == support.UnwindRegFp && d.Info.Param == 16 {
+				return util.Range{Start: d.Address, End: next.Address}, nil
+			}
+		}
+	}
+
+	return util.Range{}, errors.New("failed to find interpreter range")
+}
+
+// interpCframeUnwind returns how to step over the interpreter's C frame when the
+// luajit unwinder hands back to the native unwinder. It reads the interpreter
+// region's own stack delta (the one covering interpStart): param is the CFA
+// offset and fp is 1 when that delta is frame-pointer based (CFA = fp + param,
+// as on arm64) vs stack-pointer based (CFA = sp + param, as on x86). This is
+// authoritative per build/arch, unlike the hardcoded LUAJIT_CFRAME_SPACE which
+// is wrong for tarantool (x86 wants 96 not 80; arm64 is fp-based +16 not 208).
+func interpCframeUnwind(deltas sdtypes.StackDeltaArray, interpStart uint64) (param, fp uint16, ok bool) {
+	for i := 0; i < len(deltas)-1; i++ {
+		if deltas[i].Address <= interpStart && interpStart < deltas[i+1].Address {
+			p := deltas[i].Info.Param
+			if p <= 0 || p > 0xffff {
+				return 0, 0, false
+			}
+			if deltas[i].Info.BaseReg == support.UnwindRegFp {
+				return uint16(p), 1, true
+			}
+			return uint16(p), 0, true
+		}
+	}
+	return 0, 0, false
+}
+
+func (l *luajitInstance) getVMList() []libpf.Address {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	gs := make([]libpf.Address, 0, len(l.vms))
+	for g := range l.vms {
+		gs = append(gs, g)
+	}
+	return gs
+}
+
+func (l *luajitInstance) addJITRegion(ebpf interpreter.EbpfHandler, pid libpf.PID,
+	start, end uint64) error {
+	prefixes, err := lpm.CalculatePrefixList(start, end)
+	if err != nil {
+		logf("lj: failed to calculate lpm: %v", err)
+		return err
+	}
+	logf("lj: add JIT region pid(%v) %#x:%#x", pid, start, end)
+	for _, prefix := range prefixes {
+		// TODO: fix these: WARN[0267] Failed to lookup file ID 0x2a00000000
+		fileID := support.LJFileId << 32
+		if err := ebpf.UpdatePidInterpreterMapping(pid, prefix, support.ProgUnwindLuaJIT,
+			host.FileID(fileID), 0); err != nil {
+			return err
+		}
+	}
+	k := regionKey{start: start, end: end}
+	l.prefixes[k] = prefixes
+	return nil
+}
+
+func (l *luajitInstance) addTrace(ebpf interpreter.EbpfHandler, pid libpf.PID, t trace, g,
+	spadjust uint64) ([]lpm.Prefix, error) {
+	start, end := t.mcode, t.mcode+uint64(t.szmcode)
+	prefixes, err := lpm.CalculatePrefixList(start, end)
+	if err != nil {
+		logf("lj: failed to calculate lpm: %v", err)
+		return nil, err
+	}
+	logf("lj: add trace mapping for pid(%v) %x:%x", pid, start, end)
+	for _, prefix := range prefixes {
+		fileID := support.LJFileId<<32 | spadjust
+		if err := ebpf.UpdatePidInterpreterMapping(pid, prefix, support.ProgUnwindLuaJIT,
+			host.FileID(fileID), g); err != nil {
+			return nil, err
+		}
+	}
+	return prefixes, nil
+}
+
+// UsesAnonymousMappings reports that LuaJIT needs the process manager to sync
+// anonymous executable mappings. LuaJIT emits JIT traces (mcode) into anonymous
+// executable mmap regions; without these mappings synced into
+// pid_page_to_mapping_info, the native unwinder treats an mcode PC as an
+// unsupported anonymous mapping (ERR_NATIVE_UNSUPPORTED_MAPPING) instead of
+// handing off to the LuaJIT unwinder. (Interface added upstream by #1473,
+// after parca #1236.)
+func (l *luajitInstance) UsesAnonymousMappings() bool {
+	return true
+}
+
+func (l *luajitInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
+	_ reporter.ExecutableReporter, pr process.Process, mappings []process.RawMapping) error {
+	return l.synchronizeMappings(ebpf, pr.PID(), mappings)
+}
+
+func (l *luajitInstance) synchronizeMappings(ebpf interpreter.EbpfHandler, pid libpf.PID,
+	mappings []process.RawMapping) error {
+	cycle := l.cycle
+	l.cycle++
+	for i := range mappings {
+		m := &mappings[i]
+		if !m.IsAnonymous() || !m.IsExecutable() {
+			continue
+		}
+		l.jitRegions[*m] = cycle
+	}
+
+	// Remove old ones
+	for m, c := range l.jitRegions {
+		k := regionKey{start: m.Vaddr, end: m.Vaddr + m.Length}
+		if c != cycle {
+			for _, prefix := range l.prefixes[k] {
+				if err := ebpf.DeletePidInterpreterMapping(pid, prefix); err != nil {
+					return errors.Join(err, fmt.Errorf("failed to delete prefix %v", prefix))
+				}
+			}
+			delete(l.jitRegions, m)
+			delete(l.prefixes, k)
+		}
+	}
+
+	// Add new ones
+	for m := range l.jitRegions {
+		k := regionKey{start: m.Vaddr, end: m.Vaddr + m.Length}
+		if _, ok := l.prefixes[k]; !ok {
+			if err := l.addJITRegion(ebpf, pid, m.Vaddr, m.Vaddr+m.Length); err != nil {
+				return errors.Join(err, fmt.Errorf("failed to add JIT region %v", m))
+			}
+		}
+	}
+
+	return l.processVMs(ebpf, pid)
+}
+
+func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID) error {
+	var badVMs []libpf.Address
+	for _, g := range l.getVMList() {
+		hash, traces, err := loadTraces(g+libpf.Address(l.g2Traces), l.rm)
+		if err != nil {
+			// if g is bad remove it
+			log.Warnf("LuaJIT instance (%v) deleted: %v", g, err)
+			badVMs = append(badVMs, g)
+			continue
+		}
+		// Don't do anything if nothing changed.
+		if hash == l.traceHashes[g] {
+			continue
+		}
+
+		// We don't bother trying to keep things in sync, just delete them all and re-add them.
+		prefixes := l.prefixesByG[g]
+		l.prefixesByG[g] = nil
+		for _, prefix := range prefixes {
+			_ = ebpf.DeletePidInterpreterMapping(pid, prefix)
+		}
+
+		newPrefixes := []lpm.Prefix{}
+	traceLoop:
+		for i := range traces {
+			t := traces[i]
+			// Validate the trace
+			foundRegion := false
+			for reg := range l.jitRegions {
+				if t.mcode >= reg.Vaddr && t.mcode < reg.Vaddr+reg.Length {
+					foundRegion = true
+					end := t.mcode + uint64(t.szmcode)
+					if end > reg.Vaddr+reg.Length {
+						log.Errorf("trace %v end goes beyond JIT region, bad szmcode", t)
+						continue traceLoop
+					}
+					break
+				}
+			}
+
+			if !foundRegion {
+				log.Errorf("trace %v not in a JIT region", t)
+				continue
+			}
+
+			stackDelta := uint64(t.spadjust) + uint64(l.cframeSizeJIT)
+			// If this is a side trace, we need to add the spadjust of the root trace but
+			// only if they are different.
+			//https://github.com/openresty/luajit2/blob/7952882d/src/lj_gdbjit.c#L597
+			if t.root != 0 && traces[t.root].spadjust != t.spadjust {
+				stackDelta += uint64(traces[t.root].spadjust) + uint64(l.cframeSizeJIT)
+			}
+			p, err := l.addTrace(ebpf, pid, t, uint64(g), stackDelta)
+			if err != nil {
+				log.Errorf("Error adding trace(%d): %v", t.traceno, err)
+				continue
+			}
+			newPrefixes = append(newPrefixes, p...)
+		}
+
+		log.Infof("LuaJIT traces for pid(%v) added: %d with %d prefixes and removed %d prefixes",
+			pid, len(traces), len(newPrefixes), len(prefixes))
+
+		l.prefixesByG[g] = newPrefixes
+		l.traceHashes[g] = hash
+	}
+	l.removeVMs(badVMs)
+	return nil
+}
+
+func (l *luajitInstance) removeVMs(gs []libpf.Address) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, g := range gs {
+		delete(l.vms, g)
+	}
+}
+
+func (l *luajitInstance) getGCproto(pt libpf.Address) (*proto, error) {
+	if pt == 0 {
+		return nil, nil
+	}
+	if gc, ok := l.protos[pt]; ok {
+		return gc, nil
+	}
+	gc, err := newProto(l.rm, pt)
+	if err != nil {
+		return nil, err
+	}
+	l.protos[pt] = gc
+	return gc, nil
+}
+
+// symbolizeFrame symbolizes the previous (up the stack)
+func (l *luajitInstance) symbolizeFrame(funcName string, ptAddr libpf.Address,
+	pc uint32, frames *libpf.Frames) error {
+	pt, err := l.getGCproto(ptAddr)
+	if err != nil {
+		logf("lj: callee proto %x: %v", ptAddr, err)
+		return err
+	}
+	line := pt.getLine(pc)
+	fileName := pt.getName()
+	logf("lj: [%x] %v+%v at %v:%v", ptAddr, funcName, pc, fileName, line)
+	frames.Append(&libpf.Frame{
+		Type:           libpf.LuaJITFrame,
+		FunctionOffset: pc,
+		FunctionName:   libpf.Intern(funcName),
+		SourceFile:     libpf.Intern(fileName),
+		SourceLine:     libpf.SourceLineno(line),
+	})
+	return nil
+}
+
+func (l *luajitInstance) addVM(g libpf.Address) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.vms[g]
+	if !ok {
+		l.vms[g] = struct{}{}
+	}
+	return !ok
+}
+
+func (l *luajitInstance) Symbolize(frame libpf.EbpfFrame, frames *libpf.Frames, fm libpf.FrameMapping) error {
+	if !frame.Type().IsInterpType(libpf.LuaJIT) {
+		return interpreter.ErrMismatchInterpreterType
+	}
+
+	var funcName string
+	ljkind := frame.Data()
+	switch ljkind {
+	case support.LJNormalFrame:
+		if frame.NumVariables() < 3 {
+			return errors.New("LuaJIT normal frame not large enough")
+		}
+		callerPT := libpf.Address(frame.Variable(1))
+
+		pt, err := l.getGCproto(callerPT)
+		if err != nil {
+			logf("lj: caller proto %x: %v", callerPT, err)
+			return err
+		}
+
+		var2 := frame.Variable(2)
+		callerPC := uint32(var2 & 0xFFFFFFFF)
+		calleePC := uint32(var2 >> 32)
+		funcName = pt.getFunctionName(callerPC)
+		calleePT := libpf.Address(frame.Variable(0))
+		if err := l.symbolizeFrame(funcName, calleePT,
+			calleePC, frames); err != nil {
+			return err
+		}
+
+		return nil
+	case support.LJFFIFunc:
+		if frame.NumVariables() < 1 {
+			return errors.New("LuaJIT FFI frame not large enough")
+		}
+		funcId := libpf.Address(frame.Variable(0)) & 7
+		switch funcId {
+		case 0:
+			funcName = "lua-frame"
+		case 1:
+			funcName = "c-frame"
+		case 2:
+			funcName = "cont-frame"
+		case 3:
+			return errors.New("unexpected frame type 3")
+		case 4:
+			funcName = "lua-pframe"
+		case 5:
+			funcName = "cpcall"
+		case 6:
+			funcName = "ff-pcall"
+		case 7:
+			funcName = "ff-pcall-hook"
+		}
+		frames.Append(&libpf.Frame{
+			Type:         libpf.LuaJITFrame,
+			FunctionName: libpf.Intern("LuaJIT FFI: " + funcName),
+		})
+		return nil
+	case support.LJGReport:
+		if frame.NumVariables() < 1 {
+			return errors.New("LuaJIT G report frame not large enough")
+		}
+		g := libpf.Address(frame.Variable(0))
+		if g != 0 {
+			unseen := l.addVM(g)
+			if unseen {
+				log.Infof("New LuaJIT instance detected: %v", g)
+				if l.ebpf.CoredumpTest() {
+					return interpreter.ErrLJRestart
+				}
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("Unrecognized LuaJIT frame kind: %d", ljkind)
+	}
+
+	return nil
+}

@@ -206,6 +206,11 @@
     "description": "Ruby: Unable to read objspace flags"
   },
   {
+    "id": 3034,
+    "name": "ruby_jit_native_resume_unsupported",
+    "description": "Ruby: Native resume requested after Ruby JIT, but unwinding was stopped because JIT frames cannot resume native unwinding"
+  },
+  {
     "id": 4000,
     "name": "native_lookup_text_section",
     "description": "Native: Unable to find the code section in the stack delta page info map"
@@ -379,5 +384,30 @@
     "id": 7006,
     "name": "beam_range_search_exhausted",
     "description": "BEAM: Ran out of iterations searching for the current code header"
+  },
+  {
+    "id": 8000,
+    "name": "luajit_no_proc_info",
+    "description": "LuaJIT: No entry for this process exists in the LuaJIT process info array"
+  },
+  {
+    "id": 8001,
+    "name": "luajit_read_lua_context",
+    "description": "LuaJIT: Unable to read the Lua context"
+  },
+  {
+    "id": 8002,
+    "name": "luajit_frame_read",
+    "description": "LuaJIT: Unable to read the Lua frame"
+  },
+  {
+    "id": 8003,
+    "name": "luajit_l_mismatch",
+    "description": "LuaJIT: context pointer validity check failed"
+  },
+  {
+    "id": 8004,
+    "name": "luajit_invalid_pc",
+    "description": "LuaJIT: PC exceeds 24 bits"
   }
 ]
