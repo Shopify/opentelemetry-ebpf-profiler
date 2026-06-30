@@ -155,7 +155,15 @@ func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 		return nil, err
 	}
 
-	luaInterp, err := extractInterpreterBounds(ef.Machine, *info.Intervals(), cframeSize)
+	// When the binary is unstripped (e.g. tarantool), lj_vm_asm_begin marks the
+	// exact start of the VM interpreter. Anchor the interpreter-range detection
+	// to it: the stack-delta heuristic alone can match an unrelated large gap.
+	var asmBegin uint64
+	if s, lookupErr := ef.LookupSymbol(ljVMAsmBeginSym); lookupErr == nil {
+		asmBegin = uint64(s.Address)
+	}
+
+	luaInterp, err := extractInterpreterBounds(ef.Machine, *info.Intervals(), cframeSize, asmBegin)
 	if err != nil {
 		return nil, err
 	}
@@ -189,8 +197,13 @@ const (
 // big and has a somewhat unique FDE we can pick out. We could tighten this up by looking for
 // direct jumps to the start of the interpreter (one can be found lj_dispatch_update) but we'd
 // still need to consult the stack deltas to get the end of the interpreter.
-func extractInterpreterBounds(machine elf.Machine, intervals sdtypes.IntervalData, param int32) (util.Range,
-	error) {
+func extractInterpreterBounds(machine elf.Machine, intervals sdtypes.IntervalData, param int32,
+	asmBegin uint64) (util.Range, error) {
+	var (
+		fallback      util.Range
+		foundFallback bool
+	)
+
 DeltasLoop:
 	for i, bk := range intervals.Blocks {
 		for j, d := range bk.Deltas {
@@ -213,17 +226,29 @@ DeltasLoop:
 			}
 			dAddr := bk.Start + uint64(d.Offset)
 			nextAddr := nextBk.Start + uint64(next.Offset)
-			if nextAddr < dAddr || nextAddr-dAddr <= minInterpreterSize {
+			if nextAddr < dAddr {
+				continue
+			}
+
+			if asmBegin != 0 && dAddr == asmBegin {
+				return util.Range{Start: dAddr, End: nextAddr}, nil
+			}
+			if nextAddr-dAddr <= minInterpreterSize {
 				continue
 			}
 
 			// The first case covers x86 w/ dwarf and old versions of luajit ARM that used dwarf and
 			// the second covers more recent arm versions that use frame pointers.
-			if (d.Info.BaseReg == support.UnwindRegSp && d.Info.Param == param) ||
-				(machine == elf.EM_AARCH64 && d.Info.BaseReg == support.UnwindRegFp && d.Info.Param == 16) {
-				return util.Range{Start: dAddr, End: nextAddr}, nil
+			if !foundFallback &&
+				((d.Info.BaseReg == support.UnwindRegSp && d.Info.Param == param) ||
+					(machine == elf.EM_AARCH64 && d.Info.BaseReg == support.UnwindRegFp && d.Info.Param == 16)) {
+				fallback = util.Range{Start: dAddr, End: nextAddr}
+				foundFallback = true
 			}
 		}
+	}
+	if foundFallback {
+		return fallback, nil
 	}
 	return util.Range{}, errors.New("failed to find interpreter range")
 }
