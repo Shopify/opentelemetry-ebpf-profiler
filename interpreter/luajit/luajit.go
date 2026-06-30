@@ -60,6 +60,9 @@ type luajitData struct {
 	// interpFP is 1 when frame-pointer based (arm64) vs SP based (x86). 0 = default.
 	cframeSizeInterp uint16
 	interpFP         uint16
+	// Size to step over a JIT trace's C frame on the native handback (gate cframe
+	// + the interp->trace transition frame). Derived from cframeSizeInterp on x86.
+	cframeSizeJIT uint16
 }
 
 type luajitInstance struct {
@@ -85,7 +88,8 @@ type luajitInstance struct {
 	traceHashes map[libpf.Address]uint64
 	cycle       int
 
-	g2Traces uint16
+	g2Traces      uint16
+	cframeSizeJIT uint16
 }
 
 var (
@@ -98,7 +102,7 @@ func (d *luajitData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, _ libpf
 	cdata := support.LuaJITProcInfo{
 		G2dispatch:         d.g2Dispatch,
 		Cur_L_offset:       d.currentLOffset,
-		Cframe_size_jit:    uint16(cframeSizeJIT),
+		Cframe_size_jit:    d.cframeSizeJIT,
 		G2jitbase:          d.g2jitbase,
 		Cframe_size_interp: d.cframeSizeInterp,
 		Interp_fp:          d.interpFP,
@@ -108,15 +112,16 @@ func (d *luajitData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, _ libpf
 	}
 
 	return &luajitInstance{rm: rm,
-		pid:         pid,
-		ebpf:        ebpf,
-		protos:      make(map[libpf.Address]*proto),
-		jitRegions:  make(regionMap),
-		prefixes:    make(map[regionKey][]lpm.Prefix),
-		prefixesByG: make(map[libpf.Address][]lpm.Prefix),
-		vms:         make(vmMap),
-		traceHashes: make(map[libpf.Address]uint64),
-		g2Traces:    d.g2Traces,
+		pid:           pid,
+		ebpf:          ebpf,
+		protos:        make(map[libpf.Address]*proto),
+		jitRegions:    make(regionMap),
+		prefixes:      make(map[regionKey][]lpm.Prefix),
+		prefixesByG:   make(map[libpf.Address][]lpm.Prefix),
+		vms:           make(vmMap),
+		traceHashes:   make(map[libpf.Address]uint64),
+		g2Traces:      d.g2Traces,
+		cframeSizeJIT: d.cframeSizeJIT,
 	}, nil
 }
 
@@ -193,6 +198,18 @@ func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 		ljd.interpFP = fp
 		logf("lj: interp cframe size %d fp %d", p, fp)
 	}
+	// The JIT trace runs in the VM gate's C frame plus a small interp->trace
+	// transition frame (16 bytes). On SP-based builds (x86) the gate cframe is the
+	// extracted interp cframe, which differs from the hardcoded LJCframeSpace
+	// (tarantool 96 vs OpenResty 80) -- using the wrong base left the JIT native
+	// handback 16 bytes short, resuming in the fiber stack instead of the C
+	// caller (ERROR_4012). FP-based (arm64) keeps the arch constant. Falls back to
+	// the constant when the interp cframe couldn't be extracted.
+	ljd.cframeSizeJIT = uint16(cframeSizeJIT)
+	if ljd.cframeSizeInterp != 0 && ljd.interpFP == 0 {
+		ljd.cframeSizeJIT = ljd.cframeSizeInterp + 16
+	}
+	logf("lj: cframe size jit %d", ljd.cframeSizeJIT)
 
 	if err = extractOffsets(ef, ljd, luaInterp); err != nil {
 		return nil, err
@@ -423,12 +440,12 @@ func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID)
 				continue
 			}
 
-			stackDelta := uint64(t.spadjust) + uint64(cframeSizeJIT)
+			stackDelta := uint64(t.spadjust) + uint64(l.cframeSizeJIT)
 			// If this is a side trace, we need to add the spadjust of the root trace but
 			// only if they are different.
 			//https://github.com/openresty/luajit2/blob/7952882d/src/lj_gdbjit.c#L597
 			if t.root != 0 && traces[t.root].spadjust != t.spadjust {
-				stackDelta += uint64(traces[t.root].spadjust) + uint64(cframeSizeJIT)
+				stackDelta += uint64(traces[t.root].spadjust) + uint64(l.cframeSizeJIT)
 			}
 			p, err := l.addTrace(ebpf, pid, t, uint64(g), stackDelta)
 			if err != nil {
