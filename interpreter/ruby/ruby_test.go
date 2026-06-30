@@ -391,19 +391,14 @@ func TestFindJITRegion(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			start, end, found := findJITRegion(tt.mappings)
-			if found != tt.wantFound {
-				t.Errorf("found = %v, want %v", found, tt.wantFound)
+			if !assert.Equal(t, tt.wantFound, found) {
 				return
 			}
 			if !found {
 				return
 			}
-			if start != tt.wantStart {
-				t.Errorf("start = %#x, want %#x", start, tt.wantStart)
-			}
-			if end != tt.wantEnd {
-				t.Errorf("end = %#x, want %#x", end, tt.wantEnd)
-			}
+			assert.Equal(t, tt.wantStart, start)
+			assert.Equal(t, tt.wantEnd, end)
 		})
 	}
 }

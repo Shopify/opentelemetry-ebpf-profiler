@@ -1283,16 +1283,17 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 }
 
 // findJITRegion detects the Ruby JIT code reservation from process memory mappings.
-// Ruby reserves address ranges via rb_jit_reserve_addr_space() and then uses
-// mprotect to activate pages as r-x or temporarily rw. Code GC can turn pages
-// back into PROT_NONE, so the reservation may appear as multiple VMAs.
-// On systems with CONFIG_ANON_VMA_NAME, Ruby labels the region via prctl(PR_SET_VMA)
-// giving it a path like "[anon:Ruby:rb_jit_reserve_addr_space]". Otherwise we use
-// a conservative fallback that spans from the first anonymous executable mapping
-// to the end of the last anonymous executable mapping, plus any contiguous
-// anonymous tail after that last executable mapping. This covers production
-// layouts where Ruby exposes multiple discontiguous anonymous executable ranges
-// without requiring multi-segment tracking in eBPF.
+// Ruby reserves one contiguous address range via rb_jit_reserve_addr_space(), then
+// uses mprotect to activate pages as r-x or temporarily rw. Code GC can turn pages
+// back into PROT_NONE, so that single reservation may appear as multiple VMAs with
+// holes or different protections. On systems with CONFIG_ANON_VMA_NAME, Ruby labels
+// the region via prctl(PR_SET_VMA) giving it a path like
+// "[anon:Ruby:rb_jit_reserve_addr_space]". Otherwise we use a conservative fallback
+// that spans from the first anonymous executable mapping to the end of the last
+// anonymous executable mapping, plus any contiguous anonymous tail after that last
+// executable mapping. This covers production layouts where the single Ruby JIT
+// reservation is split across several VMAs without requiring multi-segment tracking
+// in eBPF.
 // Returns (start, end, found).
 func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
 	var jitStart, jitEnd uint64
@@ -1357,6 +1358,23 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 	// reservation. PROT_NONE gaps are safe to include because they cannot execute,
 	// and covering the full range avoids churn as Ruby mprotects new code pages.
 	jitStart, jitEnd, jitFound := findJITRegion(mappings)
+	if !jitFound {
+		jitStart = 0
+		jitEnd = 0
+	}
+
+	// Publish the JIT range before publishing new interpreter prefixes. Once a
+	// prefix is visible to eBPF, samples in that range may enter the Ruby unwinder
+	// and need procInfo to already contain the matching range for JIT-frame checks.
+	if r.procInfo.Jit_start != jitStart || r.procInfo.Jit_end != jitEnd {
+		r.procInfo.Jit_start = jitStart
+		r.procInfo.Jit_end = jitEnd
+		if err := ebpf.UpdateProcData(libpf.Ruby, pr.PID(), unsafe.Pointer(r.procInfo)); err != nil {
+			return err
+		}
+		log.Debugf("Updated JIT region %#x-%#x in ruby proc info", jitStart, jitEnd)
+	}
+
 	if jitFound {
 		prefixes, err := lpm.CalculatePrefixList(jitStart, jitEnd)
 		if err != nil {
@@ -1372,18 +1390,6 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 			}
 			r.prefixes[prefix] = r.mappingGeneration
 		}
-	} else {
-		jitStart = 0
-		jitEnd = 0
-	}
-
-	if r.procInfo.Jit_start != jitStart || r.procInfo.Jit_end != jitEnd {
-		r.procInfo.Jit_start = jitStart
-		r.procInfo.Jit_end = jitEnd
-		if err := ebpf.UpdateProcData(libpf.Ruby, pr.PID(), unsafe.Pointer(r.procInfo)); err != nil {
-			return err
-		}
-		log.Debugf("Updated JIT region %#x-%#x in ruby proc info", jitStart, jitEnd)
 	}
 
 	// Remove prefixes not seen.
