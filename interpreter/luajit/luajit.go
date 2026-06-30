@@ -444,6 +444,7 @@ func (l *luajitInstance) symbolizeFrame(funcName string, ptAddr libpf.Address,
 	pc uint32, frames *libpf.Frames) error {
 	pt, err := l.getGCproto(ptAddr)
 	if err != nil {
+		logf("lj: callee proto %x: %v", ptAddr, err)
 		return err
 	}
 	line := pt.getLine(pc)
@@ -485,6 +486,7 @@ func (l *luajitInstance) Symbolize(frame libpf.EbpfFrame, frames *libpf.Frames, 
 
 		pt, err := l.getGCproto(callerPT)
 		if err != nil {
+			logf("lj: caller proto %x: %v", callerPT, err)
 			return err
 		}
 
