@@ -21,9 +21,11 @@ require (
 	github.com/klauspost/compress v1.19.2
 	github.com/mdlayher/kobject v0.0.0-20200520190114-19ca17470d7d
 	github.com/minio/sha256-simd v1.0.1
+	github.com/moby/moby/api v1.55.0
 	github.com/open-telemetry/sig-profiling/profcheck v0.0.0-20260826135623-e4135eebc9d9
 	github.com/peterbourgon/ff/v3 v3.4.0
 	github.com/stretchr/testify v1.12.1
+	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/zeebo/xxh3 v1.1.0
 	go.opentelemetry.io/collector/component v1.65.0
 	go.opentelemetry.io/collector/component/componenttest v0.159.0
