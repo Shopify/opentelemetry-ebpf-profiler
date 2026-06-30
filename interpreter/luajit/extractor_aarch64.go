@@ -145,6 +145,14 @@ func (a *armExtractor) findG2DispatchOffsetFromLjDispatchUpdate(b []byte) (libpf
 	return result, err
 }
 
+// findG2JitBaseFromExitHandler extracts jit_base's offset from G on arm64.
+// The implementation is added separately; until then, return zero so the
+// caller falls back to cur_L+8 for OpenResty/luajit2.
+func (a *armExtractor) findG2JitBaseFromExitHandler(
+	_ []byte, _, _ libpf.Address) (libpf.Address, error) {
+	return 0, nil
+}
+
 func (a *armExtractor) findLjDispatchUpdateAddr(b []byte, addr libpf.Address) (libpf.Address, error) {
 	it := arm.NewInterpreterWithCode(b)
 	it.CodeAddress = expression.Imm(uint64(addr))

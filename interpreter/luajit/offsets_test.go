@@ -98,6 +98,13 @@ func TestExtractInterpreterBoundsAnchor(t *testing.T) {
 	})
 }
 
+func TestG2JitBaseOffsetFallback(t *testing.T) {
+	o := offsetData{}
+	got, err := o.findG2JitBaseOffset(0x170, 0)
+	require.NoError(t, err)
+	require.Equal(t, libpf.Address(0x178), got)
+}
+
 func TestX86LuaClose(t *testing.T) {
 	testdata := []struct {
 		name          string
