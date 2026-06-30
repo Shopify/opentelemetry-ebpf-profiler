@@ -500,7 +500,7 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 // isInterpreterMapping reports whether a mapping should be passed to interpreter
 // SynchronizeMappings when an attached interpreter has requested mapping updates.
 func isInterpreterMapping(m *process.RawMapping) bool {
-	return (m.IsExecutable() && m.IsAnonymous()) || strings.HasSuffix(m.Path, ".dll")
+	return m.IsAnonymous() || strings.HasSuffix(m.Path, ".dll")
 }
 
 type interpreterMappingCollector struct {
@@ -623,8 +623,10 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	start := time.Now()
 
 	// This callback processes each memory mapping, keeping only executable
-	// file-backed mappings and anonymous executable/DLL mappings needed by interpreters.
-	// All other mappings are skipped.
+	// file-backed mappings and anonymous/DLL mappings needed by interpreters.
+	// Anonymous non-executable mappings are included once an attached interpreter
+	// requests them so runtimes with JIT reservations split across r-x/rw/--- VMAs
+	// can detect the full reserved area. All other mappings are skipped.
 	numParseErrors, err := pr.IterateMappings(func(m process.RawMapping) bool {
 		if processcontext.IsContextMapping(m.IsExecutable(), m.Path) {
 			processContextInfo = readProcessContext(m.Vaddr, pr, oldProcessContextInfo)
