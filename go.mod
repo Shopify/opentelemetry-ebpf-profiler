@@ -23,6 +23,7 @@ require (
 	github.com/minio/sha256-simd v1.0.1
 	github.com/moby/moby/api v1.55.0
 	github.com/open-telemetry/sig-profiling/profcheck v0.0.0-20260629153356-042ee818a398
+	github.com/parca-dev/usdt v0.0.2
 	github.com/peterbourgon/ff/v3 v3.4.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.43.0
