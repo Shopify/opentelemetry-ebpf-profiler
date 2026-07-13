@@ -671,6 +671,12 @@ const (
 	// Number of Go custom labels dropped because the label value was not valid UTF-8
 	IDGoLabelsDroppedInvalidValue = 294
 
+	// Number of heap allocs dropped in eBPF due to per-PID live-heap cap
+	IDHeapPerPIDLimitHit = 299
+
+	// Number of heap allocs dropped in eBPF due to global live-heap map full
+	IDHeapLiveMapFull = 300
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 295
+	IDMax = 297
 )
