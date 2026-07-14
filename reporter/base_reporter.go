@@ -52,6 +52,11 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 	case support.TraceOriginSampling:
 	case support.TraceOriginOffCPU:
 	case support.TraceOriginProbe:
+	case support.TraceOriginHeapAlloc:
+	case support.TraceOriginHeapFree:
+		// Free events are consumed by the live heap tracker, not the
+		// reporter's alloc-profile pipeline. Nothing to record here.
+		return nil
 	default:
 		return fmt.Errorf("skip reporting trace for %d origin: %w", meta.Origin,
 			errUnknownOrigin)
@@ -97,14 +102,21 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 	if events, exists := rtp.Events[meta.Origin][sampleKey]; exists {
 		events.Timestamps = append(events.Timestamps, uint64(meta.Timestamp))
 		events.Values = append(events.Values, meta.Value)
+		if meta.Origin == support.TraceOriginHeapAlloc {
+			events.AllocSizes = append(events.AllocSizes, meta.AllocSize)
+		}
 		return nil
 	}
 
-	rtp.Events[meta.Origin][sampleKey] = &samples.TraceEvents{
+	newEvents := &samples.TraceEvents{
 		Frames:     trace.Frames,
 		Timestamps: []uint64{uint64(meta.Timestamp)},
 		Values:     []int64{meta.Value},
 		Labels:     trace.CustomLabels,
 	}
+	if meta.Origin == support.TraceOriginHeapAlloc {
+		newEvents.AllocSizes = []int64{meta.AllocSize}
+	}
+	rtp.Events[meta.Origin][sampleKey] = newEvents
 	return nil
 }
