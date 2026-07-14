@@ -692,6 +692,18 @@ const (
 	// Number of heap allocs dropped in eBPF due to global live-heap map full
 	IDHeapLiveMapFull = 301
 
+	// Current number of live heap entries tracked globally
+	IDLiveHeapEntries = 302
+
+	// Number of heap alloc samples dropped due to global live-set cap
+	IDLiveHeapDroppedAllocs = 303
+
+	// Number of heap malloc samples received per reporting interval
+	IDHeapAllocSamples = 304
+
+	// Number of heap free samples received per reporting interval
+	IDHeapFreeSamples = 305
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 302
+	IDMax = 306
 )

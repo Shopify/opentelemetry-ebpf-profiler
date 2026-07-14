@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind"
@@ -71,7 +72,7 @@ func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monit
 	executableUnloadDelay time.Duration, ebpf pmebpf.EbpfHandler, traceReporter reporter.TraceReporter,
 	exeReporter reporter.ExecutableReporter, sdp nativeunwind.StackDeltaProvider,
 	filterErrorFrames bool, includeEnvVars libpf.Set[string],
-	usdtMgr *usdt.Manager) (*ProcessManager, error) {
+	usdtMgr *usdt.Manager, liveHeapTracker *liveheap.Tracker) (*ProcessManager, error) {
 	if exeReporter == nil {
 		exeReporter = executableReporterStub{}
 	}
@@ -127,6 +128,7 @@ func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monit
 		usdtManager:              usdtMgr,
 		usdtInstances:            make(map[libpf.PID]*usdt.Instance),
 		cleanupSem:               make(chan struct{}, maxConcurrentPIDCleanups),
+		liveHeapTracker:          liveHeapTracker,
 	}
 
 	collectInterpreterMetrics(ctx, pm, monitorInterval)
@@ -195,6 +197,10 @@ func collectInterpreterMetrics(ctx context.Context, pm *ProcessManager,
 
 		summary.Add(dotnet.GetAndResetMetrics())
 		summary.Add(pm.ebpf.CollectMetrics())
+
+		if pm.liveHeapTracker != nil {
+			summary.Add(pm.liveHeapTracker.GetAndResetMetrics())
+		}
 
 		pm.eim.UpdateMetricSummary(summary)
 		pm.metricsAddSlice(metricSummaryToSlice(summary))
@@ -375,7 +381,8 @@ func hashFrameCacheKey(fk frameCacheKey) uint32 {
 // is not re-entrant due to frameCache not being synced. If the tracer is
 // later updated to distribute trace handling to goroutine pool, the caching
 // strategy needs to be updated accordingly.
-func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
+// Returns the computed trace hash and symbolized frames.
+func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) (libpf.TraceHash, libpf.Frames) {
 	meta := &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(times.KTime(bpfTrace.KTime).UnixNano()),
 		Comm:           bpfTrace.Comm,
@@ -455,4 +462,6 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	if err := pm.traceReporter.ReportTraceEvent(trace, meta); err != nil {
 		log.Errorf("Failed to report trace event: %v", err)
 	}
+
+	return trace.Hash, trace.Frames
 }

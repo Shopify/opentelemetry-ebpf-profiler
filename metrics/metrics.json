@@ -2202,5 +2202,33 @@
     "name": "HeapLiveMapFull",
     "field": "bpf.heap.live_map_full",
     "id": 301
+  },
+  {
+    "description": "Current number of live heap entries tracked globally",
+    "type": "gauge",
+    "name": "LiveHeapEntries",
+    "field": "agent.liveheap.entries",
+    "id": 302
+  },
+  {
+    "description": "Number of heap alloc samples dropped due to global live-set cap",
+    "type": "counter",
+    "name": "LiveHeapDroppedAllocs",
+    "field": "agent.liveheap.dropped_allocs",
+    "id": 303
+  },
+  {
+    "description": "Number of heap malloc samples received per reporting interval",
+    "type": "counter",
+    "name": "HeapAllocSamples",
+    "field": "agent.heap.alloc_samples",
+    "id": 304
+  },
+  {
+    "description": "Number of heap free samples received per reporting interval",
+    "type": "counter",
+    "name": "HeapFreeSamples",
+    "field": "agent.heap.free_samples",
+    "id": 305
   }
 ]
