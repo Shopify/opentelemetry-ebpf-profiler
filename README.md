@@ -31,7 +31,12 @@ coredump new -core core.tarantool-arm64 -sysroot <sysroot> \
 
 `cores/core.tarantool-{amd64,arm64}-jitoff.gz` were captured with
 `jit.off(true,true)` (interpreter execution). They back the unskipped amd64 and
-arm64 fixtures in #317. Regenerate a test and module bundle with:
+arm64 fixtures in #317. The arm64 core was recaptured in an architecture-matched
+container from image manifest
+`sha256:8f9bd6a85d48c1cdf266095b9331eefb75262db2d029a0bf6532efdb6415bfdd`
+while the byte-identical
+workload was inside recursive `fib`; its uncompressed core ID is `1bf4f24e...`.
+Regenerate a test and module bundle with:
 
 ```text
 coredump new -core <core> -sysroot <tarantool+libs> \
@@ -41,16 +46,17 @@ coredump new -core <core> -sysroot <tarantool+libs> \
 ## PR #317 replay bundle
 
 `artifacts/parca-tarantool-luajit-pr317.tar` contains the two pre-packed cores
-and ten pre-packed modules in the coredump tool's zstpak format, plus manifests,
-transport checksums, and fixture copies synchronized with #317 head `836a2176`.
-The amd64 golden includes `main+19`; the arm64 golden terminates cleanly after
-`tarantool+0x4460df`. Copy `module-store/*` directly into
+and eleven pre-packed modules in the coredump tool's zstpak format, plus
+manifests, transport checksums, and fixture copies synchronized with #317 head
+`9dddbd76`. The amd64 and arm64 goldens contain 20 and 24 recursive `fib`
+frames, respectively; both recover `hot_loop -> main`, and arm64 terminates
+cleanly after `tarantool+0x4460df`. Copy `module-store/*` directly into
 `tools/coredump/modulecache/`; do not decompress the individual objects.
 
 Archive SHA-256:
 
 ```text
-ed7911ecfa6775b67c3b743587e8e757f7cd36ab4d89eeb8a7e7d2c73d20e840
+66ecff0997a916417a6b93d772b40cb03e2900969677b966ef2579da4d571453
 ```
 
 See the archive's `README.md` and PR #317 for architecture-matched replay
