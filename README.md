@@ -41,14 +41,16 @@ coredump new -core <core> -sysroot <tarantool+libs> \
 ## PR #317 replay bundle
 
 `artifacts/parca-tarantool-luajit-pr317.tar` contains the two pre-packed cores
-and ten pre-packed modules in the coredump tool's zstpak format, plus manifests
-and transport checksums. Copy its `module-store/*` files directly into
+and ten pre-packed modules in the coredump tool's zstpak format, plus manifests,
+transport checksums, and fixture copies synchronized with #317 head `836a2176`.
+The amd64 golden includes `main+19`; the arm64 golden terminates cleanly after
+`tarantool+0x4460df`. Copy `module-store/*` directly into
 `tools/coredump/modulecache/`; do not decompress the individual objects.
 
 Archive SHA-256:
 
 ```text
-ce9a4e285df58d9eb3cd3706fb851f50bc06011d1c5850eb02848991fe3e1869
+ed7911ecfa6775b67c3b743587e8e757f7cd36ab4d89eeb8a7e7d2c73d20e840
 ```
 
 See the archive's `README.md` and PR #317 for architecture-matched replay
