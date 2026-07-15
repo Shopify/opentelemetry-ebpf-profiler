@@ -64,6 +64,9 @@ type luajitData struct {
 	// Size to step over a JIT trace's C frame on the native handback. On x86 this
 	// is the extracted interpreter cframe plus the interp-to-trace transition.
 	cframeSizeJIT uint16
+	// Offset of the previous-C-frame link. Tarantool's x64 VM frame has two
+	// additional words before this link compared with OpenResty/standard LuaJIT.
+	cframePrevOffset uint16
 }
 
 type luajitInstance struct {
@@ -106,6 +109,7 @@ func (d *luajitData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, _ libpf
 		G2jitbase:          d.g2jitbase,
 		Cframe_size_interp: d.cframeSizeInterp,
 		Interp_fp:          d.interpFP,
+		Cframe_prev_offset: d.cframePrevOffset,
 	}
 	if err := ebpf.UpdateProcData(libpf.LuaJIT, pid, unsafe.Pointer(&cdata)); err != nil {
 		return nil, err
@@ -186,7 +190,9 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	}
 	logf("lj: interp range %v", luaInterp)
 
-	ljd := &luajitData{}
+	ljd := &luajitData{
+		cframePrevOffset: cframePrevOffsetForExecutable(base),
+	}
 	// Derive the interpreter C-frame unwind from the VM region's own stack
 	// delta. The hardcoded LuaJIT constants do not match every embedding.
 	if param, fp, ok := interpCframeUnwind(info.Deltas(), luaInterp.Start); ok {
@@ -218,6 +224,15 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	}
 
 	return ljd, nil
+}
+
+func cframePrevOffsetForExecutable(base string) uint16 {
+	// Match Loader's exact executable-name contract. A renamed binary is not
+	// recognized as Tarantool by the loader and must not receive its layout.
+	if base == "tarantool" {
+		return tarantoolCframePrevOffset
+	}
+	return defaultCframePrevOffset
 }
 
 // LuaJIT's interpreter isn't a function, its a raw chunk of assembly code with direct threaded
