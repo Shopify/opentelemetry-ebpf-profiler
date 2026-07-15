@@ -297,6 +297,37 @@ currently support adding maps in an  automated fashion. The best way to do this
 is to look through existing code in this package and to see where existing code 
 refers to particular BPF maps.
 
+## LuaJIT (Tarantool) coredumps
+
+The `luajit-tarantool-*` cases exercise the LuaJIT unwinder against a
+statically linked, GC64 Tarantool running a recursive Lua workload. They verify
+host-executable detection, hidden-symbol offset extraction, Lua frame recovery,
+and the native handback across a Tarantool fiber on amd64 and arm64.
+
+A few details are intentional:
+
+- The snapshots were captured with `jit.off(true, true)`, so the sampled thread
+  stays in the bytecode interpreter. Offline coredump replay is currently
+  single-pass and cannot perform the live `report_pid -> SynchronizeMappings`
+  cycle that associates an anonymous JIT-mcode mapping with `G`. The
+  interpreter path reads `L` from the saved VM frame and is deterministic. JIT
+  mcode is covered by live profiling and direct extractor tests.
+- Tarantool statically links LuaJIT. These fixtures therefore depend on the
+  Tarantool host detection added by the parent PR rather than a separate
+  `libluajit-5.1.so` mapping.
+- The single `?+0x0` frame at the native/Lua boundary is expected. The replay
+  symbolizer renders the synthetic LuaJIT interpreter-routing FileID this way;
+  live profiling resolves the corresponding location to `tarantool+offset`.
+  The Lua source frames themselves resolve normally.
+- The arm64 golden ends with `native_stack_delta_invalid` at Tarantool's fiber
+  context-switch trampoline, which lacks usable CFI. The amd64 golden unwinds
+  through the native fiber entry.
+
+The core and module bundles are stored outside Git. Upload them to the Parca
+coredump artifact bucket before expecting these cases to pass in CI. Their raw
+captures and regeneration notes are backed up on Shopify's
+`dale/luajit-coredump-data` branch.
+
 ## Parca extension: fallback GCS bucket
 
 Currently, we have a GCS bucket called `parca-coredump-artifacts` that we can fall back to
