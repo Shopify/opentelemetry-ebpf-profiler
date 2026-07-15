@@ -1,12 +1,13 @@
-# LuaJIT coredump test data (backup)
+# LuaJIT coredump test data
 
 Compressed live coredumps captured from the GC64 tarantool **fib/churn** test
-workload on staging, for building `tools/coredump` LuaJIT regression tests.
+workload on staging, plus the pre-packed local-validation bundle for
+`parca-dev/opentelemetry-ebpf-profiler#317`.
 
-This is a **temporary backup branch** until the cores are uploaded to the
-coredump module store (OCI `ebpf-profiling-coredumps`, via the drive-folder
-upload). The `coredump new` test cases live on the LuaJIT branches (#49); these
-are the raw cores they were/will be built from.
+This isolated data branch keeps large test artifacts out of the PR's review
+history while the cores and modules await canonical coredump-store publication.
+The `coredump new` test cases live in #317; the files here let maintainers replay
+them without artifact-store access.
 
 ## Cores
 | file | arch | source pod | tarantool build-id |
@@ -27,8 +28,28 @@ coredump new -core core.tarantool-arm64 -sysroot <sysroot> \
 ```
 
 ## jit-off interpreter cores (used by the committed tests)
-`cores/core.tarantool-{amd64,arm64}-jitoff.gz` — captured with `jit.off(true,true)` (interpreter
-execution). This is the core behind the committed `testdata/arm64/luajit-tarantool-arm64.json`
-(skipped pending upload). Regenerate the test + module bundle deterministically with:
-`coredump new -core <core> -sysroot <tarantool+libs> -luajit-executables tarantool -name luajit-tarantool-arm64`,
-then `coredump upload -all` and remove the test's `skip`.
+
+`cores/core.tarantool-{amd64,arm64}-jitoff.gz` were captured with
+`jit.off(true,true)` (interpreter execution). They back the unskipped amd64 and
+arm64 fixtures in #317. Regenerate a test and module bundle with:
+
+```text
+coredump new -core <core> -sysroot <tarantool+libs> \
+  -name luajit-tarantool-<arch>
+```
+
+## PR #317 replay bundle
+
+`artifacts/parca-tarantool-luajit-pr317.tar` contains the two pre-packed cores
+and ten pre-packed modules in the coredump tool's zstpak format, plus manifests
+and transport checksums. Copy its `module-store/*` files directly into
+`tools/coredump/modulecache/`; do not decompress the individual objects.
+
+Archive SHA-256:
+
+```text
+ce9a4e285df58d9eb3cd3706fb851f50bc06011d1c5850eb02848991fe3e1869
+```
+
+See the archive's `README.md` and PR #317 for architecture-matched replay
+commands.
