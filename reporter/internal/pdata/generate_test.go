@@ -972,7 +972,7 @@ func TestHeapAllocObjectsUsesAllocSizeWeighting(t *testing.T) {
 // tier, and the comparator must be antisymmetric and only equal for equal keys.
 func TestCompareSampleKeys(t *testing.T) {
 	base := samples.SampleKey{
-		Comm:    libpf.Intern("comm"),
+		Comm:    libpf.NewCommFromString("comm"),
 		Hash:    libpf.NewTraceHash(1, 1),
 		TID:     10,
 		CPU:     20,
@@ -993,7 +993,7 @@ func TestCompareSampleKeys(t *testing.T) {
 		name  string
 		other samples.SampleKey
 	}{
-		{"comm", with(func(k *samples.SampleKey) { k.Comm = libpf.Intern("zzz") })},
+		{"comm", with(func(k *samples.SampleKey) { k.Comm = libpf.NewCommFromString("zzz") })},
 		{"hash", with(func(k *samples.SampleKey) { k.Hash = libpf.NewTraceHash(1, 2) })},
 		{"tid", with(func(k *samples.SampleKey) { k.TID = 11 })},
 		{"cpu", with(func(k *samples.SampleKey) { k.CPU = 21 })},
@@ -1057,7 +1057,7 @@ func TestGenerate_HeapAllocProfilesAligned(t *testing.T) {
 	allocEvents := samples.SampleToEvents{}
 	for i := 0; i < n; i++ {
 		key := samples.SampleKey{
-			Comm: libpf.Intern("comm"),
+			Comm: libpf.NewCommFromString("comm"),
 			Hash: libpf.NewTraceHash(uint64(i), uint64(i+1)),
 			TID:  int64(i),
 		}
