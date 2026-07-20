@@ -141,6 +141,14 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	})
 	assert.Len(t, hooks, 2, "distinct USDT providers are distinct hooks")
 
+	hooks = appendHookIfMissing([]Hook{{
+		Type: HookTypeUSDT, Provider: ExperimentalShimProvider, Name: "alloc",
+	}}, Hook{
+		Type: HookTypeUSDT, ABI: ABIWeightedAllocation,
+		Provider: ExperimentalShimProvider, Name: "alloc",
+	})
+	assert.Len(t, hooks, 1, "an omitted event-default ABI must not duplicate an injected hook")
+
 	var mode InjectionMode
 	require.NoError(t, mode.Set("GOT"))
 	assert.Equal(t, InjectionGOT, mode)

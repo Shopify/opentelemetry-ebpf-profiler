@@ -343,7 +343,10 @@ func (cfg *Config) ApplyDefaults() {
 
 func appendHookIfMissing(hooks []Hook, candidate Hook) []Hook {
 	for _, hook := range hooks {
-		if hook.Type == candidate.Type && hook.ABI == candidate.ABI &&
+		// ABI is normalized after defaults are applied. Treat an otherwise
+		// identical hook with an omitted event-default ABI as already present.
+		if hook.Type == candidate.Type &&
+			(hook.ABI == "" || hook.ABI == candidate.ABI) &&
 			hook.Provider == candidate.Provider && hook.Name == candidate.Name &&
 			hook.Executable == candidate.Executable && hook.Symbol == candidate.Symbol {
 			return hooks

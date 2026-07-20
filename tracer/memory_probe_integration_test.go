@@ -18,6 +18,7 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	"go.opentelemetry.io/ebpf-profiler/process"
@@ -187,6 +188,7 @@ int main(void) {
 		ProbesConfig: probes, SamplesPerSecond: 20,
 		ProbabilisticInterval: 100, ProbabilisticThreshold: 100,
 		OffCPUThreshold: uint32(math.MaxUint32 / 100),
+		LiveHeapTracker: liveheap.NewTracker(1024),
 	})
 	require.NoError(t, err)
 	defer func() { cancel(); tr.Close() }()
@@ -314,6 +316,7 @@ int main(void) {
 		ProbesConfig: probes, SamplesPerSecond: 20,
 		ProbabilisticInterval: 100, ProbabilisticThreshold: 100,
 		OffCPUThreshold: uint32(math.MaxUint32 / 100),
+		LiveHeapTracker: liveheap.NewTracker(1024),
 	})
 	require.NoError(t, err)
 	defer func() { cancel(); tr.Close() }()
