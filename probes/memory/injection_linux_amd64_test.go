@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -132,6 +133,62 @@ func TestPtraceSessionCloseRecoversRunningTracee(t *testing.T) {
 		<-done
 		t.Fatal("detached tracee remained stopped")
 	}
+}
+
+func TestPtraceRemoteCallHandlesTargetExit(t *testing.T) {
+	compiler, err := exec.LookPath("cc")
+	if err != nil {
+		t.Skip("C compiler unavailable for ptrace target")
+	}
+	dir := t.TempDir()
+	source := filepath.Join(dir, "remote-call-exit.c")
+	target := filepath.Join(dir, "remote-call-exit")
+	require.NoError(t, os.WriteFile(source, []byte(`#include <stdio.h>
+#include <unistd.h>
+__attribute__((noinline, visibility("default")))
+void remote_wait(void) { for (;;) pause(); }
+int main(void) {
+  printf("%p\n", (void *)remote_wait);
+  fflush(stdout);
+  for (;;) pause();
+}
+`), 0o600))
+	build := exec.Command(compiler, "-O0", "-g", "-fno-pie", "-no-pie",
+		"-o", target, source)
+	output, err := build.CombinedOutput()
+	require.NoError(t, err, string(output))
+
+	cmd := exec.Command(target)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	scanner := bufio.NewScanner(stdout)
+	require.True(t, scanner.Scan(), "target did not publish remote function address")
+	remoteAddr, err := strconv.ParseUint(strings.TrimPrefix(scanner.Text(), "0x"), 16, 64)
+	require.NoError(t, err)
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	session, err := attachThreads(cmd.Process.Pid, []int{cmd.Process.Pid})
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		t.Skipf("ptrace unavailable: %v", err)
+	}
+	require.NoError(t, err)
+	defer func() { _ = session.Close() }()
+
+	killDone := make(chan error, 1)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		killDone <- cmd.Process.Kill()
+	}()
+	_, callErr := session.Call(remoteAddr)
+	require.Error(t, callErr, "remote call unexpectedly survived target exit")
+	require.NoError(t, <-killDone)
+	require.NoError(t, session.Close(), "exited tracee was not cleaned up")
 }
 
 func TestRequiredAllocatorPatchesPresent(t *testing.T) {
