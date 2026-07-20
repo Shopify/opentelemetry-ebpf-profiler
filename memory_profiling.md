@@ -181,7 +181,11 @@ explicitly unsafe fallback modes are available on Linux x86-64:
 
 Both require `--heap-profiling` and at least one `--heap-process-executable` selector. They
 are disabled by default and attempted at most once per eligible PID, only after no producer
-allocation hook was discovered.
+allocation hook was discovered. The profiler must also have permission to ptrace the target
+(typically `CAP_SYS_PTRACE`, with compatible Yama and seccomp policy) and to open the
+injected mapping through `/proc/<pid>/map_files` (typically `CAP_CHECKPOINT_RESTORE` or
+`CAP_SYS_ADMIN` on current kernels). Mutation can succeed while later probe discovery fails
+if the latter access is missing; the one-attempt rule still prevents automatic reinjection.
 
 The injector validates and snapshots a non-writable x86-64 shim, ptrace-stops a target
 thread, creates a memfd inside the target, copies the snapshot into it, and remotely invokes
