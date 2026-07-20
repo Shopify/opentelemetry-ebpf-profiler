@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libc"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
@@ -70,6 +71,15 @@ type testEbpfHandler struct {
 		prefix lpm.Prefix
 		fileID uint64
 		bias   uint64
+	}
+	heapLivePIDUpdates []struct {
+		pid     libpf.PID
+		enabled bool
+	}
+	heapPIDAllocCountDeletes []libpf.PID
+	heapAllocLiveDeletes     []struct {
+		pid  libpf.PID
+		ptrs []uint64
 	}
 }
 
@@ -145,11 +155,23 @@ func (h *testEbpfHandler) SupportsLPMTrieBatchOperations() bool {
 	return false
 }
 
-func (h *testEbpfHandler) SetHeapLivePID(libpf.PID, bool) {}
+func (h *testEbpfHandler) SetHeapLivePID(pid libpf.PID, enabled bool) {
+	h.heapLivePIDUpdates = append(h.heapLivePIDUpdates, struct {
+		pid     libpf.PID
+		enabled bool
+	}{pid: pid, enabled: enabled})
+}
 
-func (h *testEbpfHandler) DeleteHeapAllocLiveEntries(libpf.PID, []uint64) {}
+func (h *testEbpfHandler) DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64) {
+	h.heapAllocLiveDeletes = append(h.heapAllocLiveDeletes, struct {
+		pid  libpf.PID
+		ptrs []uint64
+	}{pid: pid, ptrs: append([]uint64(nil), ptrs...)})
+}
 
-func (h *testEbpfHandler) DeleteHeapPIDAllocCount(libpf.PID) {}
+func (h *testEbpfHandler) DeleteHeapPIDAllocCount(pid libpf.PID) {
+	h.heapPIDAllocCountDeletes = append(h.heapPIDAllocCountDeletes, pid)
+}
 
 func (h *testEbpfHandler) SetHeapPIDAllocLimit(uint32)    {}
 func (h *testEbpfHandler) SetHeapSamplingInterval(uint32) {}
@@ -412,6 +434,37 @@ func TestProcessPIDExitRemovesInterpreters(t *testing.T) {
 
 	pm.processPIDExit(pid)
 	require.NotContains(pm.interpreters, pid)
+}
+
+func TestProcessPIDExitCleansLiveHeapState(t *testing.T) {
+	pid := libpf.PID(123)
+	const ptr = uint64(0xdeadbeef)
+	ebpf := &testEbpfHandler{}
+	tracker := liveheap.NewTracker(0)
+	tracker.SetPIDLiveHeapSupport(pid, true)
+	tracker.HandleAlloc(pid, ptr, libpf.NewTraceHash(0, 1), 100, nil)
+	require.Equal(t, 1, tracker.LiveCount())
+	pm := &ProcessManager{
+		ebpf:             ebpf,
+		pidToProcessInfo: map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:       make(map[libpf.PID]times.KTime),
+		interpreters:     make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
+		liveHeapTracker:  tracker,
+		cleanupSem:       make(chan struct{}, 1),
+	}
+
+	pm.processPIDExit(pid)
+	pm.cleanupWG.Wait()
+
+	assert.Zero(t, tracker.LiveCount())
+	assert.Equal(t, []struct {
+		pid     libpf.PID
+		enabled bool
+	}{{pid: pid, enabled: false}}, ebpf.heapLivePIDUpdates)
+	assert.Equal(t, []libpf.PID{pid}, ebpf.heapPIDAllocCountDeletes)
+	require.Len(t, ebpf.heapAllocLiveDeletes, 1)
+	assert.Equal(t, pid, ebpf.heapAllocLiveDeletes[0].pid)
+	assert.Equal(t, []uint64{ptr}, ebpf.heapAllocLiveDeletes[0].ptrs)
 }
 
 func TestSynchronizeProcessUpdatesAnonymousMappingInterest(t *testing.T) {

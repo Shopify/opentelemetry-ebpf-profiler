@@ -145,6 +145,42 @@ func TestPtraceSessionCloseRecoversRunningTracee(t *testing.T) {
 	}
 }
 
+func TestConsumePendingRecoveryStopKeepsTraceeRunnableAfterDetach(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	cmd := exec.Command("sleep", "30")
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	session, err := attachThreads(cmd.Process.Pid, []int{cmd.Process.Pid})
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		t.Skipf("ptrace unavailable: %v", err)
+	}
+	require.NoError(t, err)
+	defer func() { _ = session.Close() }()
+
+	// Simulate the timeout race: the tracee is already in another ptrace stop
+	// when the recovery SIGSTOP is generated, so that stop remains pending.
+	require.NoError(t, unix.Tgkill(cmd.Process.Pid, cmd.Process.Pid, unix.SIGSTOP))
+	require.NoError(t, consumePendingRecoveryStop(cmd.Process.Pid, cmd.Process.Pid))
+	require.NoError(t, session.Close())
+
+	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatal("detached tracee remained stopped by the recovery SIGSTOP")
+	}
+}
+
 func TestPtraceRemoteCallHandlesTargetExit(t *testing.T) {
 	compiler, err := exec.LookPath("cc")
 	if err != nil {

@@ -581,6 +581,16 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 	}
 
 	tid := s.threads[0]
+	var recoveryStopPending bool
+	// Register this before the stack/register restoration defers below so it
+	// runs last: consuming the recovery SIGSTOP briefly resumes the tracee.
+	defer func() {
+		if recoveryStopPending {
+			if err := consumePendingRecoveryStop(s.leader, tid); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("consume pending recovery stop: %w", err))
+			}
+		}
+	}()
 	var saved unix.PtraceRegs
 	if err := unix.PtraceGetRegs(tid, &saved); err != nil {
 		return 0, fmt.Errorf("get registers: %w", err)
@@ -652,7 +662,8 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 		return 0, fmt.Errorf("continue remote call: %w", err)
 	}
 
-	status, err := waitForPtraceStop(s.leader, tid, remoteCallTimeout)
+	status, pendingStop, err := waitForPtraceStop(s.leader, tid, remoteCallTimeout)
+	recoveryStopPending = pendingStop
 	if err != nil {
 		return 0, err
 	}
@@ -670,37 +681,96 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 	return regs.Rax, nil
 }
 
-func waitForPtraceStop(tgid, tid int, timeout time.Duration) (unix.WaitStatus, error) {
+func waitForPtraceStop(tgid, tid int, timeout time.Duration) (
+	unix.WaitStatus, bool, error,
+) {
 	status, stopped, err := pollWaitStatus(tid, timeout)
 	if err != nil {
-		return 0, fmt.Errorf("wait for remote call: %w", err)
+		return 0, false, fmt.Errorf("wait for remote call: %w", err)
 	}
 	if stopped {
-		return status, nil
+		return status, false, nil
 	}
 
 	stopErr := unix.Tgkill(tgid, tid, unix.SIGSTOP)
 	recoveredStatus, recovered, recoveryErr := pollWaitStatus(tid, ptraceStopRecoveryTime)
+	pendingStop := false
 	if recovered {
 		status = recoveredStatus
+		// If another ptrace stop won the race after SIGSTOP was sent, the
+		// job-control stop remains pending. call() consumes it only after the
+		// target stack and registers have been restored.
+		pendingStop = stopErr == nil && status.Stopped() && status.StopSignal() != unix.SIGSTOP
 		// The function may have returned through the intentional null-page fault
 		// just after the deadline. Let call() validate RIP/RSP and retain RAX
 		// rather than reporting a completed mutation as a permanent failure.
 		if potentialRemoteReturnStop(status) {
-			return status, nil
+			return status, pendingStop, nil
 		}
 	}
 	if recoveryCause := errors.Join(stopErr, recoveryErr); recoveryCause != nil {
-		return status, fmt.Errorf(
+		return status, pendingStop, fmt.Errorf(
 			"remote call timed out after %s; recovery stop=%t: %w",
 			timeout, recovered, recoveryCause)
 	}
-	return status, fmt.Errorf("remote call timed out after %s; recovery stop=%t",
+	return status, pendingStop, fmt.Errorf("remote call timed out after %s; recovery stop=%t",
 		timeout, recovered)
 }
 
 func potentialRemoteReturnStop(status unix.WaitStatus) bool {
 	return status.Stopped() && status.StopSignal() == unix.SIGSEGV
+}
+
+func consumePendingRecoveryStop(tgid, tid int) error {
+	// The tracee is currently in a different ptrace stop. Resume with signal 0
+	// until the timeout-recovery SIGSTOP is observed, thereby suppressing it
+	// instead of leaving an untraced process job-control-stopped after detach.
+	currentlyStopped := true
+	for range 4 {
+		if err := unix.PtraceCont(tid, 0); err != nil {
+			return err
+		}
+		currentlyStopped = false
+		status, observed, err := pollWaitStatus(tid, ptraceStopRecoveryTime)
+		if err != nil {
+			return err
+		}
+		if !observed {
+			break
+		}
+		if status.Exited() || status.Signaled() {
+			return nil
+		}
+		currentlyStopped = status.Stopped()
+		if currentlyStopped && status.StopSignal() == unix.SIGSTOP {
+			return nil
+		}
+	}
+
+	// The original signal should already be pending, but leave the session in
+	// a known ptrace stop even if signal ordering was unusual.
+	if currentlyStopped {
+		if err := unix.PtraceCont(tid, 0); err != nil {
+			return err
+		}
+	}
+	if err := unix.Tgkill(tgid, tid, unix.SIGSTOP); err != nil {
+		return err
+	}
+	status, observed, err := pollWaitStatus(tid, ptraceStopRecoveryTime)
+	if err != nil {
+		return err
+	}
+	if !observed {
+		return errors.New("timed out waiting to consume recovery stop")
+	}
+	if status.Exited() || status.Signaled() {
+		return nil
+	}
+	if !status.Stopped() || status.StopSignal() != unix.SIGSTOP {
+		return fmt.Errorf("unexpected recovery stop status: %v", status)
+	}
+	return nil
 }
 
 // pollWaitStatus bounds every ptrace wait. The boolean reports whether Wait4

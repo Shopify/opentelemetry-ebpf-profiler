@@ -1133,7 +1133,13 @@ func TestGenerate_InuseProfiles(t *testing.T) {
 	// per-PID ResourceProfiles.
 	tree := make(samples.TraceEventsTree)
 	profiles, err := d.Generate(tree, "agent", "v1",
-		testCollectionStart, testCollectionEnd, inuse, nil)
+		testCollectionStart, testCollectionEnd, inuse, func(pid libpf.PID) liveheap.ProcessMeta {
+			require.Equal(t, libpf.PID(42), pid)
+			return liveheap.ProcessMeta{
+				ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+				ContainerID:    libpf.Intern("container-42"),
+			}
+		})
 	require.NoError(t, err)
 
 	require.Equal(t, 1, profiles.ResourceProfiles().Len())
@@ -1141,6 +1147,15 @@ func TestGenerate_InuseProfiles(t *testing.T) {
 	pidVal, ok := rp.Resource().Attributes().Get(string(semconv.ProcessPIDKey))
 	require.True(t, ok, "inuse resource must carry the process PID")
 	assert.Equal(t, int64(42), pidVal.Int())
+	pathVal, ok := rp.Resource().Attributes().Get(string(semconv.ProcessExecutablePathKey))
+	require.True(t, ok)
+	assert.Equal(t, "/usr/bin/ruby", pathVal.Str())
+	nameVal, ok := rp.Resource().Attributes().Get(string(semconv.ProcessExecutableNameKey))
+	require.True(t, ok)
+	assert.Equal(t, "ruby", nameVal.Str())
+	containerVal, ok := rp.Resource().Attributes().Get(string(semconv.ContainerIDKey))
+	require.True(t, ok)
+	assert.Equal(t, "container-42", containerVal.Str())
 
 	require.Equal(t, 1, rp.ScopeProfiles().Len())
 	sp := rp.ScopeProfiles().At(0)
@@ -1158,12 +1173,16 @@ func TestGenerate_InuseProfiles(t *testing.T) {
 	assert.Equal(t, "bytes", strings.At(int(space.SampleType().UnitStrindex())))
 	require.Equal(t, 1, space.Samples().Len())
 	assert.Equal(t, []int64{4096}, space.Samples().At(0).Values().AsRaw())
+	assert.Equal(t, []uint64{uint64(testCollectionEnd.UnixNano())},
+		space.Samples().At(0).TimestampsUnixNano().AsRaw())
 
 	objects, ok := byType["inuse_objects"]
 	require.True(t, ok, "inuse_objects profile present")
 	assert.Equal(t, "count", strings.At(int(objects.SampleType().UnitStrindex())))
 	require.Equal(t, 1, objects.Samples().Len())
 	assert.Equal(t, []int64{3}, objects.Samples().At(0).Values().AsRaw())
+	assert.Equal(t, []uint64{uint64(testCollectionEnd.UnixNano())},
+		objects.Samples().At(0).TimestampsUnixNano().AsRaw())
 
 	// The only frames in this request are the inuse ones, so the presence of
 	// these attribute keys proves appendInuseProfiles attached them (via the
