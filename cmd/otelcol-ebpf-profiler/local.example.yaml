@@ -14,6 +14,36 @@
 #   - mounting kernel-related filesystems (e.g. /sys, /proc) as needed
 receivers:
   profiling:
+    # Memory profiling is default-off. A weighted USDT producer is the
+    # low-overhead path; a raw allocation uprobe uses paired malloc entry/return
+    # probes and has per-call breakpoint overhead.
+    # probes:
+    #   memory:
+    #     enabled: true
+    #     live: false
+    #     sampling_interval_bytes: 524288
+    #     # Required when direct allocator uprobes are configured:
+    #     process_executables: [ruby*]
+    #     allocation_hooks:
+    #       - type: usdt
+    #         provider: ddheap
+    #         name: alloc
+    #       # Direct malloc instrumentation (experimental, higher overhead):
+    #       # - type: uprobe
+    #       #   executable: libc.so.6
+    #       #   symbol: malloc
+    #       # A custom sampled entry function can explicitly set:
+    #       # - type: uprobe
+    #       #   abi: weighted_allocation
+    #       #   executable: libheap_sampler*.so
+    #       #   symbol: record_sampled_allocation
+    #     deallocation_hooks:
+    #       - type: usdt
+    #         provider: ddheap
+    #         name: free
+    #       # - type: uprobe
+    #       #   executable: libc.so.6
+    #       #   symbol: free
 
 exporters:
   otlp/local:

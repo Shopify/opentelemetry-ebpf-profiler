@@ -72,6 +72,9 @@ type EbpfHandler interface {
 
 	// SetHeapPIDAllocLimit writes the per-PID allocation limit to the eBPF map.
 	SetHeapPIDAllocLimit(limit uint32)
+
+	// SetHeapSamplingInterval configures direct allocator byte sampling.
+	SetHeapSamplingInterval(interval uint32)
 }
 
 func InterpreterOffsetKeyValue(ebpfProgIndex uint16, fileID host.FileID,

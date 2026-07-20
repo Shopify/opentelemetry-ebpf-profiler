@@ -62,7 +62,7 @@ type Tracker struct {
 	frames map[libpf.TraceHash]libpf.Frames
 
 	// liveHeapPIDs is the set of PIDs whose binary has the heap-sampler
-	// free probe attached (see usdt.ProbeHeapFree). Only these PIDs get
+	// deallocation hook attached (see memory.EventDeallocation). Only these PIDs get
 	// tracked; without the free probe, allocs would accumulate forever.
 	liveHeapPIDs map[libpf.PID]struct{}
 

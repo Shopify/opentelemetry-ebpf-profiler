@@ -15,12 +15,12 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	eim "go.opentelemetry.io/ebpf-profiler/processmanager/execinfomanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/times"
-	"go.opentelemetry.io/ebpf-profiler/usdt"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -126,16 +126,15 @@ type ProcessManager struct {
 	// that share the profiler's cgroup directory (e.g., private cgroup namespace).
 	selfContainerID libpf.String
 
-	// usdtManager handles per-process USDT (uprobe) attachment for heap
-	// profiling. May be nil if USDT support is disabled at startup.
-	usdtManager *usdt.Manager
+	// memoryProbeManager handles per-process USDT and raw uprobe attachment
+	// for memory profiling. It is nil when the memory custom probe is disabled.
+	memoryProbeManager *memory.Manager
 
-	// usdtInstances tracks the live USDT attachment state per PID. Mutated
-	// under pm.mu alongside the other per-PID maps. Entries are created/
-	// updated in SynchronizeProcess and torn down in processPIDExit.
-	usdtInstances map[libpf.PID]*usdt.Instance
+	// memoryProbeInstances tracks live attachment state per PID. Mutated under
+	// pm.mu alongside the other per-PID maps and cleaned up on process exit.
+	memoryProbeInstances map[libpf.PID]*memory.Instance
 
-	// cleanupWG tracks in-flight background cleanups (USDT detach, eBPF map
+	// cleanupWG tracks in-flight background cleanups (probe detach, eBPF map
 	// deletes) so Close can wait for them to drain on shutdown.
 	cleanupWG sync.WaitGroup
 
@@ -186,7 +185,7 @@ type processInfo struct {
 	// C-library Thread Specific Data information
 	libcInfo *libc.LibcInfo
 	// lastSeenTID is the most recent thread ID observed for this PID via
-	// a sync event. Used by ReconcileUSDTProbes to construct a Process
+	// a sync event. Used by ReconcileMemoryProbes to construct a Process
 	// that can fall back to /proc/<pid>/task/<tid>/maps when the main
 	// thread has exited.
 	lastSeenTID libpf.PID

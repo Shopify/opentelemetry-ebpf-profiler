@@ -11,6 +11,7 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/internal/linux"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
 )
 
@@ -42,37 +43,40 @@ func (e *ErrorMode) UnmarshalText(text []byte) error {
 
 // Config is the configuration for the collector.
 type Config struct {
-	ReporterInterval         time.Duration            `mapstructure:"reporter_interval"`
-	ReporterJitter           float64                  `mapstructure:"reporter_jitter"`
-	MonitorInterval          time.Duration            `mapstructure:"monitor_interval"`
-	SamplesPerSecond         int                      `mapstructure:"samples_per_second"`
-	ProbabilisticInterval    time.Duration            `mapstructure:"probabilistic_interval"`
-	ProbabilisticThreshold   uint                     `mapstructure:"probabilistic_threshold"`
-	Interpreters             interpreterconfig.Config `mapstructure:"interpreters"`
-	ClockSyncInterval        time.Duration            `mapstructure:"clock_sync_interval"`
-	SendErrorFrames          bool                     `mapstructure:"send_error_frames"`
-	SendIdleFrames           bool                     `mapstructure:"send_idle_frames"`
-	VerboseMode              bool                     `mapstructure:"verbose_mode"`
-	OffCPUThreshold          float64                  `mapstructure:"off_cpu_threshold"`
-	IncludeEnvVars           string                   `mapstructure:"include_env_vars"`
-	ProbeLinks               []string                 `mapstructure:"probe_links"`
-	LoadProbe                bool                     `mapstructure:"load_probe"`
-	HeapProfiling            bool                     `mapstructure:"heap_profiling"`
-	LiveHeapProfiling        bool                     `mapstructure:"live_heap_profiling"`
-	LiveHeapMaxEntriesPerPID int                      `mapstructure:"live_heap_max_entries_per_pid"`
-	MapScaleFactor           uint                     `mapstructure:"map_scale_factor"`
-	BPFVerifierLogLevel      uint                     `mapstructure:"bpf_verifier_log_level"`
-	NoKernelVersionCheck     bool                     `mapstructure:"no_kernel_version_check"`
-	MaxGRPCRetries           uint32                   `mapstructure:"max_grpc_retries"`
-	MaxRPCMsgSize            int                      `mapstructure:"max_rpc_msg_size"`
-	BPFFSRoot                string                   `mapstructure:"bpf_fs_root"`
-	ErrorMode                ErrorMode                `mapstructure:"error_mode"`
-	OBIProcessCtx            bool                     `mapstructure:"obi_process_ctx"`
+	ReporterInterval       time.Duration            `mapstructure:"reporter_interval"`
+	ReporterJitter         float64                  `mapstructure:"reporter_jitter"`
+	MonitorInterval        time.Duration            `mapstructure:"monitor_interval"`
+	SamplesPerSecond       int                      `mapstructure:"samples_per_second"`
+	ProbabilisticInterval  time.Duration            `mapstructure:"probabilistic_interval"`
+	ProbabilisticThreshold uint                     `mapstructure:"probabilistic_threshold"`
+	Interpreters           interpreterconfig.Config `mapstructure:"interpreters"`
+	ClockSyncInterval      time.Duration            `mapstructure:"clock_sync_interval"`
+	SendErrorFrames        bool                     `mapstructure:"send_error_frames"`
+	SendIdleFrames         bool                     `mapstructure:"send_idle_frames"`
+	VerboseMode            bool                     `mapstructure:"verbose_mode"`
+	OffCPUThreshold        float64                  `mapstructure:"off_cpu_threshold"`
+	IncludeEnvVars         string                   `mapstructure:"include_env_vars"`
+	ProbeLinks             []string                 `mapstructure:"probe_links"`
+	LoadProbe              bool                     `mapstructure:"load_probe"`
+	Probes                 probeconfig.Config       `mapstructure:"probes"`
+	MapScaleFactor         uint                     `mapstructure:"map_scale_factor"`
+	BPFVerifierLogLevel    uint                     `mapstructure:"bpf_verifier_log_level"`
+	NoKernelVersionCheck   bool                     `mapstructure:"no_kernel_version_check"`
+	MaxGRPCRetries         uint32                   `mapstructure:"max_grpc_retries"`
+	MaxRPCMsgSize          int                      `mapstructure:"max_rpc_msg_size"`
+	BPFFSRoot              string                   `mapstructure:"bpf_fs_root"`
+	ErrorMode              ErrorMode                `mapstructure:"error_mode"`
+	OBIProcessCtx          bool                     `mapstructure:"obi_process_ctx"`
 }
 
 // Validate validates the config.
 // This is automatically called by the config parser as it implements the xconfmap.Validator interface.
 func (cfg *Config) Validate() error {
+	cfg.Probes.ApplyDefaults()
+	if err := cfg.Probes.Validate(); err != nil {
+		return fmt.Errorf("invalid custom probes: %w", err)
+	}
+
 	if cfg.ErrorMode != IgnoreError && cfg.ErrorMode != PropagateError {
 		return fmt.Errorf("unknown error mode %q", cfg.ErrorMode)
 	}

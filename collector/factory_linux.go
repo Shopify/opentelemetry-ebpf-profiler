@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/internal/controller"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 )
 
 var errInvalidConfig = errors.New("invalid config")
@@ -44,6 +45,7 @@ func defaultConfig() component.Config {
 		ProbabilisticInterval:  1 * time.Minute,
 		ProbabilisticThreshold: 100,
 		Interpreters:           interpreterconfig.AllInterpreters(),
+		Probes:                 probeconfig.DefaultConfig(),
 		ClockSyncInterval:      3 * time.Minute,
 		MaxGRPCRetries:         5,
 		MaxRPCMsgSize:          32 << 20, // 32 MiB

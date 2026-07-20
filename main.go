@@ -109,7 +109,7 @@ func mainWithExitCode() exitCode {
 
 	// Create live heap tracker if enabled, shared between reporter and tracer.
 	var liveTracker *liveheap.Tracker
-	if cfg.LiveHeapProfiling {
+	if cfg.Probes.Memory.Live {
 		liveTracker = liveheap.NewTracker(liveheap.DefaultMaxEntries)
 	}
 

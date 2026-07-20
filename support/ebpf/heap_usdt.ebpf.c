@@ -1,33 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// USDT (uprobe) handlers for heap profiling.
+// Process-scoped entry handlers for memory profiling.
 //
-// Provider:  see usdt.ProbeProvider on the Go side. The current provider,
-//            "ddheap", is emitted by the reference sampler implementation
-//            we are testing this against on the Datadog side; this is
-//            expected to track the eventual OTel-standard memory-profiling
-//            provider name once defined.
+// Hook points are configured by probes/memory on the Go side. The defaults
+// consume ddheap:alloc and ddheap:free USDT notes. Adapters support both a
+// producer-weighted entry ABI and standard malloc/free function ABIs:
 //
-// Probes:    alloc(void *user, uint64_t size, uint64_t weight)
-//            free(void *ptr)
+//   allocation(void *user, uint64_t size, uint64_t weight)
+//   malloc(size) -> user; deallocation(void *ptr)
 //
-// These programs are attached PID-scoped from userspace by the `usdt`
-// package once per (process, probe site) discovered via .note.stapsdt
-// scanning. See usdt.Manager/usdt.Instance for the attachment flow.
+// Links are PID-scoped and reconciled against process mappings so late-loaded
+// libraries are discovered. See memory.Manager/memory.Instance.
 //
-// v1 reads arguments directly out of pt_regs using the architecture-specific
-// register layout defined in kernel.h, matching the fixed tracepoint signatures
-// emitted by the sampler. Honouring per-arg location descriptors from the SDT
-// note is follow-up work.
+// Hook identity stays in userspace; dedicated eBPF entry programs distinguish
+// allocation and deallocation without requiring attach-cookie support.
+//
+// v1 reads arguments and return values directly from architecture-specific
+// pt_regs fields, matching the fixed producer and allocator ABIs above.
+// Honouring arbitrary per-argument location descriptors from an SDT note is
+// follow-up work.
 
 #include "bpfdefs.h"
 #include "tracemgmt.h"
 #include "types.h"
 
 // ─────────────────────────────────────────────────────────────────────────
-// heap_live_pids: set of PIDs that have the ddheap:free probe attached.
+// heap_live_pids: set of PIDs that have a deallocation hook attached.
 // Only these PIDs get entries in heap_alloc_live. Written by userspace
-// during USDT reconcile; read by uprobe_heap_alloc.
+// during memory-probe reconcile; read by uprobe_heap_alloc.
 // ─────────────────────────────────────────────────────────────────────────
 struct heap_live_pids_t {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -87,8 +87,33 @@ struct heap_alloc_live_t {
   __type(value, HeapAllocVal);
 } heap_alloc_live SEC(".maps");
 
+// Sampled malloc-like calls need their size preserved from function entry
+// until the corresponding return probe exposes the allocation pointer. LRU
+// eviction bounds state left behind by thread exit, longjmp, or unmatched
+// returns. The map contains sampled calls only, not every allocator call.
+typedef struct {
+  u64 size;
+  u64 weight;
+} HeapPendingAlloc;
+
+struct heap_pending_allocs_t {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 65536);
+  __type(key, u64); // pid_tgid
+  __type(value, HeapPendingAlloc);
+} heap_pending_allocs SEC(".maps");
+
+// Average allocation volume represented by a directly instrumented malloc
+// sample. Written once by userspace. Producer-weighted USDT events bypass it.
+struct heap_sampling_interval_t {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} heap_sampling_interval SEC(".maps");
+
 // ─────────────────────────────────────────────────────────────────────────
-// USDT argument helpers
+// Entry/return argument helpers
 // ─────────────────────────────────────────────────────────────────────────
 
 static EBPF_INLINE u64 usdt_arg0(struct pt_regs *ctx)
@@ -124,20 +149,27 @@ static EBPF_INLINE u64 usdt_arg2(struct pt_regs *ctx)
 #endif
 }
 
+static EBPF_INLINE u64 function_return_value(struct pt_regs *ctx)
+{
+#if defined(__x86_64__)
+  return ctx->ax;
+#elif defined(__aarch64__)
+  return ctx->regs[0];
+#else
+  #error "Unsupported architecture"
+#endif
+}
+
 // ─────────────────────────────────────────────────────────────────────────
-// heap:alloc(user, size, weight)
+// Typed allocation event emission shared by producer-weighted USDT hooks and
+// the sampled malloc entry/return adapter.
 //
 //   arg0 = user-visible allocation pointer
 //   arg1 = allocation size in bytes
 //   arg2 = weight (unbiased size estimator = nsamples * interval)
 // ─────────────────────────────────────────────────────────────────────────
-SEC("uprobe/heap_alloc")
-int uprobe_heap_alloc(struct pt_regs *ctx)
+static EBPF_INLINE int emit_heap_alloc(struct pt_regs *ctx, u64 user, u64 size, u64 weight)
 {
-  u64 user   = usdt_arg0(ctx);
-  u64 size   = usdt_arg1(ctx);
-  u64 weight = usdt_arg2(ctx);
-
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid      = pid_tgid >> 32;
   u32 tid      = pid_tgid;
@@ -247,8 +279,87 @@ int uprobe_heap_alloc(struct pt_regs *ctx)
 exit:
   record->state.unwind_error = error;
   tail_call(ctx, unwinder);
-  DEBUG_PRINT("bpf_tail call failed for %d in uprobe_heap_alloc", unwinder);
+  DEBUG_PRINT("bpf_tail call failed for %d in memory allocation probe", unwinder);
   return -1;
+}
+
+// Producer-weighted allocations expose pointer, size, and weight together at
+// one entry point. This is the low-overhead path when userspace samples before
+// firing the probe (the default ddheap USDT contract).
+SEC("uprobe/heap_alloc")
+int uprobe_heap_alloc(struct pt_regs *ctx)
+{
+  return emit_heap_alloc(ctx, usdt_arg0(ctx), usdt_arg1(ctx), usdt_arg2(ctx));
+}
+
+// Byte-proportional Bernoulli sampling for direct malloc instrumentation. For
+// allocations smaller than the interval, p=size/interval and a sampled call
+// represents `interval` bytes. Larger calls are always sampled with weight=size.
+// This is unbiased for alloc_space; userspace derives alloc_objects as
+// weight/size. Sampling happens after the uprobe trap and therefore reduces
+// unwind/export work, but not breakpoint costs on allocator entry and return.
+static EBPF_INLINE bool sample_malloc(u64 size, HeapPendingAlloc *sample)
+{
+  u32 zero_key = 0;
+  u32 *interval = bpf_map_lookup_elem(&heap_sampling_interval, &zero_key);
+  if (!interval || *interval == 0 || size == 0) {
+    return false;
+  }
+
+  sample->size = size;
+  if (size >= *interval) {
+    sample->weight = size;
+    return true;
+  }
+
+  // size and interval are bounded by u32, so this multiplication fits u64.
+  u64 threshold = (size * (1ULL << 32)) / *interval;
+  if ((u64)(u32)bpf_get_prandom_u32() >= threshold) {
+    return false;
+  }
+  sample->weight = *interval;
+  return true;
+}
+
+// malloc-like entry: arg0=size. Only sampled calls occupy pending state.
+SEC("uprobe/malloc_enter")
+int uprobe_malloc_enter(struct pt_regs *ctx)
+{
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+
+  // A nested/unmatched call must drop stale state rather than pair the wrong
+  // size with a later return. Exported malloc implementations are not expected
+  // to recursively call themselves, but this makes failure a safe sample drop.
+  bpf_map_delete_elem(&heap_pending_allocs, &pid_tgid);
+
+  HeapPendingAlloc sample = {};
+  if (sample_malloc(usdt_arg0(ctx), &sample)) {
+    bpf_map_update_elem(&heap_pending_allocs, &pid_tgid, &sample, BPF_ANY);
+  }
+  return 0;
+}
+
+// malloc-like return: return register=pointer. The paired entry supplied size
+// and an unbiased weight. Failed allocations are discarded.
+SEC("uretprobe/malloc_return")
+int uretprobe_malloc_return(struct pt_regs *ctx)
+{
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  HeapPendingAlloc *pending = bpf_map_lookup_elem(&heap_pending_allocs, &pid_tgid);
+  if (!pending) {
+    return 0;
+  }
+
+  // Copy before deleting: map-value pointers are invalid after deletion.
+  u64 size = pending->size;
+  u64 weight = pending->weight;
+  bpf_map_delete_elem(&heap_pending_allocs, &pid_tgid);
+
+  u64 user = function_return_value(ctx);
+  if (!user) {
+    return 0;
+  }
+  return emit_heap_alloc(ctx, user, size, weight);
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -8,7 +8,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/confmap/xconfmap"
+
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 )
 
 // validConfig returns a config with valid defaults for testing.
@@ -70,6 +73,55 @@ func TestUnmarshalText(t *testing.T) {
 			require.Equal(t, tt.want, e)
 		})
 	}
+}
+
+func TestMemoryProbeConfigUnmarshal(t *testing.T) {
+	cfg := validConfig()
+	configuration := confmap.NewFromStringMap(map[string]any{
+		"probes": map[string]any{
+			"memory": map[string]any{
+				"enabled":                 true,
+				"sampling_interval_bytes": 262144,
+				"process_executables":     []any{"ruby*", "tarantool"},
+				"allocation_hooks": []any{
+					map[string]any{
+						"type":     "usdt",
+						"provider": "ruby",
+						"name":     "object_alloc",
+					},
+					map[string]any{
+						"type":       "uprobe",
+						"abi":        "weighted_allocation",
+						"executable": "libheap*.so",
+						"symbol":     "record_alloc",
+					},
+				},
+			},
+		},
+	})
+
+	require.NoError(t, configuration.Unmarshal(cfg))
+	cfg.ErrorMode = PropagateError
+	cfg.SamplesPerSecond = 20
+	cfg.ProbabilisticInterval = time.Minute
+	cfg.ProbabilisticThreshold = 100
+	cfg.NoKernelVersionCheck = true
+	require.NoError(t, cfg.Validate())
+	require.True(t, cfg.Probes.Memory.Enabled)
+	weightedUprobe := memory.UprobeHook("libheap*.so", "record_alloc")
+	weightedUprobe.ABI = memory.ABIWeightedAllocation
+	require.Equal(t, []memory.Hook{
+		memory.USDTHook("ruby", "object_alloc"),
+		weightedUprobe,
+	}, cfg.Probes.Memory.AllocationHooks)
+	require.Equal(t, uint64(262144), cfg.Probes.Memory.SamplingIntervalBytes)
+	require.Equal(t, []string{"ruby*", "tarantool"},
+		cfg.Probes.Memory.ProcessExecutablePatterns)
+	// Omitted values are filled by typed memory-probe defaults.
+	require.Equal(t, memory.DefaultMaxEntriesPerPID, cfg.Probes.Memory.MaxEntriesPerPID)
+	require.Equal(t, []memory.Hook{
+		memory.USDTHook(memory.DefaultUSDTProvider, "free"),
+	}, cfg.Probes.Memory.DeallocationHooks)
 }
 
 func TestValidateErrorMode(t *testing.T) {

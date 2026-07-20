@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
+	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	"go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
@@ -57,6 +58,8 @@ type ebpfMapsImpl struct {
 	HeapLivePids       *cebpf.Map `name:"heap_live_pids"`
 	HeapPIDAllocCount  *cebpf.Map `name:"heap_pid_alloc_count"`
 	HeapPIDAllocLimit  *cebpf.Map `name:"heap_pid_alloc_limit"`
+	HeapPendingAllocs  *cebpf.Map `name:"heap_pending_allocs"`
+	HeapSampling       *cebpf.Map `name:"heap_sampling_interval"`
 
 	// Stackdelta and process related eBPF maps
 	ExeIDToStackDeltaMaps []*cebpf.Map
@@ -87,7 +90,8 @@ var _ ebpfapi.EbpfHandler = &ebpfMapsImpl{}
 // It further spawns background workers for deferred map updates; the given
 // context can be used to terminate them on shutdown.
 func LoadMaps(ctx context.Context, interpretersConfig interpreterconfig.Config,
-	maps map[string]*cebpf.Map, stackdeltaInnerMapSpec *cebpf.MapSpec) (ebpfapi.EbpfHandler, error) {
+	probesConfig probeconfig.Config, maps map[string]*cebpf.Map,
+	stackdeltaInnerMapSpec *cebpf.MapSpec) (ebpfapi.EbpfHandler, error) {
 	impl := &ebpfMapsImpl{
 		stackdeltaInnerMapTemplate: stackdeltaInnerMapSpec,
 	}
@@ -103,7 +107,8 @@ func LoadMaps(ctx context.Context, interpretersConfig interpreterconfig.Config,
 		}
 		mapVal, ok := maps[nameTag]
 		if !ok {
-			if !interpretersConfig.IsMapEnabled(nameTag) {
+			if !interpretersConfig.IsMapEnabled(nameTag) ||
+				!probesConfig.IsMapEnabled(nameTag) {
 				continue
 			}
 			return nil, fmt.Errorf("Map %v is not available", nameTag)
@@ -535,6 +540,16 @@ func (impl *ebpfMapsImpl) SetHeapPIDAllocLimit(limit uint32) {
 	}
 	key := uint32(0)
 	_ = impl.HeapPIDAllocLimit.Update(unsafe.Pointer(&key), unsafe.Pointer(&limit), cebpf.UpdateAny)
+}
+
+// SetHeapSamplingInterval writes the byte-proportional sampling interval used
+// by directly instrumented malloc-like hooks.
+func (impl *ebpfMapsImpl) SetHeapSamplingInterval(interval uint32) {
+	if impl.HeapSampling == nil {
+		return
+	}
+	key := uint32(0)
+	_ = impl.HeapSampling.Update(unsafe.Pointer(&key), unsafe.Pointer(&interval), cebpf.UpdateAny)
 }
 
 // UpdateUnwindInfo writes UnwindInfo into the unwind info array at the given index

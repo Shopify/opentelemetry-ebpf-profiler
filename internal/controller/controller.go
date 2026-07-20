@@ -87,7 +87,7 @@ func (c *Controller) Start(ctx context.Context) error {
 
 	// Use the pre-created live heap tracker if provided, otherwise create one.
 	liveTracker := c.config.LiveHeapTracker
-	if liveTracker == nil && c.config.LiveHeapProfiling {
+	if liveTracker == nil && c.config.Probes.Memory.Live {
 		liveTracker = liveheap.NewTracker(liveheap.DefaultMaxEntries)
 	}
 	if liveTracker != nil {
@@ -100,29 +100,27 @@ func (c *Controller) Start(ctx context.Context) error {
 
 	// Load the eBPF code and map definitions
 	trc, err := tracer.NewTracer(ctx, &tracer.Config{
-		TraceReporter:            c.reporter,
-		Intervals:                intervals,
-		InterpretersConfig:       c.config.Interpreters,
-		FilterErrorFrames:        !c.config.SendErrorFrames,
-		FilterIdleFrames:         !c.config.SendIdleFrames,
-		SamplesPerSecond:         c.config.SamplesPerSecond,
-		MapScaleFactor:           int(c.config.MapScaleFactor),
-		KernelVersionCheck:       !c.config.NoKernelVersionCheck,
-		VerboseMode:              c.config.VerboseMode,
-		BPFVerifierLogLevel:      uint32(c.config.BPFVerifierLogLevel),
-		ProbabilisticInterval:    c.config.ProbabilisticInterval,
-		ProbabilisticThreshold:   c.config.ProbabilisticThreshold,
-		OffCPUThreshold:          uint32(c.config.OffCPUThreshold * float64(math.MaxUint32)),
-		IncludeEnvVars:           envVars,
-		ProbeLinks:               c.config.ProbeLinks,
-		LoadProbe:                c.config.LoadProbe,
-		HeapProfiling:            c.config.HeapProfiling,
-		LiveHeapProfiling:        c.config.LiveHeapProfiling,
-		LiveHeapMaxEntriesPerPID: c.config.LiveHeapMaxEntriesPerPID,
-		LiveHeapTracker:          liveTracker,
-		ExecutableReporter:       c.config.ExecutableReporter,
-		BPFFSRoot:                c.config.BPFFSRoot,
-		OBIProcessCtx:            c.config.OBIProcessCtx,
+		TraceReporter:          c.reporter,
+		Intervals:              intervals,
+		InterpretersConfig:     c.config.Interpreters,
+		FilterErrorFrames:      !c.config.SendErrorFrames,
+		FilterIdleFrames:       !c.config.SendIdleFrames,
+		SamplesPerSecond:       c.config.SamplesPerSecond,
+		MapScaleFactor:         int(c.config.MapScaleFactor),
+		KernelVersionCheck:     !c.config.NoKernelVersionCheck,
+		VerboseMode:            c.config.VerboseMode,
+		BPFVerifierLogLevel:    uint32(c.config.BPFVerifierLogLevel),
+		ProbabilisticInterval:  c.config.ProbabilisticInterval,
+		ProbabilisticThreshold: c.config.ProbabilisticThreshold,
+		OffCPUThreshold:        uint32(c.config.OffCPUThreshold * float64(math.MaxUint32)),
+		IncludeEnvVars:         envVars,
+		ProbeLinks:             c.config.ProbeLinks,
+		LoadProbe:              c.config.LoadProbe,
+		ProbesConfig:           c.config.Probes,
+		LiveHeapTracker:        liveTracker,
+		ExecutableReporter:     c.config.ExecutableReporter,
+		BPFFSRoot:              c.config.BPFFSRoot,
+		OBIProcessCtx:          c.config.OBIProcessCtx,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to load eBPF tracer: %w", err)

@@ -27,6 +27,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind"
 	"go.opentelemetry.io/ebpf-profiler/periodiccaller"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	eim "go.opentelemetry.io/ebpf-profiler/processmanager/execinfomanager"
@@ -34,7 +35,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/times"
 	"go.opentelemetry.io/ebpf-profiler/traceutil"
-	"go.opentelemetry.io/ebpf-profiler/usdt"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -72,7 +72,7 @@ func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monit
 	executableUnloadDelay time.Duration, ebpf pmebpf.EbpfHandler, traceReporter reporter.TraceReporter,
 	exeReporter reporter.ExecutableReporter, sdp nativeunwind.StackDeltaProvider,
 	filterErrorFrames bool, includeEnvVars libpf.Set[string],
-	usdtMgr *usdt.Manager, liveHeapTracker *liveheap.Tracker) (*ProcessManager, error) {
+	memoryProbeManager *memory.Manager, liveHeapTracker *liveheap.Tracker) (*ProcessManager, error) {
 	if exeReporter == nil {
 		exeReporter = executableReporterStub{}
 	}
@@ -125,8 +125,8 @@ func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monit
 		includeEnvVars:           includeEnvVars,
 		selfCgroupIno:            selfCgroupIno,
 		selfContainerID:          selfContainerID,
-		usdtManager:              usdtMgr,
-		usdtInstances:            make(map[libpf.PID]*usdt.Instance),
+		memoryProbeManager:       memoryProbeManager,
+		memoryProbeInstances:     make(map[libpf.PID]*memory.Instance),
 		cleanupSem:               make(chan struct{}, maxConcurrentPIDCleanups),
 		liveHeapTracker:          liveHeapTracker,
 	}
@@ -208,22 +208,20 @@ func collectInterpreterMetrics(ctx context.Context, pm *ProcessManager,
 }
 
 func (pm *ProcessManager) Close() {
-	// Tear down any remaining per-PID USDT attachments. Detach() closes kernel
-	// uprobe links and must run without pm.mu held, so collect the instances
-	// under the lock, clear the map, then detach outside it. Done synchronously
-	// since this is terminal shutdown; without it the uprobe links leak across
-	// receiver start/stop cycles.
+	// Tear down any remaining per-PID memory probe links without holding
+	// pm.mu. This is synchronous during terminal shutdown so receiver
+	// start/stop cycles cannot leak kernel uprobe links.
 	pm.mu.Lock()
-	instances := make([]*usdt.Instance, 0, len(pm.usdtInstances))
-	for pid, inst := range pm.usdtInstances {
+	instances := make([]*memory.Instance, 0, len(pm.memoryProbeInstances))
+	for pid, inst := range pm.memoryProbeInstances {
 		instances = append(instances, inst)
-		delete(pm.usdtInstances, pid)
+		delete(pm.memoryProbeInstances, pid)
 	}
 	pm.mu.Unlock()
 
 	for _, inst := range instances {
 		if err := inst.Detach(); err != nil {
-			log.Errorf("USDT detach during shutdown: %v", err)
+			log.Errorf("memory probe detach during shutdown: %v", err)
 		}
 	}
 
@@ -233,16 +231,15 @@ func (pm *ProcessManager) Close() {
 	// before Close, so no deferCleanup runs concurrently with this Wait.
 	pm.cleanupWG.Wait()
 
-	// Release manager-owned USDT resources (parse cache). Nil-safe when USDT
-	// is disabled.
-	if err := pm.usdtManager.Close(); err != nil {
-		log.Errorf("USDT manager close during shutdown: %v", err)
+	// Release manager-owned discovery resources. Nil-safe when disabled.
+	if err := pm.memoryProbeManager.Close(); err != nil {
+		log.Errorf("memory probe manager close during shutdown: %v", err)
 	}
 }
 
 // deferCleanup runs fn on a background goroutine, tracked by cleanupWG so
 // Close can wait for it, and gated by cleanupSem so at most
-// maxConcurrentPIDCleanups run at once. Used for per-PID teardown (USDT
+// maxConcurrentPIDCleanups run at once. Used for per-PID teardown (probe
 // detach, eBPF map deletes) that must not hold pm.mu. Safe to call while
 // holding pm.mu: the semaphore is acquired inside the goroutine, so the
 // caller never blocks.

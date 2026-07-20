@@ -41,18 +41,24 @@ const (
 	// reader goroutine to periodically check for context cancellation.
 	eventReaderDeadline = 100 * time.Millisecond
 
-	// usdtReconcileInterval is how often we re-check tracked PIDs that have
-	// no USDT attachments. This catches libraries loaded after initial PID
-	// discovery (e.g., JNA loading a .so with USDT probes after JVM startup).
-	usdtReconcileInterval = 30 * time.Second
+	// memoryProbeReconcileInterval controls retries for tracked PIDs missing
+	// required process-local memory hooks, including late-loaded libraries.
+	memoryProbeReconcileInterval = 30 * time.Second
 
-	// usdtReconcileBatchSize limits how many PIDs are re-reconciled per tick
-	// to amortise the cost of reading /proc/<pid>/maps.
-	usdtReconcileBatchSize = 20
+	// memoryProbeReconcileBatchSize amortizes /proc mapping inspection.
+	memoryProbeReconcileBatchSize = 20
 )
 
-// StartPIDEventProcessor spawns a goroutine to process PID events.
+// StartPIDEventProcessor spawns a goroutine to process PID events. Repeated
+// starts and starts after Close are ignored.
 func (t *Tracer) StartPIDEventProcessor(ctx context.Context) {
+	t.pidEventsMu.Lock()
+	if t.pidEventsStarted || t.pidEventsClosed {
+		t.pidEventsMu.Unlock()
+		return
+	}
+	t.pidEventsStarted = true
+	t.pidEventsMu.Unlock()
 	go t.processPIDEvents(ctx)
 }
 
@@ -63,15 +69,11 @@ func (t *Tracer) processPIDEvents(ctx context.Context) {
 	pidCleanupTicker := time.NewTicker(t.intervals.PIDCleanupInterval())
 	defer pidCleanupTicker.Stop()
 
-	// Periodic USDT re-reconciliation catches libraries loaded after initial
-	// PID discovery (e.g., Java JNA loading a .so with USDT probes after JVM
-	// startup). We process a small batch each tick to amortise /proc I/O.
-	// Note: this only re-sweeps USDT attachment state, not the general
-	// executable-mapping cache (see the longstanding periodic-sync TODO on
-	// ProcessManager.SynchronizeProcess, which predates and is unrelated to
-	// USDT/memory profiling).
-	usdtReconcileTicker := time.NewTicker(usdtReconcileInterval)
-	defer usdtReconcileTicker.Stop()
+	// Periodic memory-hook discovery catches configured USDTs or uprobes in
+	// libraries loaded after initial PID discovery. It does not refresh the
+	// general executable-mapping cache.
+	memoryProbeReconcileTicker := time.NewTicker(memoryProbeReconcileInterval)
+	defer memoryProbeReconcileTicker.Stop()
 
 	for {
 		select {
@@ -79,8 +81,8 @@ func (t *Tracer) processPIDEvents(ctx context.Context) {
 			t.processManager.SynchronizeProcess(process.New(pidTid.PID(), pidTid.TID()))
 		case <-pidCleanupTicker.C:
 			t.processManager.CleanupPIDs()
-		case <-usdtReconcileTicker.C:
-			t.processManager.ReconcileUSDTProbes(usdtReconcileBatchSize)
+		case <-memoryProbeReconcileTicker.C:
+			t.processManager.ReconcileMemoryProbes(memoryProbeReconcileBatchSize)
 		case <-ctx.Done():
 			return
 		}

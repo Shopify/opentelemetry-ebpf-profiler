@@ -16,6 +16,8 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/internal/controller"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
+	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
 )
 
@@ -84,9 +86,15 @@ var (
 		"Expected format: probe_type:target[:symbol]. probe_type can be kprobe, kretprobe, uprobe, or uretprobe."
 	loadProbeHelper = "Load generic eBPF program that can be attached externally to " +
 		"various user or kernel space hooks."
-	heapProfilingHelper = "Enable heap profiling via USDT uprobes. The profiler will " +
-		"scan target processes for `.note.stapsdt` entries from the heap-sampler " +
-		"provider and attach PID-scoped uprobes."
+	heapProfilingHelper = "Enable allocation profiling through configured process-local " +
+		"USDT or allocator function hooks."
+	heapAllocationHookHelper = "Allocation hook (repeatable): usdt:<provider>:<name> consumes " +
+		"a weighted allocation event; uprobe:<executable-pattern>:<symbol> pairs allocator " +
+		"entry and return probes (for example libc.so.6:malloc)."
+	heapDeallocationHookHelper = "Deallocation hook (repeatable): usdt:<provider>:<name> or " +
+		"uprobe:<executable-pattern>:<symbol>; both consume a pointer at function entry."
+	heapProcessExecutableHelper = "Process executable basename or full-path glob eligible for " +
+		"memory hooks (repeatable and required for direct allocator uprobes)."
 	liveHeapProfilingHelper = "Additionally track deallocations to report the live " +
 		"(in-use) heap by attaching the heap-sampler free probe. " +
 		"Requires -heap-profiling."
@@ -99,8 +107,9 @@ var (
 // to the same flagset.
 
 func parseArgs() (*controller.Config, error) {
-	var args controller.Config
+	args := controller.Config{Config: config.Config{Probes: probeconfig.DefaultConfig()}}
 	var tracers string
+	var allocationHooksSet, deallocationHooksSet bool
 
 	fs := flag.NewFlagSet("ebpf-profiler", flag.ExitOnError)
 
@@ -166,12 +175,49 @@ func parseArgs() (*controller.Config, error) {
 
 	fs.BoolVar(&args.LoadProbe, "load-probe", false, loadProbeHelper)
 
-	fs.BoolVar(&args.HeapProfiling, "heap-profiling", false, heapProfilingHelper)
+	fs.Func("heap-allocation-hook", heapAllocationHookHelper, func(spec string) error {
+		hook, err := memory.ParseHook(spec)
+		if err != nil {
+			return err
+		}
+		if !allocationHooksSet {
+			args.Probes.Memory.AllocationHooks = nil
+			allocationHooksSet = true
+		}
+		args.Probes.Memory.AllocationHooks = append(args.Probes.Memory.AllocationHooks, hook)
+		return nil
+	})
 
-	fs.BoolVar(&args.LiveHeapProfiling, "live-heap-profiling", false, liveHeapProfilingHelper)
+	fs.Func("heap-deallocation-hook", heapDeallocationHookHelper, func(spec string) error {
+		hook, err := memory.ParseHook(spec)
+		if err != nil {
+			return err
+		}
+		if !deallocationHooksSet {
+			args.Probes.Memory.DeallocationHooks = nil
+			deallocationHooksSet = true
+		}
+		args.Probes.Memory.DeallocationHooks = append(args.Probes.Memory.DeallocationHooks, hook)
+		return nil
+	})
 
-	fs.IntVar(&args.LiveHeapMaxEntriesPerPID, "live-heap-max-entries-per-pid",
-		10000, "Maximum number of live heap entries tracked per process. "+
+	fs.BoolVar(&args.Probes.Memory.Enabled, "heap-profiling", false, heapProfilingHelper)
+
+	fs.Func("heap-process-executable", heapProcessExecutableHelper, func(pattern string) error {
+		args.Probes.Memory.ProcessExecutablePatterns = append(
+			args.Probes.Memory.ProcessExecutablePatterns, pattern)
+		return nil
+	})
+
+	fs.Uint64Var(&args.Probes.Memory.SamplingIntervalBytes, "heap-sampling-interval-bytes",
+		memory.DefaultSamplingIntervalBytes,
+		"Average bytes represented by one sample when directly instrumenting an allocator.")
+
+	fs.BoolVar(&args.Probes.Memory.Live, "live-heap-profiling", false,
+		liveHeapProfilingHelper)
+
+	fs.IntVar(&args.Probes.Memory.MaxEntriesPerPID, "live-heap-max-entries-per-pid",
+		memory.DefaultMaxEntriesPerPID, "Maximum number of live heap entries tracked per process. "+
 			"Allocations beyond this limit are not tracked for inuse profiling.")
 
 	fs.Usage = func() {

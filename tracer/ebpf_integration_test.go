@@ -24,6 +24,8 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
+	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
@@ -96,7 +98,6 @@ type trace struct {
 
 func TestTracerErrorPropagation(t *testing.T) {
 	ctx, cancelFn := context.WithCancel(t.Context())
-	defer cancelFn()
 
 	tr, err := tracer.NewTracer(ctx, &tracer.Config{
 		Intervals:              &mockIntervals{},
@@ -112,7 +113,10 @@ func TestTracerErrorPropagation(t *testing.T) {
 		VerboseMode:            true,
 	})
 	require.NoError(t, err)
-	defer tr.Close()
+	defer func() {
+		cancelFn()
+		tr.Close()
+	}()
 
 	// tamper ebpf pid_events map type to produce invalid argument error
 	badSpec := &cebpf.MapSpec{
@@ -139,7 +143,6 @@ func TestTracerErrorPropagation(t *testing.T) {
 
 func TestTracerMapMonitorsError(t *testing.T) {
 	ctx, cancelFn := context.WithCancel(t.Context())
-	defer cancelFn()
 
 	tr, err := tracer.NewTracer(ctx, &tracer.Config{
 		Intervals:              &mockIntervals{},
@@ -155,7 +158,10 @@ func TestTracerMapMonitorsError(t *testing.T) {
 		VerboseMode:            true,
 	})
 	require.NoError(t, err)
-	defer tr.Close()
+	defer func() {
+		cancelFn()
+		tr.Close()
+	}()
 
 	// force error by removing a required map during map monitor start up
 	delete(tr.GetEbpfMaps(), "report_events")
@@ -166,7 +172,6 @@ func TestTracerMapMonitorsError(t *testing.T) {
 
 func TestTraceTransmissionAndParsing(t *testing.T) {
 	ctx, cancelFn := context.WithCancel(t.Context())
-	defer cancelFn()
 
 	tr, err := tracer.NewTracer(ctx, &tracer.Config{
 		Intervals:              &mockIntervals{},
@@ -182,7 +187,10 @@ func TestTraceTransmissionAndParsing(t *testing.T) {
 		VerboseMode:            true,
 	})
 	require.NoError(t, err)
-	defer tr.Close()
+	defer func() {
+		cancelFn()
+		tr.Close()
+	}()
 
 	traceChan := make(chan *libpf.EbpfTrace, 16)
 	err = tr.StartMapMonitors(ctx, traceChan)
@@ -262,8 +270,33 @@ Loop:
 	}
 }
 
+func TestDirectAllocatorProbeProgramsLoad(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	probes := probeconfig.DefaultConfig()
+	probes.Memory.Enabled = true
+	probes.Memory.AllocationHooks = []memory.Hook{
+		memory.UprobeHook("libc.so.6", "malloc"),
+	}
+	probes.Memory.ProcessExecutablePatterns = []string{"tracer.test"}
+
+	tr, err := tracer.NewTracer(ctx, &tracer.Config{
+		Intervals:              &mockIntervals{},
+		InterpretersConfig:     interpreterconfig.AllInterpreters(),
+		ProbesConfig:           probes,
+		SamplesPerSecond:       20,
+		ProbabilisticInterval:  100,
+		ProbabilisticThreshold: 100,
+	})
+	require.NoError(t, err)
+	defer func() {
+		cancel()
+		tr.Close()
+	}()
+}
+
 func TestAllTracers(t *testing.T) {
-	tr, err := tracer.NewTracer(t.Context(), &tracer.Config{
+	ctx, cancel := context.WithCancel(t.Context())
+	tr, err := tracer.NewTracer(ctx, &tracer.Config{
 		Intervals:              &mockIntervals{},
 		InterpretersConfig:     interpreterconfig.AllInterpreters(),
 		SamplesPerSecond:       20,
@@ -274,5 +307,8 @@ func TestAllTracers(t *testing.T) {
 		LoadProbe:              true,
 	})
 	require.NoError(t, err)
-	defer tr.Close()
+	defer func() {
+		cancel()
+		tr.Close()
+	}()
 }

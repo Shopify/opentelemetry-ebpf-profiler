@@ -37,13 +37,14 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind/elfunwindinfo"
 	"go.opentelemetry.io/ebpf-profiler/periodiccaller"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
+	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/times"
-	"go.opentelemetry.io/ebpf-profiler/usdt"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -139,9 +140,14 @@ type Tracer struct {
 	customLabels customLabelValidator
 
 	// pidEventsDone is closed when processPIDEvents exits, allowing Close()
-	// to wait for all in-flight SynchronizeProcess / ReconcileUSDTProbes calls
-	// to complete before tearing down the ProcessManager.
-	pidEventsDone chan struct{}
+	// to wait for all in-flight SynchronizeProcess / ReconcileMemoryProbes calls
+	// to complete before tearing down the ProcessManager. The mutex also lets
+	// Close handle tracers whose processor was never started (for example, a
+	// verifier-only integration test) without blocking forever.
+	pidEventsMu      sync.Mutex
+	pidEventsStarted bool
+	pidEventsClosed  bool
+	pidEventsDone    chan struct{}
 
 	// liveHeapTracker tracks live (in-use) heap allocations by correlating
 	// alloc and free events. Nil when live heap profiling is disabled.
@@ -210,19 +216,13 @@ type Config struct {
 	// LoadProbe indicates whether the generic eBPF program should be loaded
 	// without being attached to something.
 	LoadProbe bool
-	// HeapProfiling enables loading of the heap USDT uprobe entry programs
-	// and per-process attach via the usdt package.
-	HeapProfiling bool
-	// LiveHeapProfiling additionally tracks deallocations so the live
-	// (in-use) heap can be reported, by loading and attaching the heap free
-	// USDT probe alongside the alloc probe. Requires HeapProfiling.
-	LiveHeapProfiling bool
-	// LiveHeapTracker is the shared tracker instance for live heap profiling.
-	// Created externally and shared with the reporter. May be nil.
+	// ProbesConfig holds typed custom-probe configuration. Memory is the first
+	// consumer; future network/disk probes can be added without more tracer
+	// booleans or untyped hook strings.
+	ProbesConfig probeconfig.Config
+	// LiveHeapTracker is shared with the reporter when the memory probe's live
+	// mode is enabled. It may be nil for allocation-only profiling.
 	LiveHeapTracker *liveheap.Tracker
-	// LiveHeapMaxEntriesPerPID is the per-process cap on live heap entries
-	// enforced in the eBPF map. 0 means no per-PID limit.
-	LiveHeapMaxEntriesPerPID int
 	// BPFFSRoot is the root path to BPF filesystem for pinned maps and programs.
 	BPFFSRoot string
 	// OBIProcessCtx enable the use of a known shared eBPF map with OBI.
@@ -266,9 +266,11 @@ func newTracePool() sync.Pool {
 
 // NewTracer loads eBPF code and map definitions from the ELF module at the configured path.
 func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
-	if cfg.LiveHeapProfiling && !cfg.HeapProfiling {
-		return nil, errors.New("live heap profiling requires heap profiling to be enabled")
+	cfg.ProbesConfig.ApplyDefaults()
+	if err := cfg.ProbesConfig.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid custom probe configuration: %w", err)
 	}
+	memoryConfig := cfg.ProbesConfig.Memory
 
 	kernelSymbolizer, err := kallsyms.NewSymbolizer()
 	if err != nil {
@@ -286,30 +288,41 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		return nil, fmt.Errorf("failed to load eBPF code: %v", err)
 	}
 
-	ebpfHandler, err := pmebpf.LoadMaps(ctx, cfg.InterpretersConfig, ebpfMaps, stackdeltaInnerMapSpec)
+	ebpfHandler, err := pmebpf.LoadMaps(ctx, cfg.InterpretersConfig, cfg.ProbesConfig,
+		ebpfMaps, stackdeltaInnerMapSpec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF maps: %v", err)
 	}
 
-	if cfg.LiveHeapMaxEntriesPerPID > 0 {
-		ebpfHandler.SetHeapPIDAllocLimit(uint32(cfg.LiveHeapMaxEntriesPerPID))
+	if memoryConfig.Live {
+		ebpfHandler.SetHeapPIDAllocLimit(uint32(memoryConfig.MaxEntriesPerPID))
+	}
+	if memoryConfig.UsesMallocAdapter() {
+		ebpfHandler.SetHeapSamplingInterval(uint32(memoryConfig.SamplingIntervalBytes))
+		log.Warnf("Direct allocator uprobes trap on every matching function entry/return; " +
+			"use producer-side sampled USDT hooks for low-overhead production profiling")
 	}
 
-	// Set up memory profiling.
-	var usdtMgr *usdt.Manager
-	if cfg.HeapProfiling {
-		usdtProgs := map[usdt.ProbeKind]*cebpf.Program{}
-		if p, ok := ebpfProgs["uprobe_heap_alloc"]; ok {
-			usdtProgs[usdt.ProbeHeapAlloc] = p
+	// Set up the process-scoped memory custom probe. Source-specific adapters
+	// normalize producer-weighted USDTs and paired allocator entry/return hooks
+	// into the same typed allocation/deallocation events.
+	var memoryProbeManager *memory.Manager
+	if memoryConfig.Enabled {
+		memoryProgs := map[memory.ProgramKind]*cebpf.Program{}
+		programNames := map[memory.ProgramKind]string{
+			memory.ProgramWeightedAllocation: "uprobe_heap_alloc",
+			memory.ProgramMallocEnter:        "uprobe_malloc_enter",
+			memory.ProgramMallocReturn:       "uretprobe_malloc_return",
+			memory.ProgramDeallocation:       "uprobe_heap_free",
 		}
-		// Only register the free probe when live heap profiling is opted
-		// into; without it the program is not loaded and frees are never
-		// instrumented.
-		if p, ok := ebpfProgs["uprobe_heap_free"]; ok && cfg.LiveHeapProfiling {
-			usdtProgs[usdt.ProbeHeapFree] = p
+		for kind, name := range programNames {
+			if program, ok := ebpfProgs[name]; ok {
+				memoryProgs[kind] = program
+			}
 		}
-		if usdtMgr, err = usdt.NewManager(usdtProgs); err != nil {
-			return nil, fmt.Errorf("failed to build USDT manager: %w", err)
+		memoryProbeManager, err = memory.NewManager(memoryConfig, memoryProgs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build memory probe manager: %w", err)
 		}
 	}
 
@@ -318,7 +331,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 	processManager, err := pm.New(ctx, cfg.InterpretersConfig, cfg.Intervals.MonitorInterval(),
 		cfg.Intervals.ExecutableUnloadDelay(), ebpfHandler, cfg.TraceReporter, cfg.ExecutableReporter,
 		elfunwindinfo.NewStackDeltaProvider(),
-		cfg.FilterErrorFrames, cfg.IncludeEnvVars, usdtMgr, liveTracker)
+		cfg.FilterErrorFrames, cfg.IncludeEnvVars, memoryProbeManager, liveTracker)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create processManager: %v", err)
 	}
@@ -366,9 +379,16 @@ func (t *Tracer) Close() {
 	// Wait for the PID event processing goroutine to exit before tearing
 	// down the ProcessManager. The goroutine stops when its context is
 	// cancelled (done by the controller before calling Close); waiting
-	// here guarantees no concurrent SynchronizeProcess / ReconcileUSDTProbes
-	// calls are in flight when ProcessManager.Close detaches USDT links.
-	<-t.pidEventsDone
+	// here guarantees no concurrent SynchronizeProcess / ReconcileMemoryProbes
+	// calls are in flight when ProcessManager.Close detaches memory-probe links.
+	t.pidEventsMu.Lock()
+	t.pidEventsClosed = true
+	pidEventsStarted := t.pidEventsStarted
+	pidEventsDone := t.pidEventsDone
+	t.pidEventsMu.Unlock()
+	if pidEventsStarted {
+		<-pidEventsDone
+	}
 
 	t.processManager.Close()
 	t.kernelSymbolizer.Close()
@@ -523,10 +543,10 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 		return nil, nil, nil, fmt.Errorf("failed to load perf eBPF programs: %v", err)
 	}
 
-	if cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe || cfg.HeapProfiling {
-		// Load the tail call destinations if any kind of event profiling is enabled.
-		// Heap profiling needs the uprobe unwinder chain (kprobe_progs) so its
-		// USDT entry programs can tail-call into PROG_UNWIND_NATIVE.
+	if cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe ||
+		cfg.ProbesConfig.Memory.Enabled {
+		// Load tail-call destinations when any event probe is enabled. Memory
+		// hook entry programs reuse the same uprobe unwinder chain.
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], tailCallProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
@@ -566,20 +586,20 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 		}
 	}
 
-	if cfg.HeapProfiling {
-		// USDT entry points for heap profiling. Attached PID-scoped from
-		// userspace by the usdt package; they themselves tail-call into
-		// the shared uprobe unwinder chain loaded above.
-		// The free probe is only needed to track deallocations for live
-		// (in-use) heap reporting; plain allocation profiling never
-		// consumes free events, so don't load it unless opted in.
-		heapProgs := []progLoaderHelper{
-			{name: "uprobe_heap_alloc", noTailCallTarget: true, enable: true},
-			{name: "uprobe_heap_free", noTailCallTarget: true, enable: cfg.LiveHeapProfiling},
+	if cfg.ProbesConfig.Memory.Enabled {
+		memoryProgs := []progLoaderHelper{
+			{name: "uprobe_heap_alloc", noTailCallTarget: true,
+				enable: cfg.ProbesConfig.Memory.UsesWeightedAllocation()},
+			{name: "uprobe_malloc_enter", noTailCallTarget: true,
+				enable: cfg.ProbesConfig.Memory.UsesMallocAdapter()},
+			{name: "uretprobe_malloc_return", noTailCallTarget: true,
+				enable: cfg.ProbesConfig.Memory.UsesMallocAdapter()},
+			{name: "uprobe_heap_free", noTailCallTarget: true,
+				enable: cfg.ProbesConfig.Memory.Live},
 		}
-		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], heapProgs,
+		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], memoryProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to load heap USDT eBPF programs: %v", err)
+			return nil, nil, nil, fmt.Errorf("failed to load memory-probe eBPF programs: %v", err)
 		}
 	}
 
@@ -782,9 +802,19 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 			}
 		}
 
-		if !cfg.InterpretersConfig.IsMapEnabled(mapName) {
-			log.Debugf("Skipping eBPF map %s: tracer not enabled", mapName)
+		if !cfg.InterpretersConfig.IsMapEnabled(mapName) ||
+			!cfg.ProbesConfig.IsMapEnabled(mapName) {
+			log.Debugf("Skipping eBPF map %s: owning tracer/probe not enabled", mapName)
 			continue
+		}
+		if cfg.ProbesConfig.Memory.Enabled && !cfg.ProbesConfig.Memory.Live {
+			switch mapName {
+			case "heap_alloc_live", "heap_live_pids", "heap_pid_alloc_count":
+				// The allocation entry program references these maps, so they must
+				// exist for verifier rewriting even though allocation-only mode never
+				// populates them. Minimize them to avoid baseline preallocation.
+				mapSpec.MaxEntries = 1
+			}
 		}
 		if newSize, ok := adaption[mapName]; ok {
 			log.Debugf("Size of eBPF map %s: %v", mapName, newSize)

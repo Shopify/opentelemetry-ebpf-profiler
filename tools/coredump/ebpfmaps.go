@@ -277,3 +277,6 @@ func (emc *ebpfMapsCoredump) DeleteHeapPIDAllocCount(_ libpf.PID) {
 
 func (emc *ebpfMapsCoredump) SetHeapPIDAllocLimit(_ uint32) {
 }
+
+func (emc *ebpfMapsCoredump) SetHeapSamplingInterval(_ uint32) {
+}

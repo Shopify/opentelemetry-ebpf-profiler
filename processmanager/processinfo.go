@@ -31,12 +31,12 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/lpm"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/processcontext"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/times"
-	"go.opentelemetry.io/ebpf-profiler/usdt"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -497,14 +497,14 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 	pm.pidPageToMappingInfoSize -= min(pm.pidPageToMappingInfoSize, deleted)
 	pm.processRemovedInterpreters(pid, libpf.Set[util.OnDiskFileIdentifier]{})
 
-	// Tear down any USDT attachments held for this PID. Detach() does kernel
-	// work (closes uprobe links) and must not run while pm.mu is held, so hand
-	// it off to a bounded, Close-tracked background cleanup.
-	if inst, ok := pm.usdtInstances[pid]; ok {
-		delete(pm.usdtInstances, pid)
+	// Tear down process-scoped memory probe links. Closing links performs
+	// kernel work, so hand it to bounded cleanup rather than doing it under
+	// pm.mu.
+	if inst, ok := pm.memoryProbeInstances[pid]; ok {
+		delete(pm.memoryProbeInstances, pid)
 		pm.deferCleanup(func() {
 			if derr := inst.Detach(); derr != nil {
-				log.Errorf("USDT detach for PID %d: %v", pid, derr)
+				log.Errorf("memory probe detach for PID %d: %v", pid, derr)
 			}
 		})
 	}
@@ -840,49 +840,42 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 		pm.ebpf.RemoveReportedPID(pid)
 	}
 
-	// Reconcile USDT attachments for this PID. Runs on every sync (not only
-	// on first sight) so probes inside libraries dlopen'd after process
-	// start get picked up on a subsequent sync. The Manager is nil when USDT
-	// support is disabled at startup.
-	if pm.usdtManager != nil {
-		// Acquire or create the Instance under pm.mu so that concurrent
-		// callers (SynchronizeProcess vs ReconcileUSDTProbes) share the
-		// same object and serialize via Instance.mu inside Reconcile,
-		// preventing two independent Instances from being built for the
-		// same PID (which would leak the loser's uprobe links).
+	// Reconcile configured process-scoped memory hooks on every mapping sync,
+	// including hooks in libraries loaded after process startup.
+	if pm.memoryProbeManager != nil {
+		// Store one shared Instance under pm.mu before discovery. Reconcile and
+		// process-exit teardown serialize independently through Instance.mu.
 		pm.mu.Lock()
-		prev := pm.usdtInstances[pid]
-		if prev == nil {
-			prev = usdt.NewInstance(pid)
-			pm.usdtInstances[pid] = prev
+		previous := pm.memoryProbeInstances[pid]
+		if previous == nil {
+			previous = memory.NewInstance(pid)
+			pm.memoryProbeInstances[pid] = previous
 		}
 		pm.mu.Unlock()
 
-		_, err := pm.usdtManager.Reconcile(pid, pr, prev)
+		_, err := pm.memoryProbeManager.Reconcile(pid, pr, previous)
 		if err != nil {
-			log.Warnf("USDT reconcile for PID %d: %v", pid, err)
+			log.Warnf("memory probe reconcile for PID %d: %v", pid, err)
 		}
 
-		// Re-check that the PID is still tracked. processPIDExit may
-		// have fired concurrently while Reconcile was running.
+		// processPIDExit may have raced with discovery.
 		pm.mu.Lock()
 		_, stillTracked := pm.pidToProcessInfo[pid]
 		pm.mu.Unlock()
 
 		if !stillTracked {
 			pm.mu.Lock()
-			delete(pm.usdtInstances, pid)
+			delete(pm.memoryProbeInstances, pid)
 			pm.mu.Unlock()
 			pm.deferCleanup(func() {
-				if derr := prev.Detach(); derr != nil {
-					log.Errorf("USDT detach for exited PID %d: %v", pid, derr)
+				if derr := previous.Detach(); derr != nil {
+					log.Errorf("memory probe detach for exited PID %d: %v", pid, derr)
 				}
 			})
 		} else if pm.liveHeapTracker != nil {
-			// Notify the tracker and eBPF whether this PID supports
-			// live heap (has ddheap:free attached). Without the free
-			// probe, allocs would accumulate forever.
-			hasLive := prev.HasProbeKind(usdt.ProbeHeapFree)
+			// Never retain live allocations unless a deallocation hook is
+			// attached for this PID.
+			hasLive := previous.HasEvent(memory.EventDeallocation)
 			pm.liveHeapTracker.SetPIDLiveHeapSupport(pid, hasLive)
 			pm.ebpf.SetHeapLivePID(pid, hasLive)
 		}
@@ -911,99 +904,80 @@ func (pm *ProcessManager) CleanupPIDs() {
 	}
 }
 
-// ReconcileUSDTProbes performs a periodic re-reconciliation of USDT probes
-// for tracked PIDs that currently have no attachments. This handles the case
-// where a process was first discovered before its USDT-bearing libraries were
-// loaded (e.g., a Java process that loads a native .so via JNA after JVM
-// startup). The batchSize parameter limits how many PIDs are reconciled per
-// call to amortise /proc I/O cost.
+// ReconcileMemoryProbes periodically retries PIDs missing a required memory
+// event. This catches libraries loaded after initial discovery while avoiding
+// repeated scans once one allocation hook (and, for live mode, one
+// deallocation hook) is attached. batchSize amortizes /proc I/O.
 //
 // NOTE: Exported only for tracer.
-func (pm *ProcessManager) ReconcileUSDTProbes(batchSize int) {
-	if pm.usdtManager == nil {
+func (pm *ProcessManager) ReconcileMemoryProbes(batchSize int) {
+	if pm.memoryProbeManager == nil {
 		return
 	}
 
-	// Collect candidate PIDs: tracked PIDs with no current USDT attachments.
 	pm.mu.RLock()
 	candidates := make([]libpf.PID, 0, min(batchSize, len(pm.pidToProcessInfo)))
 	for pid := range pm.pidToProcessInfo {
 		if len(candidates) >= batchSize {
 			break
 		}
-		// Skip PIDs waiting for exit cleanup.
 		if _, exiting := pm.exitEvents[pid]; exiting {
 			continue
 		}
-		inst := pm.usdtInstances[pid]
-		if inst == nil || inst.NumAttached() == 0 {
+		if pm.memoryProbeManager.ShouldRetry(pm.memoryProbeInstances[pid]) {
 			candidates = append(candidates, pid)
 		}
 	}
 	pm.mu.RUnlock()
 
-	if len(candidates) == 0 {
-		return
-	}
-
-	numAttached := 0
+	numCompleted := 0
 	for _, pid := range candidates {
-		// Acquire or create the Instance under pm.mu (same pattern as
-		// SynchronizeProcess) so concurrent callers share one object.
 		pm.mu.Lock()
 		info := pm.pidToProcessInfo[pid]
 		if info == nil {
-			// PID disappeared between candidate collection and now.
 			pm.mu.Unlock()
 			continue
 		}
-		prev := pm.usdtInstances[pid]
-		if prev == nil {
-			prev = usdt.NewInstance(pid)
-			pm.usdtInstances[pid] = prev
+		instance := pm.memoryProbeInstances[pid]
+		if instance == nil {
+			instance = memory.NewInstance(pid)
+			pm.memoryProbeInstances[pid] = instance
 		}
 		tid := info.lastSeenTID
 		pm.mu.Unlock()
 
 		pr := process.New(pid, tid)
-
-		_, err := pm.usdtManager.Reconcile(pid, pr, prev)
+		_, err := pm.memoryProbeManager.Reconcile(pid, pr, instance)
 		if err != nil {
-			log.Debugf("USDT periodic reconcile for PID %d: %v", pid, err)
+			log.Debugf("periodic memory probe reconcile for PID %d: %v", pid, err)
 			continue
 		}
-
-		if prev.NumAttached() > 0 {
-			numAttached++
+		if !pm.memoryProbeManager.ShouldRetry(instance) {
+			numCompleted++
 		}
 
-		// Re-check that the PID is still tracked.
 		pm.mu.Lock()
 		_, stillTracked := pm.pidToProcessInfo[pid]
 		pm.mu.Unlock()
-
 		if !stillTracked {
 			pm.mu.Lock()
-			delete(pm.usdtInstances, pid)
+			delete(pm.memoryProbeInstances, pid)
 			pm.mu.Unlock()
 			pm.deferCleanup(func() {
-				if derr := prev.Detach(); derr != nil {
-					log.Errorf("USDT detach for exited PID %d: %v", pid, derr)
+				if derr := instance.Detach(); derr != nil {
+					log.Errorf("memory probe detach for exited PID %d: %v", pid, derr)
 				}
 			})
 		} else if pm.liveHeapTracker != nil {
-			// Notify the tracker and eBPF whether this PID supports
-			// live heap (has ddheap:free attached). Without the free
-			// probe, allocs would accumulate forever.
-			hasLive := prev.HasProbeKind(usdt.ProbeHeapFree)
+			hasLive := instance.HasEvent(memory.EventDeallocation)
 			pm.liveHeapTracker.SetPIDLiveHeapSupport(pid, hasLive)
 			pm.ebpf.SetHeapLivePID(pid, hasLive)
 		}
 	}
 
-	if numAttached > 0 {
-		log.Debugf("USDT periodic reconcile: attached probes for %d new PIDs (of %d candidates)",
-			numAttached, len(candidates))
+	if numCompleted > 0 {
+		log.Debugf("periodic memory probe reconcile completed %d PIDs (of %d candidates)",
+			numCompleted, len(candidates))
 	}
 }
 
