@@ -20,9 +20,11 @@ import (
 	"strings"
 	"time"
 
+	parcausdt "github.com/parca-dev/usdt"
 	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 )
 
 const (
@@ -106,6 +108,9 @@ func newAllocatorInjector(path string, mode InjectionMode,
 	if err := validateExperimentalShimSymbols(parsed, mode); err != nil {
 		return nil, fmt.Errorf("validate experimental allocator shim %q: %w", path, err)
 	}
+	if err := validateExperimentalShimProbes(shim); err != nil {
+		return nil, fmt.Errorf("validate experimental allocator shim %q: %w", path, err)
+	}
 	return &ptraceAllocatorInjector{
 		shim: shim, mode: mode, samplingInterval: samplingInterval,
 		requireFree: requireFree,
@@ -142,6 +147,40 @@ func validateExperimentalShimSymbols(parsed *elf.File, mode InjectionMode) error
 	sort.Strings(missing)
 	if len(missing) != 0 {
 		return fmt.Errorf("missing exported symbols: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func validateExperimentalShimProbes(shim []byte) error {
+	parsed, err := pfelf.NewFile(bytes.NewReader(shim), 0, false)
+	if err != nil {
+		return fmt.Errorf("parse probe ELF: %w", err)
+	}
+	defer parsed.Close()
+	probes, err := parcausdt.ParseProbes(&pfelfReader{f: parsed})
+	if err != nil {
+		return fmt.Errorf("parse USDT notes: %w", err)
+	}
+
+	required := map[string]bool{"alloc": false, "free": false}
+	for _, probe := range probes {
+		if probe.Provider != ExperimentalShimProvider {
+			continue
+		}
+		if _, wanted := required[probe.Name]; !wanted {
+			continue
+		}
+		if probe.SemaphoreOffset == 0 {
+			return fmt.Errorf("USDT probe %s:%s has no semaphore offset",
+				probe.Provider, probe.Name)
+		}
+		required[probe.Name] = true
+	}
+	for name, found := range required {
+		if !found {
+			return fmt.Errorf("missing semaphore-gated USDT probe %s:%s",
+				ExperimentalShimProvider, name)
+		}
 	}
 	return nil
 }
