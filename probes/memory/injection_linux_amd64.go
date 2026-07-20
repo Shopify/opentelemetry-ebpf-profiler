@@ -442,22 +442,23 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 	}
 	regs := saved
 
-	trapAddress := saved.Rip &^ uint64(7)
-	trapOffset := int(saved.Rip - trapAddress)
-	trap := make([]byte, 8)
-	if _, err := unix.PtracePeekData(tid, uintptr(trapAddress), trap); err != nil {
-		return 0, fmt.Errorf("read return trap instruction at %#x (rip=%#x): %w",
-			trapAddress, saved.Rip, err)
+	// Return through the unmapped zero page instead of planting INT3 in the
+	// interrupted instruction. Text is shared by every target thread: patching
+	// it while dlopen runs can let an untraced sibling hit the breakpoint and
+	// terminate the process. Ptrace observes the leader's instruction-fetch
+	// SIGSEGV before target signal handling; the register checks below distinguish
+	// this intentional return fault from a fault inside the remote function.
+	const returnAddress uint64 = 0
+	mappings, err := readProcessMappings(s.leader)
+	if err != nil {
+		return 0, fmt.Errorf("check remote return address: %w", err)
 	}
-	patchedTrap := append([]byte(nil), trap...)
-	patchedTrap[trapOffset] = 0xcc
-	if _, err := unix.PtracePokeData(tid, uintptr(trapAddress), patchedTrap); err != nil {
-		return 0, fmt.Errorf("install return trap: %w", err)
+	for _, mapping := range mappings {
+		if mapping.start == returnAddress && mapping.end > returnAddress {
+			return 0, errors.New("remote return address zero is mapped in target")
+		}
 	}
 	defer func() {
-		if _, err := unix.PtracePokeData(tid, uintptr(trapAddress), trap); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore return trap instruction: %w", err))
-		}
 		if err := unix.PtraceSetRegs(tid, &saved); err != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("restore registers: %w", err))
 		}
@@ -483,7 +484,7 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 	}()
 
 	frame := append([]byte(nil), scratch...)
-	binary.LittleEndian.PutUint64(frame[:8], saved.Rip)
+	binary.LittleEndian.PutUint64(frame[:8], returnAddress)
 	if len(data) > 0 {
 		copy(frame[256:], data)
 		args[dataArg] = dataAddr
@@ -510,11 +511,16 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 	if err != nil {
 		return 0, err
 	}
-	if !status.Stopped() || status.StopSignal() != unix.SIGTRAP {
+	if !status.Stopped() || status.StopSignal() != unix.SIGSEGV {
 		return 0, fmt.Errorf("remote call stopped unexpectedly: %v", status)
 	}
 	if err := unix.PtraceGetRegs(tid, &regs); err != nil {
 		return 0, fmt.Errorf("read remote return registers: %w", err)
+	}
+	if regs.Rip != returnAddress || regs.Rsp != callRSP+8 {
+		return 0, fmt.Errorf(
+			"remote function faulted before returning (rip=%#x rsp=%#x, want rip=%#x rsp=%#x)",
+			regs.Rip, regs.Rsp, returnAddress, callRSP+8)
 	}
 	return regs.Rax, nil
 }
