@@ -6,6 +6,7 @@ package memory
 import (
 	"debug/elf"
 	"errors"
+	"os"
 	"testing"
 
 	cebpf "github.com/cilium/ebpf"
@@ -15,6 +16,7 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
+	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
@@ -157,8 +159,9 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 
 type processWithExecutable struct {
 	process.Process
-	executable libpf.String
-	mappings   []process.RawMapping
+	executable    libpf.String
+	mappings      []process.RawMapping
+	mappingOpenErr error
 }
 
 func (p processWithExecutable) GetExe() (libpf.String, error) {
@@ -174,6 +177,24 @@ func (p processWithExecutable) IterateMappings(
 		}
 	}
 	return 0, nil
+}
+
+func (p processWithExecutable) OpenMappingFile(
+	*process.RawMapping,
+) (process.ReadAtCloser, error) {
+	if p.mappingOpenErr != nil {
+		return nil, p.mappingOpenErr
+	}
+	return nil, errors.New("mapping open not configured by test")
+}
+
+func memoryMetricValue(values []metrics.Metric, id metrics.MetricID) metrics.MetricValue {
+	for _, value := range values {
+		if value.ID == id {
+			return value.Value
+		}
+	}
+	return 0
 }
 
 type recordingInjector struct {
@@ -328,11 +349,18 @@ func TestNewManager(t *testing.T) {
 
 func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		result InjectionResult
+		name          string
+		result        InjectionResult
+		outcomeMetric metrics.MetricID
 	}{
-		{name: "does not retry a successful injection", result: InjectionResult{GOTMallocPatched: true}},
-		{name: "does not retry an already-present shim", result: InjectionResult{AlreadyPresent: true}},
+		{
+			name: "does not retry a successful injection", result: InjectionResult{GOTMallocPatched: true},
+			outcomeMetric: metrics.IDHeapInjectionSuccesses,
+		},
+		{
+			name: "does not retry an already-present shim", result: InjectionResult{AlreadyPresent: true},
+			outcomeMetric: metrics.IDHeapInjectionAlreadyPresent,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			injector := &recordingInjector{result: test.result}
@@ -346,6 +374,15 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 			_, err = manager.Reconcile(1234, pr, inst)
 			require.NoError(t, err)
 			assert.Equal(t, 1, injector.calls, "a completed PID mutation is never retried")
+
+			gotMetrics := manager.GetAndResetMetrics()
+			assert.Equal(t, metrics.MetricValue(1),
+				memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts))
+			assert.Equal(t, metrics.MetricValue(1),
+				memoryMetricValue(gotMetrics, test.outcomeMetric))
+			assert.Equal(t, metrics.MetricValue(0),
+				memoryMetricValue(manager.GetAndResetMetrics(), metrics.IDHeapInjectionAttempts),
+				"injection counters must reset after collection")
 		})
 	}
 
@@ -364,6 +401,44 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 		_, err = manager.Reconcile(1234, pr, inst)
 		require.NoError(t, err)
 		assert.Equal(t, 1, injector.calls, "a failed PID mutation is never retried")
+
+		gotMetrics := manager.GetAndResetMetrics()
+		assert.Equal(t, metrics.MetricValue(1),
+			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts))
+		assert.Equal(t, metrics.MetricValue(1),
+			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionFailures))
+	})
+
+	t.Run("records injected shim discovery failure once per PID", func(t *testing.T) {
+		cache, err := lru.NewSynced[util.OnDiskFileIdentifier, parsedFile](
+			8, util.OnDiskFileIdentifier.Hash32)
+		require.NoError(t, err)
+		manager := &Manager{
+			config:    Config{Enabled: true},
+			needsUSDT: true,
+			parseCache: cache,
+			injector:  &recordingInjector{},
+		}
+		pr := processWithExecutable{
+			executable:     libpf.Intern("/usr/bin/ruby"),
+			mappingOpenErr: os.ErrPermission,
+			mappings: []process.RawMapping{{
+				Vaddr: 0x1000, Length: 0x1000, Flags: elf.PF_R | elf.PF_X,
+				Device: 1, Inode: 2, Path: "/memfd:prophiler-heap-shim (deleted)",
+			}},
+		}
+		inst := NewInstance(1234)
+		inst.injectionAttempted = true
+
+		_, err = manager.Reconcile(1234, pr, inst)
+		require.ErrorIs(t, err, os.ErrPermission)
+		_, err = manager.Reconcile(1234, pr, inst)
+		require.ErrorIs(t, err, os.ErrPermission)
+
+		gotMetrics := manager.GetAndResetMetrics()
+		assert.Equal(t, metrics.MetricValue(1), memoryMetricValue(
+			gotMetrics, metrics.IDHeapInjectionProbeDiscoveryFailures))
+		assert.Zero(t, memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts))
 	})
 
 	t.Run("discovered memfd producer prevents injection", func(t *testing.T) {

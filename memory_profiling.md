@@ -186,6 +186,10 @@ allocation hook was discovered. The profiler must also have permission to ptrace
 injected mapping through `/proc/<pid>/map_files` (typically `CAP_CHECKPOINT_RESTORE` or
 `CAP_SYS_ADMIN` on current kernels). Mutation can succeed while later probe discovery fails
 if the latter access is missing; the one-attempt rule still prevents automatic reinjection.
+Injector lifecycle is exported through `agent.heap.injection.{attempts,successes,failures,
+already_present,probe_discovery_failures}` counters. A successful count means a new target
+mutation was reported; partial mutation is counted as failure, and `already_present` is a
+separate non-mutating outcome. The three outcome counters sum to attempts.
 
 The injector validates and snapshots a non-writable x86-64 shim, ptrace-stops a target
 thread, creates a sealable memfd inside the target, copies and write-seals the snapshot, and

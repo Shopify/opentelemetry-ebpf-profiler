@@ -2230,5 +2230,40 @@
     "name": "HeapFreeSamples",
     "field": "agent.heap.free_samples",
     "id": 305
+  },
+  {
+    "description": "Number of explicitly enabled experimental allocator injection attempts",
+    "type": "counter",
+    "name": "HeapInjectionAttempts",
+    "field": "agent.heap.injection.attempts",
+    "id": 306
+  },
+  {
+    "description": "Number of experimental allocator injection attempts that newly mutated a target",
+    "type": "counter",
+    "name": "HeapInjectionSuccesses",
+    "field": "agent.heap.injection.successes",
+    "id": 307
+  },
+  {
+    "description": "Number of failed experimental allocator injection attempts, including partial mutation",
+    "type": "counter",
+    "name": "HeapInjectionFailures",
+    "field": "agent.heap.injection.failures",
+    "id": 308
+  },
+  {
+    "description": "Number of experimental allocator injection attempts that found an existing shim",
+    "type": "counter",
+    "name": "HeapInjectionAlreadyPresent",
+    "field": "agent.heap.injection.already_present",
+    "id": 309
+  },
+  {
+    "description": "Number of injected PIDs whose shim probes could not be discovered through map_files",
+    "type": "counter",
+    "name": "HeapInjectionProbeDiscoveryFailures",
+    "field": "agent.heap.injection.probe_discovery_failures",
+    "id": 310
   }
 ]

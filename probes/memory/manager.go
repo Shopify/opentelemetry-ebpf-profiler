@@ -5,10 +5,12 @@ package memory // import "go.opentelemetry.io/ebpf-profiler/probes/memory"
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	cebpf "github.com/cilium/ebpf"
 	lru "github.com/elastic/go-freelru"
 
+	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
@@ -38,6 +40,14 @@ type Manager struct {
 	// injector is non-nil only after an operator explicitly enables destructive
 	// allocator interposition. Normal memory profiling never constructs it.
 	injector allocatorInjector
+
+	// Injection counters are process-independent and periodically drained by
+	// ProcessManager. Atomics keep reconciliation independent across PIDs.
+	injectionAttempts               atomic.Uint64
+	injectionSuccesses              atomic.Uint64
+	injectionFailures               atomic.Uint64
+	injectionAlreadyPresent         atomic.Uint64
+	injectionProbeDiscoveryFailures atomic.Uint64
 }
 
 // NewManager constructs the process-scoped memory hook manager. It returns
@@ -166,4 +176,25 @@ func (m *Manager) Close() error {
 	}
 	m.parseCache.Purge()
 	return nil
+}
+
+// GetAndResetMetrics returns experimental-injection lifecycle counters since
+// the previous collection. A nil slice keeps ordinary memory profiling from
+// reporting injector-only metrics.
+func (m *Manager) GetAndResetMetrics() []metrics.Metric {
+	if m == nil || m.injector == nil {
+		return nil
+	}
+	return []metrics.Metric{
+		{ID: metrics.IDHeapInjectionAttempts,
+			Value: metrics.MetricValue(m.injectionAttempts.Swap(0))},
+		{ID: metrics.IDHeapInjectionSuccesses,
+			Value: metrics.MetricValue(m.injectionSuccesses.Swap(0))},
+		{ID: metrics.IDHeapInjectionFailures,
+			Value: metrics.MetricValue(m.injectionFailures.Swap(0))},
+		{ID: metrics.IDHeapInjectionAlreadyPresent,
+			Value: metrics.MetricValue(m.injectionAlreadyPresent.Swap(0))},
+		{ID: metrics.IDHeapInjectionProbeDiscoveryFailures,
+			Value: metrics.MetricValue(m.injectionProbeDiscoveryFailures.Swap(0))},
+	}
 }

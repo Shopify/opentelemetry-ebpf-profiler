@@ -198,6 +198,9 @@ func collectInterpreterMetrics(ctx context.Context, pm *ProcessManager,
 		summary.Add(dotnet.GetAndResetMetrics())
 		summary.Add(pm.ebpf.CollectMetrics())
 
+		if pm.memoryProbeManager != nil {
+			summary.Add(pm.memoryProbeManager.GetAndResetMetrics())
+		}
 		if pm.liveHeapTracker != nil {
 			summary.Add(pm.liveHeapTracker.GetAndResetMetrics())
 		}

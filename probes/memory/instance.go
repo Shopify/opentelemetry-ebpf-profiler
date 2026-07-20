@@ -159,6 +159,9 @@ func (m *Manager) Reconcile(
 			if mapping.IsMemFD() && strings.Contains(mapping.Path, "prophiler-heap-shim") &&
 				errors.Is(err, os.ErrPermission) {
 				inst.injectionDiscoveryWarning.Do(func() {
+					if m.injector != nil {
+						m.injectionProbeDiscoveryFailures.Add(1)
+					}
 					log.Warnf("EXPERIMENTAL allocator shim pid=%d cannot attach USDT probes: "+
 						"opening /proc/%d/map_files was denied; grant CAP_CHECKPOINT_RESTORE "+
 						"or CAP_SYS_ADMIN to attach, or restart the target to remove interposition: %v",
@@ -262,14 +265,18 @@ func (m *Manager) Reconcile(
 	if m.injector != nil && !allocationHookDiscovered && !hasAllocation && inst.beginInjection() {
 		// This permanently mutates the target. It is reachable only through an
 		// explicitly selected experimental mode and is never retried implicitly.
+		m.injectionAttempts.Add(1)
 		result, err := m.injector.Inject(pid)
 		inst.completeInjection(result, err)
 		if err != nil {
+			m.injectionFailures.Add(1)
 			injectionErr = fmt.Errorf("experimental allocator injection pid=%d: %w", pid, err)
 		} else if result.AlreadyPresent {
+			m.injectionAlreadyPresent.Add(1)
 			log.Warnf("EXPERIMENTAL allocator shim already present in pid=%d; no new mutation: %s",
 				pid, result)
 		} else {
+			m.injectionSuccesses.Add(1)
 			log.Warnf("EXPERIMENTAL allocator injection mutated pid=%d: %s", pid, result)
 		}
 	}
