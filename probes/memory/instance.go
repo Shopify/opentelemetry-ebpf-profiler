@@ -6,6 +6,8 @@ package memory // import "go.opentelemetry.io/ebpf-profiler/probes/memory"
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf/link"
@@ -30,9 +32,10 @@ type Instance struct {
 
 	// injectionAttempted makes destructive mutation at most once per process.
 	// A failed injection is never retried automatically.
-	injectionAttempted bool
-	injectionResult    InjectionResult
-	injectionErr       error
+	injectionAttempted        bool
+	injectionResult           InjectionResult
+	injectionErr              error
+	injectionDiscoveryWarning sync.Once
 }
 
 type desiredEntry struct {
@@ -153,6 +156,15 @@ func (m *Manager) Reconcile(
 			// Preserve existing links for a file we could not inspect. A
 			// transient map_files/read failure is not evidence that its hooks
 			// disappeared.
+			if mapping.IsMemFD() && strings.Contains(mapping.Path, "prophiler-heap-shim") &&
+				errors.Is(err, os.ErrPermission) {
+				inst.injectionDiscoveryWarning.Do(func() {
+					log.Warnf("EXPERIMENTAL allocator shim pid=%d cannot attach USDT probes: "+
+						"opening /proc/%d/map_files was denied; grant CAP_CHECKPOINT_RESTORE "+
+						"or CAP_SYS_ADMIN to attach, or restart the target to remove interposition: %v",
+						pid, pid, err)
+				})
+			}
 			failedFiles[fileID] = struct{}{}
 			scanErrs = append(scanErrs, fmt.Errorf("scan mapping %#x-%#x: %w",
 				mapping.Vaddr, mapping.Vaddr+mapping.Length, err))

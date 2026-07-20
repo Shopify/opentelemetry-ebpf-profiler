@@ -188,10 +188,12 @@ injected mapping through `/proc/<pid>/map_files` (typically `CAP_CHECKPOINT_REST
 if the latter access is missing; the one-attempt rule still prevents automatic reinjection.
 
 The injector validates and snapshots a non-writable x86-64 shim, ptrace-stops a target
-thread, creates a memfd inside the target, copies the snapshot into it, and remotely invokes
-`dlopen`. It first calls the shim's GOT/PLT rewriter. `got-then-inline` additionally reaches
-a stable all-thread stop and permits the shim to copy allocator prologues into trampolines
-and overwrite libc `malloc`/`free` entries with jumps. The inline decoder refuses unknown
+thread, creates a sealable memfd inside the target, copies and write-seals the snapshot, and
+remotely invokes `dlopen`. It first calls the shim's GOT/PLT rewriter. GOT mode only rewrites
+eligible relocation slots in objects loaded at injection time; direct allocator calls and
+later-loaded objects can bypass it. `got-then-inline` additionally reaches a stable
+all-thread stop and permits the shim to copy allocator prologues into trampolines and
+overwrite libc `malloc`/`free` entries with jumps. The inline decoder refuses unknown
 instruction encodings but cannot make arbitrary hot patching safe. A mapped Prophiler shim
 is treated as already present, preventing reinjection after an agent restart.
 

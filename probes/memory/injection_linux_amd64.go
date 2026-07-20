@@ -34,8 +34,10 @@ const (
 	maxExperimentalShimSize = 16 << 20
 	remoteSysMemfdCreate    = 319
 	remoteSysClose          = 3
-	remoteMfdCloexec        = 1
-	remoteRtldNow           = 2
+	remoteMfdFlags          = unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING
+	remoteMfdSeals          = unix.F_SEAL_SEAL | unix.F_SEAL_SHRINK |
+		unix.F_SEAL_GROW | unix.F_SEAL_WRITE
+	remoteRtldNow = 2
 
 	shimGOTMallocBit    = 1 << 0
 	shimGOTFreeBit      = 1 << 1
@@ -208,6 +210,23 @@ func validateOpenedShimMemfd(file *os.File, stat *unix.Stat_t) error {
 	return nil
 }
 
+func sealOpenedShimMemfd(file *os.File) error {
+	if file == nil {
+		return errors.New("missing opened memfd")
+	}
+	if _, err := unix.FcntlInt(file.Fd(), unix.F_ADD_SEALS, remoteMfdSeals); err != nil {
+		return fmt.Errorf("seal target shim memfd: %w", err)
+	}
+	seals, err := unix.FcntlInt(file.Fd(), unix.F_GET_SEALS, 0)
+	if err != nil {
+		return fmt.Errorf("read target shim memfd seals: %w", err)
+	}
+	if seals&remoteMfdSeals != remoteMfdSeals {
+		return fmt.Errorf("target shim memfd has incomplete seals %#x", seals)
+	}
+	return nil
+}
+
 func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult, retErr error) {
 	// Linux records ptrace ownership at thread granularity. Keep every attach,
 	// wait, register operation, and detach on one tracer thread.
@@ -249,7 +268,7 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	}()
 
 	fdValue, err := session.CallWithData(syscallAddr,
-		[]uint64{remoteSysMemfdCreate, 0, remoteMfdCloexec}, 1,
+		[]uint64{remoteSysMemfdCreate, 0, remoteMfdFlags}, 1,
 		[]byte("prophiler-heap-shim\x00"))
 	if err != nil {
 		return result, fmt.Errorf("remote memfd_create: %w", err)
@@ -278,10 +297,14 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 			copyErr = io.ErrShortWrite
 		}
 	}
+	var sealErr error
+	if identityErr == nil && truncateErr == nil && copyErr == nil {
+		sealErr = sealOpenedShimMemfd(remoteFile)
+	}
 	closeErr := remoteFile.Close()
-	if identityErr != nil || truncateErr != nil || copyErr != nil || closeErr != nil {
+	if identityErr != nil || truncateErr != nil || copyErr != nil || sealErr != nil || closeErr != nil {
 		return result, fmt.Errorf("populate target memfd: %w",
-			errors.Join(identityErr, truncateErr, copyErr, closeErr))
+			errors.Join(identityErr, truncateErr, copyErr, sealErr, closeErr))
 	}
 	injectedShimMapping := func(mapping processMapping) bool {
 		return isExperimentalShimMapping(mapping) &&
@@ -489,11 +512,49 @@ func (s *ptraceSession) Close() error {
 	s.closed = true
 	var errs []error
 	for n := len(s.threads) - 1; n >= 0; n-- {
-		if err := unix.PtraceDetach(s.threads[n]); err != nil && !errors.Is(err, unix.ESRCH) {
+		if err := s.detachThread(s.threads[n]); err != nil {
 			errs = append(errs, fmt.Errorf("ptrace detach tid %d: %w", s.threads[n], err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (s *ptraceSession) detachThread(tid int) error {
+	detachErr := unix.PtraceDetach(tid)
+	if detachErr == nil {
+		return nil
+	}
+	// PTRACE_DETACH reports ESRCH when a still-live tracee is running rather
+	// than ptrace-stopped. Force one bounded stop and retry instead of silently
+	// leaving the target attached until the profiler exits.
+	if !errors.Is(detachErr, unix.ESRCH) && !errors.Is(detachErr, unix.EBUSY) &&
+		!errors.Is(detachErr, unix.EIO) {
+		return detachErr
+	}
+	stopErr := unix.Tgkill(s.leader, tid, unix.SIGSTOP)
+	if errors.Is(stopErr, unix.ESRCH) {
+		return nil // The thread exited before cleanup.
+	}
+	if stopErr != nil {
+		return errors.Join(detachErr, fmt.Errorf("stop running tracee: %w", stopErr))
+	}
+	status, observed, waitErr := pollWaitStatus(tid, ptraceStopRecoveryTime)
+	if waitErr != nil {
+		return errors.Join(detachErr, fmt.Errorf("wait for detach stop: %w", waitErr))
+	}
+	if !observed {
+		return errors.Join(detachErr, errors.New("timed out waiting for detach stop"))
+	}
+	if status.Exited() || status.Signaled() {
+		return nil
+	}
+	if !status.Stopped() {
+		return errors.Join(detachErr, fmt.Errorf("unexpected detach wait status: %v", status))
+	}
+	if err := unix.PtraceDetach(tid); err != nil {
+		return errors.Join(detachErr, fmt.Errorf("detach after recovery stop: %w", err))
+	}
+	return nil
 }
 
 func (s *ptraceSession) Call(fn uint64, args ...uint64) (uint64, error) {
@@ -618,6 +679,12 @@ func waitForPtraceStop(tgid, tid int, timeout time.Duration) (unix.WaitStatus, e
 	recoveredStatus, recovered, recoveryErr := pollWaitStatus(tid, ptraceStopRecoveryTime)
 	if recovered {
 		status = recoveredStatus
+		// The function may have returned through the intentional null-page fault
+		// just after the deadline. Let call() validate RIP/RSP and retain RAX
+		// rather than reporting a completed mutation as a permanent failure.
+		if potentialRemoteReturnStop(status) {
+			return status, nil
+		}
 	}
 	if recoveryCause := errors.Join(stopErr, recoveryErr); recoveryCause != nil {
 		return status, fmt.Errorf(
@@ -626,6 +693,10 @@ func waitForPtraceStop(tgid, tid int, timeout time.Duration) (unix.WaitStatus, e
 	}
 	return status, fmt.Errorf("remote call timed out after %s; recovery stop=%t",
 		timeout, recovered)
+}
+
+func potentialRemoteReturnStop(status unix.WaitStatus) bool {
+	return status.Stopped() && status.StopSignal() == unix.SIGSEGV
 }
 
 // pollWaitStatus bounds every ptrace wait. The boolean reports whether Wait4
@@ -703,12 +774,8 @@ func readProcessMappings(pid int) ([]processMapping, error) {
 	return mappings, nil
 }
 
-func isVersionedSharedObject(base, name string) bool {
-	if base == name {
-		return true
-	}
-	version, ok := strings.CutPrefix(base, name+".")
-	if !ok || version == "" {
+func isNumericVersion(version string) bool {
+	if version == "" {
 		return false
 	}
 	for _, component := range strings.Split(version, ".") {
@@ -724,14 +791,38 @@ func isVersionedSharedObject(base, name string) bool {
 	return true
 }
 
+func isVersionedSharedObject(base, name string) bool {
+	if base == name {
+		return true
+	}
+	version, ok := strings.CutPrefix(base, name+".")
+	return ok && isNumericVersion(version)
+}
+
+func isGlibcSharedObject(base, stem string) bool {
+	if isVersionedSharedObject(base, stem+".so") {
+		return true
+	}
+	versioned, ok := strings.CutPrefix(base, stem+"-")
+	if !ok {
+		return false
+	}
+	version, ok := strings.CutSuffix(versioned, ".so")
+	return ok && isNumericVersion(version)
+}
+
 func isAllocatorRuntimeMapping(mapping processMapping) bool {
 	base := path.Base(strings.TrimSuffix(mapping.path, " (deleted)"))
-	return isVersionedSharedObject(base, "libc.so") ||
-		isVersionedSharedObject(base, "libdl.so")
+	return isGlibcSharedObject(base, "libc") || isGlibcSharedObject(base, "libdl")
 }
 
 func isExperimentalShimMapping(mapping processMapping) bool {
-	return strings.Contains(mapping.path, "prophiler-heap-shim")
+	mappingPath := strings.TrimSuffix(mapping.path, " (deleted)")
+	if mappingPath == "/memfd:prophiler-heap-shim" || mappingPath == "memfd:prophiler-heap-shim" {
+		return true
+	}
+	base := path.Base(mappingPath)
+	return base == "libprophiler-heap-shim.so" || base == "libprophiler-heap-shim-test.so"
 }
 
 func resolveProcessSymbol(pid int, name string, acceptsMapping func(processMapping) bool) (uint64, error) {

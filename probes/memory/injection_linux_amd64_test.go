@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -33,22 +34,47 @@ func TestInjectionSymbolMappingFilters(t *testing.T) {
 	mapping := func(path string) processMapping { return processMapping{path: path} }
 	assert.True(t, isAllocatorRuntimeMapping(mapping("/usr/lib/x86_64-linux-gnu/libc.so.6")))
 	assert.True(t, isAllocatorRuntimeMapping(mapping("/lib/libdl.so.2 (deleted)")))
+	assert.True(t, isAllocatorRuntimeMapping(mapping("/usr/lib64/libc-2.17.so")))
+	assert.True(t, isAllocatorRuntimeMapping(mapping("/usr/lib64/libdl-2.17.so")))
 	assert.False(t, isAllocatorRuntimeMapping(mapping("/tmp/libc.so-pretender")))
 	assert.False(t, isAllocatorRuntimeMapping(mapping("/tmp/libc.so.6.pretender")))
 	assert.False(t, isAllocatorRuntimeMapping(mapping("/tmp/libc.so.6..1")))
+	assert.False(t, isAllocatorRuntimeMapping(mapping("/tmp/libc-2.x.so")))
 	assert.False(t, isAllocatorRuntimeMapping(mapping("/usr/bin/target")))
 	assert.True(t, isExperimentalShimMapping(mapping("/memfd:prophiler-heap-shim (deleted)")))
+	assert.True(t, isExperimentalShimMapping(mapping("/opt/prophiler/libprophiler-heap-shim.so")))
+	assert.False(t, isExperimentalShimMapping(mapping("/tmp/prophiler-heap-shim-decoy.so")))
 	assert.False(t, isExperimentalShimMapping(mapping("/usr/lib/libc.so.6")))
 }
 
-func TestValidateOpenedShimMemfd(t *testing.T) {
-	fd, err := unix.MemfdCreate("prophiler-heap-shim", unix.MFD_CLOEXEC)
+func TestValidateAndSealOpenedShimMemfd(t *testing.T) {
+	fd, err := unix.MemfdCreate("prophiler-heap-shim", remoteMfdFlags)
 	require.NoError(t, err)
 	memfd := os.NewFile(uintptr(fd), "prophiler-heap-shim")
 	require.NotNil(t, memfd)
 	defer memfd.Close()
+	_, err = memfd.Write([]byte("shim"))
+	require.NoError(t, err)
+
 	var stat unix.Stat_t
 	require.NoError(t, validateOpenedShimMemfd(memfd, &stat))
+	require.NoError(t, sealOpenedShimMemfd(memfd))
+	seals, err := unix.FcntlInt(memfd.Fd(), unix.F_GET_SEALS, 0)
+	require.NoError(t, err)
+	assert.Equal(t, remoteMfdSeals, seals&remoteMfdSeals)
+	_, err = memfd.WriteAt([]byte("x"), 0)
+	require.Error(t, err, "sealed shim bytes must be immutable")
+}
+
+func TestValidateOpenedShimMemfdRejectsWrongName(t *testing.T) {
+	fd, err := unix.MemfdCreate("other-shim", remoteMfdFlags)
+	require.NoError(t, err)
+	memfd := os.NewFile(uintptr(fd), "other-shim")
+	require.NotNil(t, memfd)
+	defer memfd.Close()
+	var stat unix.Stat_t
+	require.ErrorContains(t, validateOpenedShimMemfd(memfd, &stat),
+		"not the requested heap shim memfd")
 }
 
 func TestValidateOpenedShimMemfdRejectsNamedFile(t *testing.T) {
@@ -63,6 +89,49 @@ func TestValidateOpenedShimMemfdRejectsNamedFile(t *testing.T) {
 	assert.True(t, openedFileMatchesMapping(file, mapping))
 	mapping.inode++
 	assert.False(t, openedFileMatchesMapping(file, mapping))
+	mapping.inode = stat.Ino
+	mapping.device++
+	assert.False(t, openedFileMatchesMapping(file, mapping))
+}
+
+func TestPotentialRemoteReturnStop(t *testing.T) {
+	returned := unix.WaitStatus(int(unix.SIGSEGV)<<8 | 0x7f)
+	stopped := unix.WaitStatus(int(unix.SIGSTOP)<<8 | 0x7f)
+	assert.True(t, potentialRemoteReturnStop(returned))
+	assert.False(t, potentialRemoteReturnStop(stopped))
+	assert.False(t, potentialRemoteReturnStop(0))
+}
+
+func TestPtraceSessionCloseRecoversRunningTracee(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	cmd := exec.Command("sleep", "30")
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	session, err := attachThreads(cmd.Process.Pid, []int{cmd.Process.Pid})
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		t.Skipf("ptrace unavailable: %v", err)
+	}
+	require.NoError(t, err)
+	defer func() { _ = session.Close() }()
+	require.NoError(t, unix.PtraceCont(cmd.Process.Pid, 0))
+	require.NoError(t, session.Close(), "running tracee was not recovered and detached")
+
+	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatal("detached tracee remained stopped")
+	}
 }
 
 func TestRequiredAllocatorPatchesPresent(t *testing.T) {
@@ -111,13 +180,25 @@ func TestExperimentalShimUSDTNotes(t *testing.T) {
 
 	contents, err := os.ReadFile(shim)
 	require.NoError(t, err)
-	corrupt := append([]byte(nil), contents...)
-	needle := []byte(ExperimentalShimProvider + "\x00alloc\x00")
-	note := bytes.Index(corrupt, needle)
-	require.NotEqual(t, -1, note, "allocation USDT descriptor not found")
-	corrupt[note+len(ExperimentalShimProvider)+1] = 'x'
-	require.ErrorContains(t, validateExperimentalShimProbes(corrupt),
-		"missing semaphore-gated USDT probe")
+	for _, name := range []string{"alloc", "free"} {
+		t.Run("reject missing "+name, func(t *testing.T) {
+			corrupt := append([]byte(nil), contents...)
+			needle := []byte(ExperimentalShimProvider + "\x00" + name + "\x00")
+			note := bytes.Index(corrupt, needle)
+			require.NotEqual(t, -1, note, "%s USDT descriptor not found", name)
+			corrupt[note+len(ExperimentalShimProvider)+1] = 'x'
+			require.ErrorContains(t, validateExperimentalShimProbes(corrupt),
+				"missing semaphore-gated USDT probe")
+		})
+	}
+
+	zeroSemaphore := append([]byte(nil), contents...)
+	allocNote := bytes.Index(zeroSemaphore,
+		[]byte(ExperimentalShimProvider+"\x00alloc\x00"))
+	require.GreaterOrEqual(t, allocNote, 8, "allocation USDT descriptor not found")
+	clear(zeroSemaphore[allocNote-8 : allocNote])
+	require.ErrorContains(t, validateExperimentalShimProbes(zeroSemaphore),
+		"has no semaphore offset")
 }
 
 func TestExperimentalAllocatorInjection(t *testing.T) {
