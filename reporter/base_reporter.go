@@ -80,13 +80,14 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 	}
 
 	sampleKey := samples.SampleKey{
-		Hash:      traceHash,
-		Comm:      meta.Comm,
-		TID:       int64(meta.TID),
-		CPU:       int64(meta.CPU),
-		SpanID:    meta.SpanID,
-		TraceID:   meta.TraceID,
-		ExtraMeta: extraMeta,
+		Hash:       traceHash,
+		LabelsHash: traceutil.HashLabels(trace.CustomLabels),
+		Comm:       meta.Comm,
+		TID:        int64(meta.TID),
+		CPU:        int64(meta.CPU),
+		SpanID:     meta.SpanID,
+		TraceID:    meta.TraceID,
+		ExtraMeta:  extraMeta,
 	}
 	if events, exists := rtp.Events[meta.ProfileType][sampleKey]; exists {
 		events.Timestamps = append(events.Timestamps, uint64(meta.Timestamp))
