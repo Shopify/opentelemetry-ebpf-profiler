@@ -92,7 +92,7 @@ func TestExperimentalShimUSDTNotes(t *testing.T) {
 		"missing semaphore-gated USDT probe")
 }
 
-func TestExperimentalGOTInjection(t *testing.T) {
+func TestExperimentalAllocatorInjection(t *testing.T) {
 	shim := os.Getenv("PROPHILER_TEST_HEAP_SHIM")
 	if shim == "" {
 		t.Skip("set PROPHILER_TEST_HEAP_SHIM to run destructive ptrace integration test")
@@ -102,21 +102,35 @@ func TestExperimentalGOTInjection(t *testing.T) {
 		t.Skip("C compiler unavailable")
 	}
 
-	target := filepath.Join(t.TempDir(), "heap-injection-target")
-	build := exec.Command(compiler, "-O0", "-g", "-fno-builtin", "-pthread", "-o", target,
-		"testdata/heap_injection_target.c")
-	buildOutput, err := build.CombinedOutput()
-	require.NoError(t, err, string(buildOutput))
+	dir := t.TempDir()
+	buildTarget := func(name string, extraFlags ...string) string {
+		t.Helper()
+		target := filepath.Join(dir, name)
+		args := []string{"-O0", "-g", "-fno-builtin", "-pthread"}
+		args = append(args, extraFlags...)
+		args = append(args, "-o", target, "testdata/heap_injection_target.c", "-ldl")
+		build := exec.Command(compiler, args...)
+		buildOutput, buildErr := build.CombinedOutput()
+		require.NoError(t, buildErr, string(buildOutput))
+		return target
+	}
+	gotTarget := buildTarget("heap-injection-got-target")
+	inlineTarget := buildTarget("heap-injection-inline-target", "-DRESOLVE_ALLOCATORS")
 
 	for _, test := range []struct {
-		name        string
-		requireFree bool
+		name         string
+		target       string
+		mode         InjectionMode
+		requireFree  bool
+		expectInline bool
 	}{
-		{name: "allocation"},
-		{name: "live", requireFree: true},
+		{name: "got-allocation", target: gotTarget, mode: InjectionGOT},
+		{name: "got-live", target: gotTarget, mode: InjectionGOT, requireFree: true},
+		{name: "inline-allocation", target: inlineTarget, mode: InjectionGOTThenInline, expectInline: true},
+		{name: "inline-live", target: inlineTarget, mode: InjectionGOTThenInline, requireFree: true, expectInline: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			cmd := exec.Command(target)
+			cmd := exec.Command(test.target)
 			stdout, err := cmd.StdoutPipe()
 			require.NoError(t, err)
 			cmd.Stderr = os.Stderr
@@ -141,13 +155,21 @@ func TestExperimentalGOTInjection(t *testing.T) {
 			}
 
 			injector, err := newAllocatorInjector(
-				shim, InjectionGOT, DefaultSamplingIntervalBytes, test.requireFree)
+				shim, test.mode, DefaultSamplingIntervalBytes, test.requireFree)
 			require.NoError(t, err)
 			result, err := injector.Inject(libpf.PID(cmd.Process.Pid))
 			require.NoError(t, err)
-			assert.True(t, result.GOTMallocPatched)
-			assert.Equal(t, test.requireFree, result.GOTFreePatched)
-			assert.Greater(t, result.PatchedSlots, uint32(0))
+			if test.expectInline {
+				assert.True(t, result.InlineMallocPatched)
+				assert.Equal(t, test.requireFree, result.InlineFreePatched)
+			} else {
+				assert.True(t, result.GOTMallocPatched)
+				assert.Equal(t, test.requireFree, result.GOTFreePatched)
+				assert.Greater(t, result.PatchedSlots, uint32(0))
+			}
+			time.Sleep(20 * time.Millisecond)
+			require.NoError(t, cmd.Process.Signal(syscall.Signal(0)),
+				"target died after allocator mutation")
 
 			// A fresh manager after an agent restart must recognize the mapped shim
 			// and never layer another allocator patch over the first one.
