@@ -3,7 +3,7 @@
 
 //go:build !linux || !amd64
 
-package memory
+package memory // import "go.opentelemetry.io/ebpf-profiler/probes/memory"
 
 import "fmt"
 
