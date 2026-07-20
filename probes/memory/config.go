@@ -21,11 +21,14 @@ const (
 	// by one sample from a directly instrumented allocator.
 	DefaultSamplingIntervalBytes = 512 * 1024
 
-	// ExperimentalShimExecutable matches the memfd name used when the profiler
-	// injects its allocator shim into another process.
+	// ExperimentalShimExecutable and symbols describe the stable helper ABI of
+	// the injected shim. The profiler's built-in injection path attaches through
+	// semaphore-gated USDT notes so sampling stops when the links are detached;
+	// the symbols remain available for explicit weighted-uprobe configurations.
 	ExperimentalShimExecutable  = "*prophiler-heap-shim*"
 	ExperimentalShimAllocSymbol = "prophiler_heap_alloc"
 	ExperimentalShimFreeSymbol  = "prophiler_heap_free"
+	ExperimentalShimProvider    = "prophiler_heap"
 )
 
 // HookType identifies how a process-local memory event hook is discovered.
@@ -74,6 +77,9 @@ const (
 	HookTypeUSDT HookType = "usdt"
 	// HookTypeUprobe discovers a function symbol in matching executable mappings.
 	HookTypeUprobe HookType = "uprobe"
+	// HookTypeWeightedUprobe is the compact CLI form for a producer-sampled
+	// uprobe exposing the weighted allocation ABI.
+	HookTypeWeightedUprobe HookType = "weighted-uprobe"
 )
 
 // HookABI identifies the adapter between an attachment point and a typed memory
@@ -148,7 +154,7 @@ func ParseHook(spec string) (Hook, error) {
 			return Hook{}, fmt.Errorf("invalid memory hook %q: expected usdt:<provider>:<name>", spec)
 		}
 		hook = USDTHook(strings.TrimSpace(provider), strings.TrimSpace(name))
-	case HookTypeUprobe, HookType("weighted-uprobe"):
+	case HookTypeUprobe, HookTypeWeightedUprobe:
 		// Split on the final colon so Linux paths containing ':' remain valid.
 		separator := strings.LastIndexByte(target, ':')
 		if separator < 0 {
@@ -157,7 +163,7 @@ func ParseHook(spec string) (Hook, error) {
 		}
 		hook = UprobeHook(
 			strings.TrimSpace(target[:separator]), strings.TrimSpace(target[separator+1:]))
-		if HookType(strings.ToLower(strings.TrimSpace(typeName))) == HookType("weighted-uprobe") {
+		if HookType(strings.ToLower(strings.TrimSpace(typeName))) == HookTypeWeightedUprobe {
 			hook.ABI = ABIWeightedAllocation
 		}
 	default:
@@ -323,13 +329,13 @@ func (cfg *Config) ApplyDefaults() {
 	}
 	if cfg.ExperimentalInjectionMode != InjectionDisabled {
 		cfg.AllocationHooks = appendHookIfMissing(cfg.AllocationHooks, Hook{
-			Type: HookTypeUprobe, ABI: ABIWeightedAllocation,
-			Executable: ExperimentalShimExecutable, Symbol: ExperimentalShimAllocSymbol,
+			Type: HookTypeUSDT, ABI: ABIWeightedAllocation,
+			Provider: ExperimentalShimProvider, Name: "alloc",
 		})
 		if cfg.Live {
 			cfg.DeallocationHooks = appendHookIfMissing(cfg.DeallocationHooks, Hook{
-				Type: HookTypeUprobe, ABI: ABIFree,
-				Executable: ExperimentalShimExecutable, Symbol: ExperimentalShimFreeSymbol,
+				Type: HookTypeUSDT, ABI: ABIFree,
+				Provider: ExperimentalShimProvider, Name: "free",
 			})
 		}
 	}
@@ -338,6 +344,7 @@ func (cfg *Config) ApplyDefaults() {
 func appendHookIfMissing(hooks []Hook, candidate Hook) []Hook {
 	for _, hook := range hooks {
 		if hook.Type == candidate.Type && hook.ABI == candidate.ABI &&
+			hook.Provider == candidate.Provider && hook.Name == candidate.Name &&
 			hook.Executable == candidate.Executable && hook.Symbol == candidate.Symbol {
 			return hooks
 		}
@@ -357,6 +364,9 @@ func (cfg Config) Validate() error {
 	case InjectionGOT, InjectionGOTThenInline:
 		if !cfg.Enabled {
 			return fmt.Errorf("experimental allocator injection requires memory profiling to be enabled")
+		}
+		if cfg.SamplingIntervalBytes == 0 {
+			return fmt.Errorf("experimental allocator injection requires a non-zero sampling interval bytes")
 		}
 		if cfg.ExperimentalShimPath == "" {
 			return fmt.Errorf("experimental allocator injection requires experimental_shim_path")

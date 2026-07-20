@@ -183,12 +183,18 @@ Both require `--heap-profiling` and at least one `--heap-process-executable` sel
 are disabled by default and attempted at most once per eligible PID, only after no producer
 allocation hook was discovered.
 
-The injector ptrace-stops a target thread, creates a memfd inside the target, copies the
-local shim into it, and remotely invokes `dlopen`. It first calls the shim's GOT/PLT
-rewriter. `got-then-inline` additionally stops every target thread and permits the shim to
-copy allocator prologues into trampolines and overwrite libc `malloc`/`free` entries with
-jumps. The inline decoder refuses unknown instruction encodings but cannot make arbitrary
-hot patching safe.
+The injector validates and snapshots a non-writable x86-64 shim, ptrace-stops a target
+thread, creates a memfd inside the target, copies the snapshot into it, and remotely invokes
+`dlopen`. It first calls the shim's GOT/PLT rewriter. `got-then-inline` additionally reaches
+a stable all-thread stop and permits the shim to copy allocator prologues into trampolines
+and overwrite libc `malloc`/`free` entries with jumps. The inline decoder refuses unknown
+instruction encodings but cannot make arbitrary hot patching safe. A mapped Prophiler shim
+is treated as already present, preventing reinjection after an agent restart.
+
+Injected samples are exposed as semaphore-gated `prophiler_heap:alloc` and
+`prophiler_heap:free` USDT notes. Kernel uprobe reference counters disable userspace
+sampling and new pointer tracking when the profiler links detach; allocator interposition
+itself remains installed.
 
 These modes permanently mutate a target for its remaining lifetime. They do not unload or
 unpatch when profiling stops; ptrace, loader-lock, relocation, seccomp, libc-version, and

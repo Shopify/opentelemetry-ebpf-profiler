@@ -19,13 +19,17 @@ type allocatorInjector interface {
 // reported. It is intentionally diagnostic only: hook discovery remains the
 // source of truth for whether the profiler can attach.
 type InjectionResult struct {
-	AlreadyPresent bool
-	GOTPatched     bool
-	InlinePatched  bool
-	PatchedSlots   uint32
+	AlreadyPresent      bool
+	GOTMallocPatched    bool
+	GOTFreePatched      bool
+	InlineMallocPatched bool
+	InlineFreePatched   bool
+	PatchedSlots        uint32
 }
 
 func (r InjectionResult) String() string {
-	return fmt.Sprintf("already_present=%t got=%t inline=%t slots=%d",
-		r.AlreadyPresent, r.GOTPatched, r.InlinePatched, r.PatchedSlots)
+	return fmt.Sprintf(
+		"already_present=%t got_malloc=%t got_free=%t inline_malloc=%t inline_free=%t slots=%d",
+		r.AlreadyPresent, r.GOTMallocPatched, r.GOTFreePatched,
+		r.InlineMallocPatched, r.InlineFreePatched, r.PatchedSlots)
 }

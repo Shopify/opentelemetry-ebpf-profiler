@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,16 +25,28 @@ import (
 )
 
 const (
-	remoteCallTimeout    = 5 * time.Second
-	remoteSysMemfdCreate = 319
-	remoteSysClose       = 3
-	remoteMfdCloexec     = 1
-	remoteRtldNow        = 2
+	remoteCallTimeout       = 5 * time.Second
+	ptraceStopRecoveryTime  = time.Second
+	maxThreadAttachPasses   = 16
+	maxExperimentalShimSize = 16 << 20
+	remoteSysMemfdCreate    = 319
+	remoteSysClose          = 3
+	remoteMfdCloexec        = 1
+	remoteRtldNow           = 2
 
-	shimGOTMallocBit = 1 << 0
-	shimGOTFreeBit   = 1 << 1
-	shimInlineBit    = 1 << 2
+	shimGOTMallocBit    = 1 << 0
+	shimGOTFreeBit      = 1 << 1
+	shimInlineMallocBit = 1 << 2
+	shimInlineFreeBit   = 1 << 3
 )
+
+func requiredAllocatorPatchesPresent(status uint64, requireFree bool,
+	mallocBit, freeBit uint64) bool {
+	if status&mallocBit == 0 {
+		return false
+	}
+	return !requireFree || status&freeBit != 0
+}
 
 type ptraceAllocatorInjector struct {
 	shim             []byte
@@ -44,9 +57,42 @@ type ptraceAllocatorInjector struct {
 
 func newAllocatorInjector(path string, mode InjectionMode,
 	samplingInterval uint64, requireFree bool) (allocatorInjector, error) {
-	shim, err := os.ReadFile(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open experimental allocator shim %q: %w", path, err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat experimental allocator shim %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("experimental allocator shim %q must be a regular file", path)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return nil, fmt.Errorf("experimental allocator shim %q must not be group/world writable", path)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return nil, fmt.Errorf("fstat experimental allocator shim %q: %w", path, err)
+	}
+	if os.Geteuid() == 0 && stat.Uid != 0 {
+		return nil, fmt.Errorf("experimental allocator shim %q must be root-owned when profiler runs as root", path)
+	}
+	if info.Size() <= 0 || info.Size() > maxExperimentalShimSize {
+		return nil, fmt.Errorf("experimental allocator shim %q has invalid size %d", path, info.Size())
+	}
+
+	// Read through the already-validated descriptor. Injection uses this immutable
+	// snapshot, so replacing the configured path later cannot change the bytes
+	// copied into a target.
+	shim, err := io.ReadAll(io.LimitReader(file, maxExperimentalShimSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("read experimental allocator shim %q: %w", path, err)
+	}
+	if len(shim) > maxExperimentalShimSize {
+		return nil, fmt.Errorf("experimental allocator shim %q exceeds %d bytes", path, maxExperimentalShimSize)
 	}
 	parsed, err := elf.NewFile(bytes.NewReader(shim))
 	if err != nil {
@@ -56,14 +102,67 @@ func newAllocatorInjector(path string, mode InjectionMode,
 	if parsed.Class != elf.ELFCLASS64 || parsed.Machine != elf.EM_X86_64 || parsed.Type != elf.ET_DYN {
 		return nil, fmt.Errorf("experimental allocator shim must be an x86-64 ET_DYN ELF")
 	}
+	if err := validateExperimentalShimSymbols(parsed, mode); err != nil {
+		return nil, fmt.Errorf("validate experimental allocator shim %q: %w", path, err)
+	}
 	return &ptraceAllocatorInjector{
 		shim: shim, mode: mode, samplingInterval: samplingInterval,
 		requireFree: requireFree,
 	}, nil
 }
 
+func validateExperimentalShimSymbols(parsed *elf.File, mode InjectionMode) error {
+	required := map[string]bool{
+		"malloc":                               false,
+		"free":                                 false,
+		ExperimentalShimAllocSymbol:            false,
+		ExperimentalShimFreeSymbol:             false,
+		"prophiler_heap_set_sampling_interval": false,
+		"prophiler_heap_install_got":           false,
+	}
+	if mode == InjectionGOTThenInline {
+		required["prophiler_heap_install_inline"] = false
+	}
+	symbols, err := parsed.DynamicSymbols()
+	if err != nil {
+		return fmt.Errorf("read dynamic symbols: %w", err)
+	}
+	for _, symbol := range symbols {
+		if _, wanted := required[symbol.Name]; wanted && symbol.Section != elf.SHN_UNDEF {
+			required[symbol.Name] = true
+		}
+	}
+	var missing []string
+	for name, present := range required {
+		if !present {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) != 0 {
+		return fmt.Errorf("missing exported symbols: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult, retErr error) {
+	// Linux records ptrace ownership at thread granularity. Keep every attach,
+	// wait, register operation, and detach on one tracer thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	leader := int(pid)
+	mappings, err := readProcessMappings(leader)
+	if err != nil {
+		return result, fmt.Errorf("read target mappings before injection: %w", err)
+	}
+	for _, mapping := range mappings {
+		if strings.Contains(mapping.path, "prophiler-heap-shim") {
+			result.AlreadyPresent = true
+			return result, nil
+		}
+	}
+
 	syscallAddr, err := resolveProcessSymbol(leader, "syscall")
 	if err != nil {
 		return result, fmt.Errorf("resolve libc syscall: %w", err)
@@ -140,7 +239,11 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	if err != nil {
 		return result, fmt.Errorf("resolve injected GOT installer: %w", err)
 	}
-	status, err := session.Call(installGOT)
+	requireFree := uint64(0)
+	if i.requireFree {
+		requireFree = 1
+	}
+	status, err := session.Call(installGOT, requireFree)
 	if err != nil {
 		return result, fmt.Errorf("invoke injected GOT installer: %w", err)
 	}
@@ -151,16 +254,15 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 			return result, fmt.Errorf("resolve injected inline installer: %w", err)
 		}
 	}
-	result.GOTPatched = status&(shimGOTMallocBit|shimGOTFreeBit) != 0
+	result.GOTMallocPatched = status&shimGOTMallocBit != 0
+	result.GOTFreePatched = status&shimGOTFreeBit != 0
 	result.PatchedSlots = uint32(status >> 32)
 	if _, err := session.Call(syscallAddr, remoteSysClose, uint64(fd)); err != nil {
 		return result, fmt.Errorf("close target shim memfd: %w", err)
 	}
 	fdOpen = false
-	gotSufficient := status&shimGOTMallocBit != 0
-	if i.requireFree {
-		gotSufficient = gotSufficient && status&shimGOTFreeBit != 0
-	}
+	gotSufficient := requiredAllocatorPatchesPresent(status, i.requireFree,
+		shimGOTMallocBit, shimGOTFreeBit)
 	if gotSufficient {
 		return result, nil
 	}
@@ -176,11 +278,7 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	}
 	session = nil
 
-	all, err := listThreadIDs(leader)
-	if err != nil {
-		return result, fmt.Errorf("list target threads: %w", err)
-	}
-	allSession, err := attachThreads(leader, all)
+	allSession, err := attachAllThreads(leader)
 	if err != nil {
 		return result, fmt.Errorf("stop target for inline fallback: %w", err)
 	}
@@ -190,13 +288,18 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 		}
 	}()
 
-	inlineStatus, err := allSession.Call(installInline)
+	inlineStatus, err := allSession.Call(installInline, requireFree)
 	if err != nil {
 		return result, fmt.Errorf("invoke injected inline installer: %w", err)
 	}
-	result.InlinePatched = inlineStatus&shimInlineBit != 0
-	if !result.InlinePatched {
-		return result, fmt.Errorf("shim refused or failed direct allocator text patch (status=%#x)", inlineStatus)
+	result.InlineMallocPatched = inlineStatus&shimInlineMallocBit != 0
+	result.InlineFreePatched = inlineStatus&shimInlineFreeBit != 0
+	inlineSufficient := requiredAllocatorPatchesPresent(inlineStatus, i.requireFree,
+		shimInlineMallocBit, shimInlineFreeBit)
+	if !inlineSufficient {
+		return result, fmt.Errorf(
+			"shim failed required direct allocator text patches (status=%#x, require_free=%t)",
+			inlineStatus, i.requireFree)
 	}
 	return result, nil
 }
@@ -210,22 +313,90 @@ type ptraceSession struct {
 func attachThreads(leader int, tids []int) (*ptraceSession, error) {
 	s := &ptraceSession{leader: leader}
 	for _, tid := range tids {
-		if err := unix.PtraceAttach(tid); err != nil {
+		if err := s.attachThread(tid); err != nil {
 			_ = s.Close()
-			return nil, fmt.Errorf("ptrace attach tid %d: %w", tid, err)
+			return nil, err
 		}
-		var status unix.WaitStatus
-		if _, err := unix.Wait4(tid, &status, 0, nil); err != nil {
-			_ = s.Close()
-			return nil, fmt.Errorf("wait for ptrace stop tid %d: %w", tid, err)
-		}
-		if !status.Stopped() {
-			_ = s.Close()
-			return nil, fmt.Errorf("tid %d did not enter ptrace stop: %v", tid, status)
-		}
-		s.threads = append(s.threads, tid)
 	}
 	return s, nil
+}
+
+// attachAllThreads repeatedly snapshots /proc/<pid>/task. Once every listed
+// thread is ptrace-stopped, none can clone another thread, making the final
+// no-missing-thread pass stable enough to patch process-wide executable text.
+func attachAllThreads(leader int) (*ptraceSession, error) {
+	s, err := attachThreads(leader, []int{leader})
+	if err != nil {
+		return nil, err
+	}
+	for pass := 0; pass < maxThreadAttachPasses; pass++ {
+		tids, err := listThreadIDs(leader)
+		if err != nil {
+			_ = s.Close()
+			return nil, fmt.Errorf("list target threads: %w", err)
+		}
+		missing := false
+		for _, tid := range tids {
+			if s.hasThread(tid) {
+				continue
+			}
+			missing = true
+			if err := s.attachThread(tid); err != nil {
+				if errors.Is(err, unix.ESRCH) || errors.Is(err, unix.ECHILD) {
+					continue
+				}
+				_ = s.Close()
+				return nil, err
+			}
+		}
+		if !missing {
+			return s, nil
+		}
+	}
+	_ = s.Close()
+	return nil, fmt.Errorf("target thread list did not stabilize after %d passes",
+		maxThreadAttachPasses)
+}
+
+func (s *ptraceSession) hasThread(tid int) bool {
+	for _, attached := range s.threads {
+		if attached == tid {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *ptraceSession) attachThread(tid int) error {
+	if s.hasThread(tid) {
+		return nil
+	}
+	if err := unix.PtraceAttach(tid); err != nil {
+		return fmt.Errorf("ptrace attach tid %d: %w", tid, err)
+	}
+	// Track the relationship immediately so error cleanup at least attempts to
+	// detach a thread whose stop notification is delayed or lost.
+	s.threads = append(s.threads, tid)
+	status, stopped, err := pollWaitStatus(tid, remoteCallTimeout)
+	if err != nil {
+		return fmt.Errorf("wait for ptrace stop tid %d: %w", tid, err)
+	}
+	if !stopped {
+		// PTRACE_ATTACH normally supplies SIGSTOP. Retry explicitly but never
+		// follow a timed wait with an unbounded Wait4.
+		_ = unix.Tgkill(s.leader, tid, unix.SIGSTOP)
+		status, stopped, err = pollWaitStatus(tid, ptraceStopRecoveryTime)
+		if err != nil {
+			return fmt.Errorf("recover ptrace stop tid %d: %w", tid, err)
+		}
+	}
+	if !stopped {
+		return fmt.Errorf("timed out waiting for ptrace stop tid %d", tid)
+	}
+	if !status.Stopped() {
+		return fmt.Errorf("tid %d did not enter ptrace stop: %v", tid, status)
+	}
+	return nil
 }
 
 func (s *ptraceSession) Close() error {
@@ -346,22 +517,50 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 }
 
 func waitForPtraceStop(tgid, tid int, timeout time.Duration) (unix.WaitStatus, error) {
+	status, stopped, err := pollWaitStatus(tid, timeout)
+	if err != nil {
+		return 0, fmt.Errorf("wait for remote call: %w", err)
+	}
+	if stopped {
+		return status, nil
+	}
+
+	stopErr := unix.Tgkill(tgid, tid, unix.SIGSTOP)
+	recoveredStatus, recovered, recoveryErr := pollWaitStatus(tid, ptraceStopRecoveryTime)
+	if recovered {
+		status = recoveredStatus
+	}
+	if recoveryCause := errors.Join(stopErr, recoveryErr); recoveryCause != nil {
+		return status, fmt.Errorf(
+			"remote call timed out after %s; recovery stop=%t: %w",
+			timeout, recovered, recoveryCause)
+	}
+	return status, fmt.Errorf("remote call timed out after %s; recovery stop=%t",
+		timeout, recovered)
+}
+
+// pollWaitStatus bounds every ptrace wait. The boolean reports whether Wait4
+// returned an event for tid; a timeout is not itself an error so callers can
+// attempt a bounded SIGSTOP recovery.
+func pollWaitStatus(tid int, timeout time.Duration) (unix.WaitStatus, bool, error) {
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	for {
 		var status unix.WaitStatus
 		waited, err := unix.Wait4(tid, &status, unix.WNOHANG, nil)
 		if err != nil {
-			return 0, fmt.Errorf("wait for remote call: %w", err)
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return 0, false, err
 		}
 		if waited == tid {
-			return status, nil
+			return status, true, nil
+		}
+		if !time.Now().Before(deadline) {
+			return 0, false, nil
 		}
 		time.Sleep(time.Millisecond)
 	}
-	_ = unix.Tgkill(tgid, tid, unix.SIGSTOP)
-	var status unix.WaitStatus
-	_, _ = unix.Wait4(tid, &status, 0, nil)
-	return status, fmt.Errorf("remote call timed out after %s", timeout)
 }
 
 type processMapping struct {

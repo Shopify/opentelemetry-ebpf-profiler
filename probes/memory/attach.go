@@ -56,12 +56,14 @@ func (m *Manager) attach(
 	var links []link.Link
 	switch hook.ABI {
 	case ABIWeightedAllocation:
-		attached, err := attachEntry(ProgramWeightedAllocation, hook.SemaphoreOffset)
+		var attached link.Link
+		attached, err = attachEntry(ProgramWeightedAllocation, hook.SemaphoreOffset)
 		if err == nil {
 			links = append(links, attached)
 		}
 	case ABIFree:
-		attached, err := attachEntry(ProgramDeallocation, hook.SemaphoreOffset)
+		var attached link.Link
+		attached, err = attachEntry(ProgramDeallocation, hook.SemaphoreOffset)
 		if err == nil {
 			links = append(links, attached)
 		}

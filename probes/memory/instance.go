@@ -130,7 +130,10 @@ func (m *Manager) Reconcile(
 	failedFiles := make(map[util.OnDiskFileIdentifier]struct{})
 	var scanErrs []error
 	_, iterErr := pr.IterateMappings(func(mapping process.RawMapping) bool {
-		if !mapping.IsExecutable() || mapping.IsAnonymous() {
+		// Injected shims are executable memfd mappings. They are anonymous for
+		// ordinary process-symbolization purposes but still have a backing object
+		// reachable through /proc/<pid>/map_files and must be scanned for hooks.
+		if !mapping.IsExecutable() || (mapping.IsAnonymous() && !mapping.IsMemFD()) {
 			return true
 		}
 		fileID := mapping.GetOnDiskFileIdentifier()

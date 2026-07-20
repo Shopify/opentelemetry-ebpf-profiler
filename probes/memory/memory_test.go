@@ -5,6 +5,7 @@ package memory
 
 import (
 	"debug/elf"
+	"errors"
 	"testing"
 
 	cebpf "github.com/cilium/ebpf"
@@ -110,8 +111,8 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	experimental.ApplyDefaults()
 	require.NoError(t, experimental.Validate())
 	assert.Contains(t, experimental.AllocationHooks, Hook{
-		Type: HookTypeUprobe, ABI: ABIWeightedAllocation,
-		Executable: ExperimentalShimExecutable, Symbol: ExperimentalShimAllocSymbol,
+		Type: HookTypeUSDT, ABI: ABIWeightedAllocation,
+		Provider: ExperimentalShimProvider, Name: "alloc",
 	})
 	assert.False(t, experimental.Live, "free hook is only installed for live profiles")
 
@@ -119,8 +120,8 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	experimental.ApplyDefaults()
 	require.NoError(t, experimental.Validate())
 	assert.Contains(t, experimental.DeallocationHooks, Hook{
-		Type: HookTypeUprobe, ABI: ABIFree,
-		Executable: ExperimentalShimExecutable, Symbol: ExperimentalShimFreeSymbol,
+		Type: HookTypeUSDT, ABI: ABIFree,
+		Provider: ExperimentalShimProvider, Name: "free",
 	})
 
 	missingSelector := experimental
@@ -129,6 +130,16 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	missingShim := experimental
 	missingShim.ExperimentalShimPath = ""
 	require.ErrorContains(t, missingShim.Validate(), "experimental_shim_path")
+	zeroSampling := experimental
+	zeroSampling.SamplingIntervalBytes = 0
+	require.ErrorContains(t, zeroSampling.Validate(), "non-zero sampling interval")
+
+	hooks := appendHookIfMissing([]Hook{{
+		Type: HookTypeUSDT, ABI: ABIWeightedAllocation, Provider: "first", Name: "alloc",
+	}}, Hook{
+		Type: HookTypeUSDT, ABI: ABIWeightedAllocation, Provider: "second", Name: "alloc",
+	})
+	assert.Len(t, hooks, 2, "distinct USDT providers are distinct hooks")
 
 	var mode InjectionMode
 	require.NoError(t, mode.Set("GOT"))
@@ -139,10 +150,33 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 type processWithExecutable struct {
 	process.Process
 	executable libpf.String
+	mappings   []process.RawMapping
 }
 
 func (p processWithExecutable) GetExe() (libpf.String, error) {
 	return p.executable, nil
+}
+
+func (p processWithExecutable) IterateMappings(
+	callback func(process.RawMapping) bool,
+) (uint32, error) {
+	for _, mapping := range p.mappings {
+		if !callback(mapping) {
+			return 0, process.ErrCallbackStopped
+		}
+	}
+	return 0, nil
+}
+
+type recordingInjector struct {
+	calls  int
+	result InjectionResult
+	err    error
+}
+
+func (i *recordingInjector) Inject(libpf.PID) (InjectionResult, error) {
+	i.calls++
+	return i.result, i.err
 }
 
 func TestManagerProcessSelector(t *testing.T) {
@@ -262,6 +296,7 @@ func TestNewManager(t *testing.T) {
 	require.NotNil(t, manager)
 	assert.Len(t, manager.hooks, 1)
 	assert.True(t, manager.needsUSDT)
+	assert.Nil(t, manager.injector, "disabled injection never constructs an injector")
 	assert.NoError(t, manager.Close())
 
 	allocator := DefaultConfig()
@@ -275,6 +310,61 @@ func TestNewManager(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, manager.hooks, 1)
 	assert.Equal(t, ABIMalloc, manager.hooks[0].hook.ABI)
+}
+
+func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
+	t.Run("does not retry a failed injection", func(t *testing.T) {
+		injector := &recordingInjector{err: errors.New("synthetic mutation failure")}
+		manager := &Manager{
+			config:   Config{Enabled: true},
+			injector: injector,
+		}
+		pr := processWithExecutable{executable: libpf.Intern("/usr/bin/ruby")}
+
+		inst, err := manager.Reconcile(1234, pr, nil)
+		require.ErrorContains(t, err, "synthetic mutation failure")
+		require.Equal(t, 1, injector.calls)
+
+		_, err = manager.Reconcile(1234, pr, inst)
+		require.NoError(t, err)
+		assert.Equal(t, 1, injector.calls, "a failed PID mutation is never retried")
+	})
+
+	t.Run("discovered memfd producer prevents injection", func(t *testing.T) {
+		cache, err := lru.NewSynced[util.OnDiskFileIdentifier, parsedFile](
+			8, util.OnDiskFileIdentifier.Hash32)
+		require.NoError(t, err)
+		fileID := util.OnDiskFileIdentifier{DeviceID: 1, InodeNum: 2}
+		cache.Add(fileID, parsedFile{usdtNotes: []usdtNote{{
+			Provider: ExperimentalShimProvider, Name: "alloc",
+			Location: 0x100, SemaphoreOffset: 0x20,
+		}}})
+		weighted := Hook{
+			Type: HookTypeUSDT, ABI: ABIWeightedAllocation,
+			Provider: ExperimentalShimProvider, Name: "alloc",
+		}
+		injector := &recordingInjector{}
+		manager := &Manager{
+			config:     Config{Enabled: true},
+			hooks:      []configuredHook{{id: 1, event: EventAllocation, hook: weighted}},
+			needsUSDT:  true,
+			parseCache: cache,
+			injector:   injector,
+		}
+		pr := processWithExecutable{
+			executable: libpf.Intern("/usr/bin/ruby"),
+			mappings: []process.RawMapping{{
+				Vaddr: 0x1000, Length: 0x1000, Flags: elf.PF_R | elf.PF_X,
+				Device: fileID.DeviceID, Inode: fileID.InodeNum,
+				Path: "/memfd:prophiler-heap-shim (deleted)",
+			}},
+		}
+
+		_, err = manager.Reconcile(999999, pr, nil)
+		require.ErrorContains(t, err, "attach")
+		assert.Zero(t, injector.calls,
+			"producer discovery must suppress mutation even when attachment fails")
+	})
 }
 
 func TestManagerClose(t *testing.T) {
