@@ -108,18 +108,23 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 		return result, fmt.Errorf("populate target memfd: %w", errors.Join(copyErr, closeErr))
 	}
 
+	fdOpen := true
+	defer func() {
+		if fdOpen && session != nil && !session.closed {
+			if _, err := session.Call(syscallAddr, remoteSysClose, uint64(fd)); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close target shim memfd: %w", err))
+			}
+		}
+	}()
+
 	handle, err := session.CallWithData(dlopenAddr,
 		[]uint64{0, remoteRtldNow}, 0,
 		[]byte(fmt.Sprintf("/proc/self/fd/%d\x00", fd)))
 	if err != nil {
 		return result, fmt.Errorf("remote dlopen: %w", err)
 	}
-	_, closeCallErr := session.Call(syscallAddr, remoteSysClose, uint64(fd))
 	if handle == 0 {
-		return result, errors.Join(errors.New("remote dlopen returned NULL"), closeCallErr)
-	}
-	if closeCallErr != nil {
-		return result, fmt.Errorf("close target shim memfd: %w", closeCallErr)
+		return result, errors.New("remote dlopen returned NULL")
 	}
 
 	setSamplingInterval, err := resolveProcessSymbol(
@@ -139,8 +144,19 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	if err != nil {
 		return result, fmt.Errorf("invoke injected GOT installer: %w", err)
 	}
+	var installInline uint64
+	if i.mode == InjectionGOTThenInline {
+		installInline, err = resolveProcessSymbol(leader, "prophiler_heap_install_inline")
+		if err != nil {
+			return result, fmt.Errorf("resolve injected inline installer: %w", err)
+		}
+	}
 	result.GOTPatched = status&(shimGOTMallocBit|shimGOTFreeBit) != 0
 	result.PatchedSlots = uint32(status >> 32)
+	if _, err := session.Call(syscallAddr, remoteSysClose, uint64(fd)); err != nil {
+		return result, fmt.Errorf("close target shim memfd: %w", err)
+	}
+	fdOpen = false
 	gotSufficient := status&shimGOTMallocBit != 0
 	if i.requireFree {
 		gotSufficient = gotSufficient && status&shimGOTFreeBit != 0
@@ -174,10 +190,6 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 		}
 	}()
 
-	installInline, err := resolveProcessSymbol(leader, "prophiler_heap_install_inline")
-	if err != nil {
-		return result, fmt.Errorf("resolve injected inline installer: %w", err)
-	}
 	inlineStatus, err := allSession.Call(installInline)
 	if err != nil {
 		return result, fmt.Errorf("invoke injected inline installer: %w", err)
@@ -452,10 +464,26 @@ func openMappedELF(pid int, mapping processMapping) (*os.File, error) {
 	// map_files can require CAP_CHECKPOINT_RESTORE on newer kernels. Ordinary
 	// filesystem-backed mappings remain reachable through the target root.
 	path := strings.TrimSuffix(mapping.path, " (deleted)")
-	if strings.HasPrefix(path, "/") {
+	if strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "/memfd:") {
 		rootPath := fmt.Sprintf("/proc/%d/root%s", pid, path)
 		if file, err := os.Open(rootPath); err == nil {
 			return file, nil
+		}
+	}
+
+	// Keep the injected memfd open through symbol resolution so environments
+	// lacking map_files permission can still parse the exact backing object.
+	if strings.Contains(path, "prophiler-heap-shim") {
+		entries, _ := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+		for _, entry := range entries {
+			fdPath := fmt.Sprintf("/proc/%d/fd/%s", pid, entry.Name())
+			target, err := os.Readlink(fdPath)
+			if err != nil || !strings.Contains(target, "prophiler-heap-shim") {
+				continue
+			}
+			if file, err := os.Open(fdPath); err == nil {
+				return file, nil
+			}
 		}
 	}
 	return nil, mapErr
