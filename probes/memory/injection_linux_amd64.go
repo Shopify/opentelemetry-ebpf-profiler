@@ -582,11 +582,14 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 
 	tid := s.threads[0]
 	var recoveryStopPending bool
+	var recoveryResumeSignal int
 	// Register this before the stack/register restoration defers below so it
 	// runs last: consuming the recovery SIGSTOP briefly resumes the tracee.
 	defer func() {
 		if recoveryStopPending {
-			if err := consumePendingRecoveryStop(s.leader, tid); err != nil {
+			if err := consumePendingRecoveryStop(
+				s.leader, tid, recoveryResumeSignal,
+			); err != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("consume pending recovery stop: %w", err))
 			}
 		}
@@ -664,6 +667,12 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 
 	status, pendingStop, err := waitForPtraceStop(s.leader, tid, remoteCallTimeout)
 	recoveryStopPending = pendingStop
+	if pendingStop && status.Stopped() && !isInjectorFaultSignal(status.StopSignal()) {
+		// Preserve an asynchronous target signal (for example SIGTERM) that
+		// happened to win the timeout-recovery race. Fault signals raised by
+		// the synthetic remote call are suppressed after restoring registers.
+		recoveryResumeSignal = int(status.StopSignal())
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -721,10 +730,27 @@ func potentialRemoteReturnStop(status unix.WaitStatus) bool {
 	return status.Stopped() && status.StopSignal() == unix.SIGSEGV
 }
 
-func consumePendingRecoveryStop(tgid, tid int) error {
+func isInjectorFaultSignal(signal unix.Signal) bool {
+	switch signal {
+	case unix.SIGSEGV, unix.SIGBUS, unix.SIGILL, unix.SIGFPE, unix.SIGTRAP, unix.SIGSYS:
+		return true
+	default:
+		return false
+	}
+}
+
+func consumePendingRecoveryStop(tgid, tid, resumeSignal int) error {
 	// The tracee is currently in a different ptrace stop. Resume with signal 0
 	// until the timeout-recovery SIGSTOP is observed, thereby suppressing it
 	// instead of leaving an untraced process job-control-stopped after detach.
+	// Requeue any asynchronous signal only after SIGSTOP is consumed: injecting
+	// it on the first PTRACE_CONT can lose it when the pending group stop wins.
+	requeueSignal := func() error {
+		if resumeSignal == 0 {
+			return nil
+		}
+		return unix.Tgkill(tgid, tid, unix.Signal(resumeSignal))
+	}
 	currentlyStopped := true
 	for range 4 {
 		if err := unix.PtraceCont(tid, 0); err != nil {
@@ -743,7 +769,7 @@ func consumePendingRecoveryStop(tgid, tid int) error {
 		}
 		currentlyStopped = status.Stopped()
 		if currentlyStopped && status.StopSignal() == unix.SIGSTOP {
-			return nil
+			return requeueSignal()
 		}
 	}
 
@@ -762,15 +788,25 @@ func consumePendingRecoveryStop(tgid, tid int) error {
 		return err
 	}
 	if !observed {
-		return errors.New("timed out waiting to consume recovery stop")
+		timeoutErr := errors.New("timed out waiting to consume recovery stop")
+		var clearErr error
+		if err := unix.Tgkill(tgid, tid, unix.SIGCONT); err != nil {
+			clearErr = fmt.Errorf("clear unobserved recovery stop: %w", err)
+		}
+		return errors.Join(timeoutErr, clearErr, requeueSignal())
 	}
 	if status.Exited() || status.Signaled() {
 		return nil
 	}
 	if !status.Stopped() || status.StopSignal() != unix.SIGSTOP {
-		return fmt.Errorf("unexpected recovery stop status: %v", status)
+		statusErr := fmt.Errorf("unexpected recovery stop status: %v", status)
+		var clearErr error
+		if err := unix.Tgkill(tgid, tid, unix.SIGCONT); err != nil {
+			clearErr = fmt.Errorf("clear unexpected recovery stop: %w", err)
+		}
+		return errors.Join(statusErr, clearErr, requeueSignal())
 	}
-	return nil
+	return requeueSignal()
 }
 
 // pollWaitStatus bounds every ptrace wait. The boolean reports whether Wait4

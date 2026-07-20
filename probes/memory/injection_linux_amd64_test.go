@@ -111,6 +111,9 @@ func TestPotentialRemoteReturnStop(t *testing.T) {
 	assert.True(t, potentialRemoteReturnStop(returned))
 	assert.False(t, potentialRemoteReturnStop(stopped))
 	assert.False(t, potentialRemoteReturnStop(0))
+	assert.True(t, isInjectorFaultSignal(unix.SIGSEGV))
+	assert.True(t, isInjectorFaultSignal(unix.SIGILL))
+	assert.False(t, isInjectorFaultSignal(unix.SIGTERM))
 }
 
 func TestPtraceSessionCloseRecoversRunningTracee(t *testing.T) {
@@ -166,7 +169,7 @@ func TestConsumePendingRecoveryStopKeepsTraceeRunnableAfterDetach(t *testing.T) 
 	// Simulate the timeout race: the tracee is already in another ptrace stop
 	// when the recovery SIGSTOP is generated, so that stop remains pending.
 	require.NoError(t, unix.Tgkill(cmd.Process.Pid, cmd.Process.Pid, unix.SIGSTOP))
-	require.NoError(t, consumePendingRecoveryStop(cmd.Process.Pid, cmd.Process.Pid))
+	require.NoError(t, consumePendingRecoveryStop(cmd.Process.Pid, cmd.Process.Pid, 0))
 	require.NoError(t, session.Close())
 
 	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
@@ -178,6 +181,59 @@ func TestConsumePendingRecoveryStopKeepsTraceeRunnableAfterDetach(t *testing.T) 
 		_ = cmd.Process.Kill()
 		<-done
 		t.Fatal("detached tracee remained stopped by the recovery SIGSTOP")
+	}
+}
+
+func TestConsumePendingRecoveryStopRedeliversTargetSignal(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	marker := filepath.Join(t.TempDir(), "sigterm-delivered")
+	cmd := exec.Command("sh", "-c",
+		`trap ': > "$MARKER"' TERM; echo ready; while :; do :; done`)
+	cmd.Env = append(os.Environ(), "MARKER="+marker)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	scanner := bufio.NewScanner(stdout)
+	require.True(t, scanner.Scan(), "target did not install its SIGTERM handler")
+	require.Equal(t, "ready", scanner.Text())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	session, err := attachThreads(cmd.Process.Pid, []int{cmd.Process.Pid})
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		t.Skipf("ptrace unavailable: %v", err)
+	}
+	require.NoError(t, err)
+	defer func() { _ = session.Close() }()
+
+	// Put SIGTERM in the current ptrace signal-delivery stop, then queue the
+	// timeout-recovery SIGSTOP behind it.
+	require.NoError(t, unix.PtraceCont(cmd.Process.Pid, 0))
+	require.NoError(t, unix.Tgkill(cmd.Process.Pid, cmd.Process.Pid, unix.SIGTERM))
+	status, observed, err := pollWaitStatus(cmd.Process.Pid, ptraceStopRecoveryTime)
+	require.NoError(t, err)
+	require.True(t, observed)
+	require.True(t, status.Stopped())
+	require.Equal(t, unix.SIGTERM, status.StopSignal())
+	require.NoError(t, unix.Tgkill(cmd.Process.Pid, cmd.Process.Pid, unix.SIGSTOP))
+
+	require.NoError(t, consumePendingRecoveryStop(
+		cmd.Process.Pid, cmd.Process.Pid, int(unix.SIGTERM)))
+	require.NoError(t, session.Close())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("target SIGTERM handler did not run after recovery")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
