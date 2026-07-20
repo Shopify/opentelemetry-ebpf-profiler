@@ -300,7 +300,7 @@ int uprobe_heap_alloc(struct pt_regs *ctx)
 // unwind/export work, but not breakpoint costs on allocator entry and return.
 static EBPF_INLINE bool sample_malloc(u64 size, HeapPendingAlloc *sample)
 {
-  u32 zero_key = 0;
+  u32 zero_key  = 0;
   u32 *interval = bpf_map_lookup_elem(&heap_sampling_interval, &zero_key);
   if (!interval || *interval == 0 || size == 0) {
     return false;
@@ -344,14 +344,14 @@ int uprobe_malloc_enter(struct pt_regs *ctx)
 SEC("uretprobe/malloc_return")
 int uretprobe_malloc_return(struct pt_regs *ctx)
 {
-  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u64 pid_tgid              = bpf_get_current_pid_tgid();
   HeapPendingAlloc *pending = bpf_map_lookup_elem(&heap_pending_allocs, &pid_tgid);
   if (!pending) {
     return 0;
   }
 
   // Copy before deleting: map-value pointers are invalid after deletion.
-  u64 size = pending->size;
+  u64 size   = pending->size;
   u64 weight = pending->weight;
   bpf_map_delete_elem(&heap_pending_allocs, &pid_tgid);
 
