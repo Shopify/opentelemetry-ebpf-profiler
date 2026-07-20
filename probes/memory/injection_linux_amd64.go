@@ -566,14 +566,18 @@ func (s *ptraceSession) CallWithData(fn uint64, args []uint64, dataArg int, data
 }
 
 func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte) (result uint64, retErr error) {
-	if s == nil || s.closed || len(s.threads) == 0 {
-		return 0, errors.New("ptrace session is closed")
-	}
 	if len(args) > 6 {
 		return 0, fmt.Errorf("remote call supports at most 6 arguments, got %d", len(args))
 	}
+	if dataArg < -1 || (len(data) > 0 && dataArg < 0) {
+		return 0, fmt.Errorf("remote data argument %d is invalid for %d data bytes",
+			dataArg, len(data))
+	}
 	if dataArg >= len(args) {
 		return 0, fmt.Errorf("remote data argument %d outside %d arguments", dataArg, len(args))
+	}
+	if s == nil || s.closed || len(s.threads) == 0 {
+		return 0, errors.New("ptrace session is closed")
 	}
 
 	tid := s.threads[0]
@@ -817,6 +821,10 @@ func isAllocatorRuntimeMapping(mapping processMapping) bool {
 }
 
 func isExperimentalShimMapping(mapping processMapping) bool {
+	// A filesystem-backed shim may be deliberately preloaded from any path.
+	// Match its exact package basename and fail closed rather than risking a
+	// second mutation; post-injection symbol calls additionally require the
+	// exact device/inode of the memfd created by this injector.
 	mappingPath := strings.TrimSuffix(mapping.path, " (deleted)")
 	if mappingPath == "/memfd:prophiler-heap-shim" || mappingPath == "memfd:prophiler-heap-shim" {
 		return true

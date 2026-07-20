@@ -189,7 +189,10 @@ if the latter access is missing; the one-attempt rule still prevents automatic r
 Injector lifecycle is exported through `agent.heap.injection.{attempts,successes,failures,
 already_present,probe_discovery_failures}` counters. A successful count means a new target
 mutation was reported; partial mutation is counted as failure, and `already_present` is a
-separate non-mutating outcome. The three outcome counters sum to attempts.
+separate non-mutating outcome. The three outcome counters sum to attempts. Treat any
+`failures` increment as actionable: find the matching `EXPERIMENTAL allocator injection
+failed pid=...` error, disable further injection, and restart that target because it may be
+partially mutated.
 
 The injector validates and snapshots a non-writable x86-64 shim, ptrace-stops a target
 thread, creates a sealable memfd inside the target, copies and write-seals the snapshot, and

@@ -347,6 +347,15 @@ func TestNewManager(t *testing.T) {
 	assert.Equal(t, ABIMalloc, manager.hooks[0].hook.ABI)
 }
 
+func TestBeginInjectionRechecksAttachedProducer(t *testing.T) {
+	inst := NewInstance(1234)
+	inst.attached[AttachmentKey{Event: EventAllocation}] = AttachedHook{}
+
+	assert.False(t, inst.beginInjectionIfNoAllocation())
+	assert.False(t, inst.injectionAttempted,
+		"a concurrently attached producer must suppress destructive mutation")
+}
+
 func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 	for _, test := range []struct {
 		name          string
@@ -380,6 +389,11 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 				memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts))
 			assert.Equal(t, metrics.MetricValue(1),
 				memoryMetricValue(gotMetrics, test.outcomeMetric))
+			outcomes := memoryMetricValue(gotMetrics, metrics.IDHeapInjectionSuccesses) +
+				memoryMetricValue(gotMetrics, metrics.IDHeapInjectionFailures) +
+				memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAlreadyPresent)
+			assert.Equal(t, memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts),
+				outcomes, "every attempt must have exactly one terminal outcome")
 			assert.Equal(t, metrics.MetricValue(0),
 				memoryMetricValue(manager.GetAndResetMetrics(), metrics.IDHeapInjectionAttempts),
 				"injection counters must reset after collection")
@@ -407,19 +421,30 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts))
 		assert.Equal(t, metrics.MetricValue(1),
 			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionFailures))
+		outcomes := memoryMetricValue(gotMetrics, metrics.IDHeapInjectionSuccesses) +
+			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionFailures) +
+			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAlreadyPresent)
+		assert.Equal(t, memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts),
+			outcomes, "every attempt must have exactly one terminal outcome")
 	})
 
 	t.Run("records injected shim discovery failure once per PID", func(t *testing.T) {
 		cache, err := lru.NewSynced[util.OnDiskFileIdentifier, parsedFile](
 			8, util.OnDiskFileIdentifier.Hash32)
 		require.NoError(t, err)
+		injector := &recordingInjector{result: InjectionResult{GOTMallocPatched: true}}
 		manager := &Manager{
 			config:     Config{Enabled: true},
 			needsUSDT:  true,
 			parseCache: cache,
-			injector:   &recordingInjector{},
+			injector:   injector,
 		}
-		pr := processWithExecutable{
+		initial := processWithExecutable{executable: libpf.Intern("/usr/bin/ruby")}
+		inst, err := manager.Reconcile(1234, initial, nil)
+		require.NoError(t, err)
+		require.Equal(t, 1, injector.calls)
+
+		unreadableShim := processWithExecutable{
 			executable:     libpf.Intern("/usr/bin/ruby"),
 			mappingOpenErr: os.ErrPermission,
 			mappings: []process.RawMapping{{
@@ -427,18 +452,46 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 				Device: 1, Inode: 2, Path: "/memfd:prophiler-heap-shim (deleted)",
 			}},
 		}
-		inst := NewInstance(1234)
-		inst.injectionAttempted = true
-
-		_, err = manager.Reconcile(1234, pr, inst)
+		_, err = manager.Reconcile(1234, unreadableShim, inst)
 		require.ErrorIs(t, err, os.ErrPermission)
-		_, err = manager.Reconcile(1234, pr, inst)
+		_, err = manager.Reconcile(1234, unreadableShim, inst)
 		require.ErrorIs(t, err, os.ErrPermission)
 
 		gotMetrics := manager.GetAndResetMetrics()
 		assert.Equal(t, metrics.MetricValue(1), memoryMetricValue(
 			gotMetrics, metrics.IDHeapInjectionProbeDiscoveryFailures))
-		assert.Zero(t, memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts))
+		assert.Equal(t, metrics.MetricValue(1), memoryMetricValue(
+			gotMetrics, metrics.IDHeapInjectionAttempts))
+		assert.Equal(t, metrics.MetricValue(1), memoryMetricValue(
+			gotMetrics, metrics.IDHeapInjectionSuccesses))
+	})
+
+	t.Run("mapping scan failure suppresses injection", func(t *testing.T) {
+		cache, err := lru.NewSynced[util.OnDiskFileIdentifier, parsedFile](
+			8, util.OnDiskFileIdentifier.Hash32)
+		require.NoError(t, err)
+		injector := &recordingInjector{}
+		manager := &Manager{
+			config:     Config{Enabled: true},
+			needsUSDT:  true,
+			parseCache: cache,
+			injector:   injector,
+		}
+		pr := processWithExecutable{
+			executable:     libpf.Intern("/usr/bin/ruby"),
+			mappingOpenErr: os.ErrPermission,
+			mappings: []process.RawMapping{{
+				Vaddr: 0x1000, Length: 0x1000, Flags: elf.PF_R | elf.PF_X,
+				Device: 1, Inode: 2, Path: "/opt/lib/libexisting-producer.so",
+			}},
+		}
+
+		inst, err := manager.Reconcile(1234, pr, nil)
+		require.ErrorIs(t, err, os.ErrPermission)
+		assert.Zero(t, injector.calls)
+		assert.False(t, inst.injectionAttempted)
+		assert.Zero(t, memoryMetricValue(
+			manager.GetAndResetMetrics(), metrics.IDHeapInjectionAttempts))
 	})
 
 	t.Run("discovered memfd producer prevents injection", func(t *testing.T) {

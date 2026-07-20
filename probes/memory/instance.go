@@ -92,11 +92,19 @@ func (inst *Instance) setApplicability(eligible bool) {
 	inst.eligible = eligible
 }
 
-func (inst *Instance) beginInjection() bool {
+func (inst *Instance) beginInjectionIfNoAllocation() bool {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
 	if inst.injectionAttempted {
 		return false
+	}
+	// Recheck under the same lock that marks the attempt. A concurrent
+	// reconciliation may have attached an existing producer after this caller
+	// finished scanning; discovery must still win over destructive mutation.
+	for key := range inst.attached {
+		if key.Event == EventAllocation {
+			return false
+		}
 	}
 	inst.injectionAttempted = true
 	return true
@@ -246,13 +254,6 @@ func (m *Manager) Reconcile(
 		}
 	}
 
-	hasAllocation := false
-	for key := range inst.attached {
-		if key.Event == EventAllocation {
-			hasAllocation = true
-			break
-		}
-	}
 	liveAttachments := len(inst.attached)
 	inst.mu.Unlock()
 
@@ -262,15 +263,21 @@ func (m *Manager) Reconcile(
 	}
 
 	var injectionErr error
-	if m.injector != nil && !allocationHookDiscovered && !hasAllocation && inst.beginInjection() {
+	if m.injector != nil && len(scanErrs) == 0 && !allocationHookDiscovered &&
+		inst.beginInjectionIfNoAllocation() {
 		// This permanently mutates the target. It is reachable only through an
 		// explicitly selected experimental mode and is never retried implicitly.
+		// Any ambiguous mapping scan suppresses injection for this cycle because
+		// an unreadable mapping may already contain the preferred producer.
 		m.injectionAttempts.Add(1)
 		result, err := m.injector.Inject(pid)
 		inst.completeInjection(result, err)
 		if err != nil {
 			m.injectionFailures.Add(1)
-			injectionErr = fmt.Errorf("experimental allocator injection pid=%d: %w", pid, err)
+			log.Errorf("EXPERIMENTAL allocator injection failed pid=%d; target may be "+
+				"partially mutated and must be restarted: result=%s error=%v", pid, result, err)
+			injectionErr = fmt.Errorf("experimental allocator injection pid=%d (%s): %w",
+				pid, result, err)
 		} else if result.AlreadyPresent {
 			m.injectionAlreadyPresent.Add(1)
 			log.Warnf("EXPERIMENTAL allocator shim already present in pid=%d; no new mutation: %s",

@@ -42,6 +42,52 @@ func createTestBaseReporter(t *testing.T, cfg *Config) *baseReporter {
 	}
 }
 
+func TestBaseReporterHeapEventRouting(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	trace := &libpf.Trace{Frames: testReporterFrames()}
+	meta := &samples.TraceEventMeta{
+		Timestamp:   1,
+		Comm:        libpf.NewCommFromString("heap-app"),
+		PID:         1234,
+		TID:         1234,
+		Origin:      support.TraceOriginHeapAlloc,
+		Value:       4096,
+		AllocSize:   64,
+		ProcessName: libpf.Intern("heap-app"),
+	}
+
+	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
+	meta.Timestamp = 2
+	meta.Value = 8192
+	meta.AllocSize = 128
+	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
+
+	tree := reporter.traceEvents.RLock()
+	require.Len(t, *tree, 1)
+	for _, resource := range *tree {
+		require.Len(t, resource.Events[support.TraceOriginHeapAlloc], 1)
+		for _, events := range resource.Events[support.TraceOriginHeapAlloc] {
+			assert.Equal(t, []int64{4096, 8192}, events.Values)
+			assert.Equal(t, []int64{64, 128}, events.AllocSizes)
+		}
+	}
+	reporter.traceEvents.RUnlock(&tree)
+
+	meta.Origin = support.TraceOriginHeapFree
+	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
+	tree = reporter.traceEvents.RLock()
+	defer reporter.traceEvents.RUnlock(&tree)
+	for _, resource := range *tree {
+		assert.Empty(t, resource.Events[support.TraceOriginHeapFree])
+	}
+}
+
+func testReporterFrames() libpf.Frames {
+	frames := make(libpf.Frames, 0, 1)
+	frames.Append(&libpf.Frame{Type: libpf.NativeFrame, AddressOrLineno: 0x1000})
+	return frames
+}
+
 // TestBaseReporterGenerate tests the Generate method and validates the output
 func TestBaseReporterGenerate(t *testing.T) {
 	reporter := createTestBaseReporter(t, nil)

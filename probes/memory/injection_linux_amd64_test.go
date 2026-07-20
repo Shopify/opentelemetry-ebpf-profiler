@@ -44,6 +44,8 @@ func TestInjectionSymbolMappingFilters(t *testing.T) {
 	assert.False(t, isAllocatorRuntimeMapping(mapping("/usr/bin/target")))
 	assert.True(t, isExperimentalShimMapping(mapping("/memfd:prophiler-heap-shim (deleted)")))
 	assert.True(t, isExperimentalShimMapping(mapping("/opt/prophiler/libprophiler-heap-shim.so")))
+	assert.True(t, isExperimentalShimMapping(mapping("/tmp/libprophiler-heap-shim.so")),
+		"an explicitly preloaded package shim may live outside the install prefix")
 	assert.False(t, isExperimentalShimMapping(mapping("/tmp/prophiler-heap-shim-decoy.so")))
 	assert.False(t, isExperimentalShimMapping(mapping("/usr/lib/libc.so.6")))
 }
@@ -93,6 +95,14 @@ func TestValidateOpenedShimMemfdRejectsNamedFile(t *testing.T) {
 	mapping.inode = stat.Ino
 	mapping.device++
 	assert.False(t, openedFileMatchesMapping(file, mapping))
+}
+
+func TestRemoteCallRejectsInvalidDataArgument(t *testing.T) {
+	_, err := (&ptraceSession{}).call(0, []uint64{0}, -1, []byte{1})
+	require.ErrorContains(t, err, "remote data argument -1 is invalid")
+
+	_, err = (&ptraceSession{}).call(0, []uint64{0}, 1, []byte{1})
+	require.ErrorContains(t, err, "remote data argument 1 outside 1 arguments")
 }
 
 func TestPotentialRemoteReturnStop(t *testing.T) {

@@ -4,8 +4,10 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"sync/atomic"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	lru "github.com/elastic/go-freelru"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,11 +17,50 @@ import (
 	golang "go.opentelemetry.io/ebpf-profiler/interpreter/go"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
+
+func TestReconcileMemoryProbesMarksIneligibleProcessComplete(t *testing.T) {
+	manager, err := memory.NewManager(memory.Config{
+		Enabled:                   true,
+		ProcessExecutablePatterns: []string{"definitely-not-this-test-process"},
+	}, map[memory.ProgramKind]*ebpf.Program{
+		memory.ProgramWeightedAllocation: {},
+	})
+	require.NoError(t, err)
+	defer manager.Close()
+
+	pid := libpf.PID(os.Getpid())
+	pm := &ProcessManager{
+		memoryProbeManager:   manager,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {lastSeenTID: pid}},
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+		cleanupSem:           make(chan struct{}, 1),
+	}
+
+	pm.ReconcileMemoryProbes(1)
+	inst := pm.memoryProbeInstances[pid]
+	require.NotNil(t, inst)
+	evaluated, eligible := inst.Applicability()
+	assert.True(t, evaluated)
+	assert.False(t, eligible)
+	assert.False(t, manager.ShouldRetry(inst))
+}
+
+func TestCloseDrainsDeferredCleanup(t *testing.T) {
+	pm := &ProcessManager{cleanupSem: make(chan struct{}, 2)}
+	var completed atomic.Uint32
+	for range 32 {
+		pm.deferCleanup(func() { completed.Add(1) })
+	}
+
+	pm.Close()
+	assert.Equal(t, uint32(32), completed.Load())
+}
 
 type traceCapture struct {
 	traces []*libpf.Trace

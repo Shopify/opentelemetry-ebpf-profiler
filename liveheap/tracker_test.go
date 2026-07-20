@@ -4,6 +4,7 @@
 package liveheap
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -174,6 +175,32 @@ func TestTracker_HandleProcessExit(t *testing.T) {
 	// Exit clears the PID's live-heap support, so later allocs are ignored.
 	tr.HandleAlloc(1, 0xd, h, 100, testFrames())
 	assert.Equal(t, 1, tr.LiveCount())
+}
+
+func TestTracker_ConcurrentAllocFree(t *testing.T) {
+	tr := NewTracker(0)
+	tr.SetPIDLiveHeapSupport(1, true)
+
+	var wg sync.WaitGroup
+	for worker := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range 1000 {
+				ptr := uint64(worker*1000 + index + 1)
+				tr.HandleAlloc(1, ptr, libpf.NewTraceHash(0, ptr), 100, testFrames())
+				tr.HandleFree(1, ptr)
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Zero(t, tr.LiveCount())
+	gotMetrics := tr.GetAndResetMetrics()
+	assert.Equal(t, metrics.MetricValue(8000),
+		metricValue(gotMetrics, metrics.IDHeapAllocSamples))
+	assert.Equal(t, metrics.MetricValue(8000),
+		metricValue(gotMetrics, metrics.IDHeapFreeSamples))
 }
 
 func TestTracker_GetAndResetMetrics(t *testing.T) {
