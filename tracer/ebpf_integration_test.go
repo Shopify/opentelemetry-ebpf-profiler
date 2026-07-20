@@ -275,4 +275,7 @@ func TestAllTracers(t *testing.T) {
 	})
 	require.NoError(t, err)
 	defer tr.Close()
+	require.NotContains(t, tr.GetEbpfMaps(), "function_latency_starts")
+	require.NotContains(t, tr.GetEbpfMaps(), "block_io_stacks_inflight")
+	require.NotContains(t, tr.GetEbpfMaps(), "block_io_stacks_scratch")
 }

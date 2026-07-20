@@ -4,6 +4,7 @@
 package tracer // import "go.opentelemetry.io/ebpf-profiler/tracer"
 
 import (
+	"errors"
 	"fmt"
 
 	cebpf "github.com/cilium/ebpf"
@@ -11,6 +12,47 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
+
+var dynamicProbeResources = struct {
+	maps      []string
+	programs  []string
+	variables []string
+}{
+	maps: []string{
+		"block_io_stacks_inflight",
+		"block_io_stacks_scratch",
+		"function_latency_starts",
+	},
+	programs: []string{
+		"block_io_stacks_issue",
+		"block_io_stacks_start",
+		"function_latency_entry",
+		"function_latency_exit",
+	},
+	variables: []string{
+		"block_io_stacks_min_ns",
+		"block_io_stacks_origin",
+		"block_io_stacks_sample_threshold",
+		"function_latency_min_ns",
+		"function_latency_origin",
+		"function_latency_sample_threshold",
+	},
+}
+
+// removeDynamicProbeResources prevents private maps and unattached programs
+// from consuming kernel memory in the main collection. Dynamic probes copy
+// these resources from the original embedded specification when enabled.
+func removeDynamicProbeResources(collection *cebpf.CollectionSpec) {
+	for _, name := range dynamicProbeResources.maps {
+		delete(collection.Maps, name)
+	}
+	for _, name := range dynamicProbeResources.programs {
+		delete(collection.Programs, name)
+	}
+	for _, name := range dynamicProbeResources.variables {
+		delete(collection.Variables, name)
+	}
+}
 
 // ProbeContext bundles the tracer's shared state and provides helpers for building eBPF
 // collections inside Probe.Load() implementations.
@@ -21,7 +63,7 @@ type ProbeContext struct {
 
 // CollectionSpecWith returns a filtered CollectionSpec built from the tracer's embedded
 // eBPF ELF. The returned spec contains only the maps, programs, and variables requested
-// by the probe plus ".rodata.var" and the mandatory system variables (tpbase_offset,
+// by the probe plus its private RODATA maps and the mandatory system variables (tpbase_offset,
 // task_stack_offset, etc.), which are always included and pre-populated from the values
 // determined at tracer startup.
 //
@@ -47,9 +89,12 @@ func (c *ProbeContext) CollectionSpecWith(
 		Variables: make(map[string]*cebpf.VariableSpec),
 	}
 
-	// .rodata.var holds all RODATA variables; always include it.
-	if m, ok := full.Maps[".rodata.var"]; ok {
-		filtered.Maps[".rodata.var"] = m.Copy()
+	// Each probe gets isolated RODATA maps so its origin and thresholds cannot
+	// clobber the main tracer or another instance of the same probe.
+	for _, name := range []string{".rodata", ".rodata.var"} {
+		if m, ok := full.Maps[name]; ok {
+			filtered.Maps[name] = m.Copy()
+		}
 	}
 
 	for _, name := range extraMaps {
@@ -139,12 +184,11 @@ func (c *ProbeContext) applySystemVars(coll *cebpf.CollectionSpec) error {
 // maps that the probe does not use are silently skipped.
 func (c *ProbeContext) RewriteMaps(coll *cebpf.CollectionSpec, probeMaps map[string]*cebpf.Map) error {
 	// Build pool: shared tracer maps plus probe-specific maps.
-	// .rodata.var is excluded: each probe creates its own isolated RODATA map
-	// in LoadProbeUnwinders so that probe-specific variables (e.g. origin_id_probe)
-	// are not clobbered by the main tracer's copy.
+	// RODATA maps are excluded: LoadProbeUnwinders creates isolated copies so
+	// probe-specific variables aren't clobbered by the main tracer's copy.
 	pool := make(map[string]*cebpf.Map, len(c.maps)+len(probeMaps))
 	for k, v := range c.maps {
-		if k == ".rodata.var" {
+		if k == ".rodata" || k == ".rodata.var" {
 			continue
 		}
 		pool[k] = v
@@ -175,6 +219,17 @@ func (c *ProbeContext) RewriteMaps(coll *cebpf.CollectionSpec, probeMaps map[str
 	return rewriteMaps(coll, toRewrite)
 }
 
+func collectionReferencesMap(coll *cebpf.CollectionSpec, name string) bool {
+	for _, progSpec := range coll.Programs {
+		for _, ins := range progSpec.Instructions {
+			if ins.Reference() == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // LoadProbeUnwinders loads the eBPF programs described by progs into the kernel,
 // wiring them into the tracer's kprobe tail-call map and the perf unwinder chain.
 // It syncs all VariableSpec values into the .rodata.var MapSpec, creates that map,
@@ -189,13 +244,17 @@ func (c *ProbeContext) LoadProbeUnwinders(
 	if err := syncVariablesToMapSpecs(coll); err != nil {
 		return err
 	}
-	if rodataSpec, ok := coll.Maps[".rodata.var"]; ok {
+	for _, name := range []string{".rodata", ".rodata.var"} {
+		rodataSpec, ok := coll.Maps[name]
+		if !ok || !collectionReferencesMap(coll, name) {
+			continue
+		}
 		rodataMap, err := cebpf.NewMap(rodataSpec)
 		if err != nil {
-			return fmt.Errorf("creating .rodata.var: %w", err)
+			return fmt.Errorf("creating %s: %w", name, err)
 		}
 		defer rodataMap.Close()
-		if err := rewriteMaps(coll, map[string]*cebpf.Map{".rodata.var": rodataMap}); err != nil {
+		if err := rewriteMaps(coll, map[string]*cebpf.Map{name: rodataMap}); err != nil {
 			return err
 		}
 	}
@@ -245,12 +304,19 @@ type Probe interface {
 // If p.Load fails, the origin ID is permanently consumed and cannot be reclaimed.
 // Enable must not be called concurrently with Close.
 func (t *Tracer) Enable(p Probe) error {
+	if p == nil {
+		return errors.New("probe is nil")
+	}
 	if !t.kprobeChainLoaded {
 		return fmt.Errorf("Enable requires the kprobe unwinder chain to be loaded at startup: " +
 			"set LoadProbe: true in the tracer Config")
 	}
 
-	originID, err := t.origins.register(p.ReportMetadata())
+	metadata := p.ReportMetadata()
+	if metadata == nil {
+		return errors.New("probe report metadata is nil")
+	}
+	originID, err := t.origins.register(metadata)
 	if err != nil {
 		return fmt.Errorf("failed to register probe origin: %w", err)
 	}
@@ -262,11 +328,14 @@ func (t *Tracer) Enable(p Probe) error {
 
 	lnk, err := p.Load(originID, ctx)
 	if err != nil {
+		t.origins.unregister(originID)
 		return fmt.Errorf("failed to load probe: %w", err)
 	}
-
-	if lnk != nil {
-		t.hooks[hookPoint{group: "probe", name: fmt.Sprintf("%d", originID)}] = lnk
+	if lnk == nil {
+		t.origins.unregister(originID)
+		return errors.New("probe returned a nil link")
 	}
+
+	t.hooks[hookPoint{group: "probe", name: fmt.Sprintf("%d", originID)}] = lnk
 	return nil
 }

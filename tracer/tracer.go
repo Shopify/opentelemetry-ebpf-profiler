@@ -390,6 +390,7 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *orig
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to load specification for tracers: %v", err)
 	}
+	removeDynamicProbeResources(coll)
 
 	if major > 6 || (major == 6 && minor >= 16) {
 		// Tracepoint format for sched_process_free has changed in v6.16+.
@@ -1530,6 +1531,10 @@ func (r *originRegistry) register(metadata *samples.TypeMetadata) (uint16, error
 
 // lookup returns the profile type metadata registered for origin, or nil if
 // origin is unknown.
+func (r *originRegistry) unregister(origin uint16) {
+	r.types.Delete(origin)
+}
+
 func (r *originRegistry) lookup(origin uint16) *samples.TypeMetadata {
 	v, ok := r.types.Load(origin)
 	if !ok {
