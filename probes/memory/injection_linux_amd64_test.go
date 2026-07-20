@@ -7,6 +7,7 @@ package memory
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
@@ -79,6 +80,16 @@ func TestExperimentalShimUSDTNotes(t *testing.T) {
 		}
 	}
 	assert.Equal(t, map[string]bool{"alloc": true, "free": true}, found)
+
+	contents, err := os.ReadFile(shim)
+	require.NoError(t, err)
+	corrupt := append([]byte(nil), contents...)
+	needle := []byte(ExperimentalShimProvider + "\x00alloc\x00")
+	note := bytes.Index(corrupt, needle)
+	require.NotEqual(t, -1, note, "allocation USDT descriptor not found")
+	corrupt[note+len(ExperimentalShimProvider)+1] = 'x'
+	require.ErrorContains(t, validateExperimentalShimProbes(corrupt),
+		"missing semaphore-gated USDT probe")
 }
 
 func TestExperimentalGOTInjection(t *testing.T) {
