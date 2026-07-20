@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"runtime"
 	"sort"
 	"strconv"
@@ -163,11 +164,11 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 		}
 	}
 
-	syscallAddr, err := resolveProcessSymbol(leader, "syscall")
+	syscallAddr, err := resolveProcessSymbol(leader, "syscall", isAllocatorRuntimeMapping)
 	if err != nil {
 		return result, fmt.Errorf("resolve libc syscall: %w", err)
 	}
-	dlopenAddr, err := resolveProcessSymbol(leader, "dlopen")
+	dlopenAddr, err := resolveProcessSymbol(leader, "dlopen", isAllocatorRuntimeMapping)
 	if err != nil {
 		return result, fmt.Errorf("resolve dlopen: %w", err)
 	}
@@ -227,7 +228,7 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	}
 
 	setSamplingInterval, err := resolveProcessSymbol(
-		leader, "prophiler_heap_set_sampling_interval")
+		leader, "prophiler_heap_set_sampling_interval", isExperimentalShimMapping)
 	if err != nil {
 		return result, fmt.Errorf("resolve injected sampling configuration: %w", err)
 	}
@@ -235,7 +236,8 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 		return result, fmt.Errorf("configure injected sampling interval: %w", err)
 	}
 
-	installGOT, err := resolveProcessSymbol(leader, "prophiler_heap_install_got")
+	installGOT, err := resolveProcessSymbol(
+		leader, "prophiler_heap_install_got", isExperimentalShimMapping)
 	if err != nil {
 		return result, fmt.Errorf("resolve injected GOT installer: %w", err)
 	}
@@ -249,7 +251,8 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	}
 	var installInline uint64
 	if i.mode == InjectionGOTThenInline {
-		installInline, err = resolveProcessSymbol(leader, "prophiler_heap_install_inline")
+		installInline, err = resolveProcessSymbol(
+			leader, "prophiler_heap_install_inline", isExperimentalShimMapping)
 		if err != nil {
 			return result, fmt.Errorf("resolve injected inline installer: %w", err)
 		}
@@ -600,14 +603,25 @@ func readProcessMappings(pid int) ([]processMapping, error) {
 	return mappings, nil
 }
 
-func resolveProcessSymbol(pid int, name string) (uint64, error) {
+func isAllocatorRuntimeMapping(mappingPath string) bool {
+	base := path.Base(strings.TrimSuffix(mappingPath, " (deleted)"))
+	return base == "libc.so" || strings.HasPrefix(base, "libc.so.") ||
+		base == "libdl.so" || strings.HasPrefix(base, "libdl.so.")
+}
+
+func isExperimentalShimMapping(mappingPath string) bool {
+	return strings.Contains(mappingPath, "prophiler-heap-shim")
+}
+
+func resolveProcessSymbol(pid int, name string, acceptsMapping func(string) bool) (uint64, error) {
 	mappings, err := readProcessMappings(pid)
 	if err != nil {
 		return 0, err
 	}
 	seen := make(map[string]struct{})
 	for _, mapping := range mappings {
-		if mapping.path == "" || strings.HasPrefix(mapping.path, "[") {
+		if mapping.path == "" || strings.HasPrefix(mapping.path, "[") ||
+			(acceptsMapping != nil && !acceptsMapping(mapping.path)) {
 			continue
 		}
 		identity := fmt.Sprintf("%x-%x", mapping.start-mapping.offset, mapping.end-mapping.offset)
@@ -650,7 +664,7 @@ func resolveProcessSymbol(pid int, name string) (uint64, error) {
 		_ = parsed.Close()
 		_ = file.Close()
 	}
-	return 0, fmt.Errorf("symbol %q not found in pid %d executable mappings", name, pid)
+	return 0, fmt.Errorf("symbol %q not found in accepted pid %d executable mappings", name, pid)
 }
 
 func openMappedELF(pid int, mapping processMapping) (*os.File, error) {

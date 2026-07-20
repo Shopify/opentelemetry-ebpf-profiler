@@ -27,6 +27,15 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
+func TestInjectionSymbolMappingFilters(t *testing.T) {
+	assert.True(t, isAllocatorRuntimeMapping("/usr/lib/x86_64-linux-gnu/libc.so.6"))
+	assert.True(t, isAllocatorRuntimeMapping("/lib/libdl.so.2 (deleted)"))
+	assert.False(t, isAllocatorRuntimeMapping("/tmp/libc.so-pretender"))
+	assert.False(t, isAllocatorRuntimeMapping("/usr/bin/target"))
+	assert.True(t, isExperimentalShimMapping("/memfd:prophiler-heap-shim (deleted)"))
+	assert.False(t, isExperimentalShimMapping("/usr/lib/libc.so.6"))
+}
+
 func TestRequiredAllocatorPatchesPresent(t *testing.T) {
 	tests := []struct {
 		name        string
