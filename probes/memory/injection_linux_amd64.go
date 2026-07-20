@@ -36,11 +36,13 @@ const (
 )
 
 type ptraceAllocatorInjector struct {
-	shim []byte
-	mode InjectionMode
+	shim             []byte
+	mode             InjectionMode
+	samplingInterval uint64
 }
 
-func newAllocatorInjector(path string, mode InjectionMode) (allocatorInjector, error) {
+func newAllocatorInjector(path string, mode InjectionMode,
+	samplingInterval uint64) (allocatorInjector, error) {
 	shim, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read experimental allocator shim %q: %w", path, err)
@@ -53,7 +55,9 @@ func newAllocatorInjector(path string, mode InjectionMode) (allocatorInjector, e
 	if parsed.Class != elf.ELFCLASS64 || parsed.Machine != elf.EM_X86_64 || parsed.Type != elf.ET_DYN {
 		return nil, fmt.Errorf("experimental allocator shim must be an x86-64 ET_DYN ELF")
 	}
-	return &ptraceAllocatorInjector{shim: shim, mode: mode}, nil
+	return &ptraceAllocatorInjector{
+		shim: shim, mode: mode, samplingInterval: samplingInterval,
+	}, nil
 }
 
 func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult, retErr error) {
@@ -114,6 +118,15 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	}
 	if closeCallErr != nil {
 		return result, fmt.Errorf("close target shim memfd: %w", closeCallErr)
+	}
+
+	setSamplingInterval, err := resolveProcessSymbol(
+		leader, "prophiler_heap_set_sampling_interval")
+	if err != nil {
+		return result, fmt.Errorf("resolve injected sampling configuration: %w", err)
+	}
+	if _, err := session.Call(setSamplingInterval, i.samplingInterval); err != nil {
+		return result, fmt.Errorf("configure injected sampling interval: %w", err)
 	}
 
 	installGOT, err := resolveProcessSymbol(leader, "prophiler_heap_install_got")

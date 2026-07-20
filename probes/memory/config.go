@@ -353,9 +353,7 @@ func (cfg Config) Validate() error {
 	}
 	switch mode {
 	case InjectionDisabled:
-		if cfg.ExperimentalShimPath != "" {
-			return fmt.Errorf("experimental shim path requires a non-disabled injection mode")
-		}
+		// A packaged shim path is inert unless an operator selects a mode.
 	case InjectionGOT, InjectionGOTThenInline:
 		if !cfg.Enabled {
 			return fmt.Errorf("experimental allocator injection requires memory profiling to be enabled")
