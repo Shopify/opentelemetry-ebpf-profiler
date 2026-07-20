@@ -21,6 +21,7 @@ import (
 	parcausdt "github.com/parca-dev/usdt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
@@ -29,12 +30,39 @@ import (
 )
 
 func TestInjectionSymbolMappingFilters(t *testing.T) {
-	assert.True(t, isAllocatorRuntimeMapping("/usr/lib/x86_64-linux-gnu/libc.so.6"))
-	assert.True(t, isAllocatorRuntimeMapping("/lib/libdl.so.2 (deleted)"))
-	assert.False(t, isAllocatorRuntimeMapping("/tmp/libc.so-pretender"))
-	assert.False(t, isAllocatorRuntimeMapping("/usr/bin/target"))
-	assert.True(t, isExperimentalShimMapping("/memfd:prophiler-heap-shim (deleted)"))
-	assert.False(t, isExperimentalShimMapping("/usr/lib/libc.so.6"))
+	mapping := func(path string) processMapping { return processMapping{path: path} }
+	assert.True(t, isAllocatorRuntimeMapping(mapping("/usr/lib/x86_64-linux-gnu/libc.so.6")))
+	assert.True(t, isAllocatorRuntimeMapping(mapping("/lib/libdl.so.2 (deleted)")))
+	assert.False(t, isAllocatorRuntimeMapping(mapping("/tmp/libc.so-pretender")))
+	assert.False(t, isAllocatorRuntimeMapping(mapping("/tmp/libc.so.6.pretender")))
+	assert.False(t, isAllocatorRuntimeMapping(mapping("/tmp/libc.so.6..1")))
+	assert.False(t, isAllocatorRuntimeMapping(mapping("/usr/bin/target")))
+	assert.True(t, isExperimentalShimMapping(mapping("/memfd:prophiler-heap-shim (deleted)")))
+	assert.False(t, isExperimentalShimMapping(mapping("/usr/lib/libc.so.6")))
+}
+
+func TestValidateOpenedShimMemfd(t *testing.T) {
+	fd, err := unix.MemfdCreate("prophiler-heap-shim", unix.MFD_CLOEXEC)
+	require.NoError(t, err)
+	memfd := os.NewFile(uintptr(fd), "prophiler-heap-shim")
+	require.NotNil(t, memfd)
+	defer memfd.Close()
+	var stat unix.Stat_t
+	require.NoError(t, validateOpenedShimMemfd(memfd, &stat))
+}
+
+func TestValidateOpenedShimMemfdRejectsNamedFile(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "prophiler-heap-shim")
+	require.NoError(t, err)
+	defer file.Close()
+	var stat unix.Stat_t
+	require.ErrorContains(t, validateOpenedShimMemfd(file, &stat),
+		"not an unlinked regular memfd")
+	require.NoError(t, unix.Fstat(int(file.Fd()), &stat))
+	mapping := processMapping{device: uint64(stat.Dev), inode: stat.Ino}
+	assert.True(t, openedFileMatchesMapping(file, mapping))
+	mapping.inode++
+	assert.False(t, openedFileMatchesMapping(file, mapping))
 }
 
 func TestRequiredAllocatorPatchesPresent(t *testing.T) {

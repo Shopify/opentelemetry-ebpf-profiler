@@ -185,6 +185,29 @@ func validateExperimentalShimProbes(shim []byte) error {
 	return nil
 }
 
+func validateOpenedShimMemfd(file *os.File, stat *unix.Stat_t) error {
+	if file == nil || stat == nil {
+		return errors.New("missing opened memfd or stat destination")
+	}
+	if err := unix.Fstat(int(file.Fd()), stat); err != nil {
+		return fmt.Errorf("stat opened target fd: %w", err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 0 {
+		return fmt.Errorf("target fd is not an unlinked regular memfd (mode=%#o nlink=%d)",
+			stat.Mode, stat.Nlink)
+	}
+	openedPath := fmt.Sprintf("/proc/self/fd/%d", file.Fd())
+	target, err := os.Readlink(openedPath)
+	if err != nil {
+		return fmt.Errorf("read opened target fd identity: %w", err)
+	}
+	target = strings.TrimSuffix(target, " (deleted)")
+	if target != "/memfd:prophiler-heap-shim" && target != "memfd:prophiler-heap-shim" {
+		return fmt.Errorf("target fd is not the requested heap shim memfd: %q", target)
+	}
+	return nil
+}
+
 func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult, retErr error) {
 	// Linux records ptrace ownership at thread granularity. Keep every attach,
 	// wait, register operation, and detach on one tracer thread.
@@ -197,7 +220,7 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 		return result, fmt.Errorf("read target mappings before injection: %w", err)
 	}
 	for _, mapping := range mappings {
-		if strings.Contains(mapping.path, "prophiler-heap-shim") {
+		if isExperimentalShimMapping(mapping) {
 			result.AlreadyPresent = true
 			return result, nil
 		}
@@ -241,10 +264,28 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	if err != nil {
 		return result, fmt.Errorf("open target memfd %s: %w", fdPath, err)
 	}
-	_, copyErr := remoteFile.Write(i.shim)
+	var remoteStat unix.Stat_t
+	identityErr := validateOpenedShimMemfd(remoteFile, &remoteStat)
+	truncateErr := error(nil)
+	if identityErr == nil {
+		truncateErr = remoteFile.Truncate(int64(len(i.shim)))
+	}
+	var copyErr error
+	if identityErr == nil && truncateErr == nil {
+		var written int
+		written, copyErr = remoteFile.Write(i.shim)
+		if copyErr == nil && written != len(i.shim) {
+			copyErr = io.ErrShortWrite
+		}
+	}
 	closeErr := remoteFile.Close()
-	if copyErr != nil || closeErr != nil {
-		return result, fmt.Errorf("populate target memfd: %w", errors.Join(copyErr, closeErr))
+	if identityErr != nil || truncateErr != nil || copyErr != nil || closeErr != nil {
+		return result, fmt.Errorf("populate target memfd: %w",
+			errors.Join(identityErr, truncateErr, copyErr, closeErr))
+	}
+	injectedShimMapping := func(mapping processMapping) bool {
+		return isExperimentalShimMapping(mapping) &&
+			mapping.device == uint64(remoteStat.Dev) && mapping.inode == remoteStat.Ino
 	}
 
 	fdOpen := true
@@ -267,7 +308,7 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	}
 
 	setSamplingInterval, err := resolveProcessSymbol(
-		leader, "prophiler_heap_set_sampling_interval", isExperimentalShimMapping)
+		leader, "prophiler_heap_set_sampling_interval", injectedShimMapping)
 	if err != nil {
 		return result, fmt.Errorf("resolve injected sampling configuration: %w", err)
 	}
@@ -276,7 +317,7 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	}
 
 	installGOT, err := resolveProcessSymbol(
-		leader, "prophiler_heap_install_got", isExperimentalShimMapping)
+		leader, "prophiler_heap_install_got", injectedShimMapping)
 	if err != nil {
 		return result, fmt.Errorf("resolve injected GOT installer: %w", err)
 	}
@@ -291,7 +332,7 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	var installInline uint64
 	if i.mode == InjectionGOTThenInline {
 		installInline, err = resolveProcessSymbol(
-			leader, "prophiler_heap_install_inline", isExperimentalShimMapping)
+			leader, "prophiler_heap_install_inline", injectedShimMapping)
 		if err != nil {
 			return result, fmt.Errorf("resolve injected inline installer: %w", err)
 		}
@@ -615,6 +656,8 @@ type processMapping struct {
 	start  uint64
 	end    uint64
 	offset uint64
+	device uint64
+	inode  uint64
 	path   string
 }
 
@@ -636,29 +679,62 @@ func readProcessMappings(pid int) ([]processMapping, error) {
 		start, startErr := strconv.ParseUint(bounds[0], 16, 64)
 		end, endErr := strconv.ParseUint(bounds[1], 16, 64)
 		offset, offsetErr := strconv.ParseUint(fields[2], 16, 64)
-		if startErr != nil || endErr != nil || offsetErr != nil {
+		deviceParts := strings.SplitN(fields[3], ":", 2)
+		if len(deviceParts) != 2 {
+			continue
+		}
+		deviceMajor, majorErr := strconv.ParseUint(deviceParts[0], 16, 32)
+		deviceMinor, minorErr := strconv.ParseUint(deviceParts[1], 16, 32)
+		inode, inodeErr := strconv.ParseUint(fields[4], 10, 64)
+		if startErr != nil || endErr != nil || offsetErr != nil ||
+			majorErr != nil || minorErr != nil || inodeErr != nil {
 			continue
 		}
 		path := ""
 		if len(fields) > 5 {
 			path = strings.Join(fields[5:], " ")
 		}
-		mappings = append(mappings, processMapping{start: start, end: end, offset: offset, path: path})
+		mappings = append(mappings, processMapping{
+			start: start, end: end, offset: offset,
+			device: unix.Mkdev(uint32(deviceMajor), uint32(deviceMinor)), inode: inode,
+			path: path,
+		})
 	}
 	return mappings, nil
 }
 
-func isAllocatorRuntimeMapping(mappingPath string) bool {
-	base := path.Base(strings.TrimSuffix(mappingPath, " (deleted)"))
-	return base == "libc.so" || strings.HasPrefix(base, "libc.so.") ||
-		base == "libdl.so" || strings.HasPrefix(base, "libdl.so.")
+func isVersionedSharedObject(base, name string) bool {
+	if base == name {
+		return true
+	}
+	version, ok := strings.CutPrefix(base, name+".")
+	if !ok || version == "" {
+		return false
+	}
+	for _, component := range strings.Split(version, ".") {
+		if component == "" {
+			return false
+		}
+		for _, char := range component {
+			if char < '0' || char > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
-func isExperimentalShimMapping(mappingPath string) bool {
-	return strings.Contains(mappingPath, "prophiler-heap-shim")
+func isAllocatorRuntimeMapping(mapping processMapping) bool {
+	base := path.Base(strings.TrimSuffix(mapping.path, " (deleted)"))
+	return isVersionedSharedObject(base, "libc.so") ||
+		isVersionedSharedObject(base, "libdl.so")
 }
 
-func resolveProcessSymbol(pid int, name string, acceptsMapping func(string) bool) (uint64, error) {
+func isExperimentalShimMapping(mapping processMapping) bool {
+	return strings.Contains(mapping.path, "prophiler-heap-shim")
+}
+
+func resolveProcessSymbol(pid int, name string, acceptsMapping func(processMapping) bool) (uint64, error) {
 	mappings, err := readProcessMappings(pid)
 	if err != nil {
 		return 0, err
@@ -666,7 +742,7 @@ func resolveProcessSymbol(pid int, name string, acceptsMapping func(string) bool
 	seen := make(map[string]struct{})
 	for _, mapping := range mappings {
 		if mapping.path == "" || strings.HasPrefix(mapping.path, "[") ||
-			(acceptsMapping != nil && !acceptsMapping(mapping.path)) {
+			(acceptsMapping != nil && !acceptsMapping(mapping)) {
 			continue
 		}
 		identity := fmt.Sprintf("%x-%x", mapping.start-mapping.offset, mapping.end-mapping.offset)
@@ -712,25 +788,45 @@ func resolveProcessSymbol(pid int, name string, acceptsMapping func(string) bool
 	return 0, fmt.Errorf("symbol %q not found in accepted pid %d executable mappings", name, pid)
 }
 
+func openedFileMatchesMapping(file *os.File, mapping processMapping) bool {
+	if file == nil {
+		return false
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return false
+	}
+	return uint64(stat.Dev) == mapping.device && stat.Ino == mapping.inode
+}
+
 func openMappedELF(pid int, mapping processMapping) (*os.File, error) {
 	mapFile := fmt.Sprintf("/proc/%d/map_files/%x-%x", pid, mapping.start, mapping.end)
 	file, mapErr := os.Open(mapFile)
 	if mapErr == nil {
-		return file, nil
+		if openedFileMatchesMapping(file, mapping) {
+			return file, nil
+		}
+		_ = file.Close()
+		mapErr = errors.New("map_files object identity differs from process mapping")
 	}
 
 	// map_files can require CAP_CHECKPOINT_RESTORE on newer kernels. Ordinary
-	// filesystem-backed mappings remain reachable through the target root.
+	// filesystem-backed mappings remain reachable through the target root, but
+	// only while that path still names the exact mapped device and inode.
 	path := strings.TrimSuffix(mapping.path, " (deleted)")
 	if strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "/memfd:") {
 		rootPath := fmt.Sprintf("/proc/%d/root%s", pid, path)
 		if file, err := os.Open(rootPath); err == nil {
-			return file, nil
+			if openedFileMatchesMapping(file, mapping) {
+				return file, nil
+			}
+			_ = file.Close()
 		}
 	}
 
-	// Keep the injected memfd open through symbol resolution so environments
-	// lacking map_files permission can still parse the exact backing object.
+	// During injection only, the target fd stays open through symbol resolution,
+	// allowing restricted environments to find the exact memfd by device/inode.
+	// After remote close, later reconciliation requires map_files permission.
 	if strings.Contains(path, "prophiler-heap-shim") {
 		entries, _ := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
 		for _, entry := range entries {
@@ -740,7 +836,10 @@ func openMappedELF(pid int, mapping processMapping) (*os.File, error) {
 				continue
 			}
 			if file, err := os.Open(fdPath); err == nil {
-				return file, nil
+				if openedFileMatchesMapping(file, mapping) {
+					return file, nil
+				}
+				_ = file.Close()
 			}
 		}
 	}
