@@ -5,15 +5,18 @@ package tracer_test
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	parcausdt "github.com/parca-dev/usdt"
 	"github.com/stretchr/testify/require"
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
@@ -22,9 +25,76 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	"go.opentelemetry.io/ebpf-profiler/process"
+	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
 )
+
+type heapShimSemaphores struct {
+	allocation libpf.Address
+	free       libpf.Address
+	objects    int
+}
+
+func locateHeapShimSemaphores(
+	t *testing.T, pid libpf.PID, shimPath string,
+) heapShimSemaphores {
+	t.Helper()
+
+	probes, err := parcausdt.ParseProbesFromFile(shimPath)
+	require.NoError(t, err)
+	offsets := make(map[string]uint64, 2)
+	for _, probe := range probes {
+		if probe.Provider == memory.ExperimentalShimProvider &&
+			(probe.Name == "alloc" || probe.Name == "free") {
+			offsets[probe.Name] = probe.SemaphoreOffset
+		}
+	}
+	require.NotZero(t, offsets["alloc"])
+	require.NotZero(t, offsets["free"])
+
+	addresses := heapShimSemaphores{}
+	objects := make(map[[2]uint64]struct{})
+	pr := process.New(pid, pid)
+	_, err = pr.IterateMappings(func(mapping process.RawMapping) bool {
+		if !strings.Contains(mapping.Path, "prophiler-heap-shim") {
+			return true
+		}
+		objects[[2]uint64{mapping.Device, mapping.Inode}] = struct{}{}
+		for name, offset := range offsets {
+			if offset < mapping.FileOffset ||
+				offset+2 > mapping.FileOffset+mapping.Length {
+				continue
+			}
+			address := libpf.Address(mapping.Vaddr + offset - mapping.FileOffset)
+			if name == "alloc" {
+				addresses.allocation = address
+			} else {
+				addresses.free = address
+			}
+		}
+		return true
+	})
+	require.NoError(t, err)
+	require.NotZero(t, addresses.allocation)
+	require.NotZero(t, addresses.free)
+	addresses.objects = len(objects)
+	return addresses
+}
+
+func requireHeapShimSemaphore(
+	t *testing.T, pid libpf.PID, address libpf.Address, expected uint16,
+) {
+	t.Helper()
+	remote := remotememory.NewProcessVirtualMemory(pid)
+	require.Eventually(t, func() bool {
+		var data [2]byte
+		if err := remote.Read(address, data[:]); err != nil {
+			return false
+		}
+		return binary.LittleEndian.Uint16(data[:]) == expected
+	}, time.Second, 10*time.Millisecond)
+}
 
 func TestDirectMallocEmitsAllocation(t *testing.T) {
 	var compiler string
@@ -277,7 +347,8 @@ int main(void) {
   if (getchar() == EOF) return 4;
   free(p);
   puts("freed"); fflush(stdout);
-  sleep(2);
+  if (getchar() == EOF) return 5;
+  puts("done"); fflush(stdout);
   return 0;
 }
 `), 0o600))
@@ -319,7 +390,13 @@ int main(void) {
 		LiveHeapTracker: liveheap.NewTracker(1024),
 	})
 	require.NoError(t, err)
-	defer func() { cancel(); tr.Close() }()
+	trClosed := false
+	defer func() {
+		if !trClosed {
+			cancel()
+			tr.Close()
+		}
+	}()
 	traceCh := make(chan *libpf.EbpfTrace, 64)
 	require.NoError(t, tr.StartMapMonitors(ctx, traceCh))
 	tr.StartPIDEventProcessor(ctx)
@@ -328,7 +405,14 @@ int main(void) {
 	// The first pass injects after finding no producer. The second discovers
 	// the sealed memfd and attaches its semaphore-gated allocation/free notes.
 	tr.ProcessManager().SynchronizeProcess(process.New(pid, pid))
+	semaphores := locateHeapShimSemaphores(t, pid, injectionShim)
+	require.Equal(t, 1, semaphores.objects, "injection created multiple shim objects")
+	requireHeapShimSemaphore(t, pid, semaphores.allocation, 0)
+	requireHeapShimSemaphore(t, pid, semaphores.free, 0)
+
 	tr.ProcessManager().SynchronizeProcess(process.New(pid, pid))
+	requireHeapShimSemaphore(t, pid, semaphores.allocation, 1)
+	requireHeapShimSemaphore(t, pid, semaphores.free, 1)
 
 	_, err = fmt.Fprintln(stdin)
 	require.NoError(t, err)
@@ -353,15 +437,65 @@ int main(void) {
 	require.NoError(t, err)
 	freeTimeout := time.NewTimer(5 * time.Second)
 	defer freeTimeout.Stop()
+freeLoop:
 	for {
 		select {
 		case got := <-traceCh:
 			if got.Origin == libpf.Origin(support.TraceOriginHeapFree) &&
 				got.PID == pid && got.Ptr == allocationPointer {
-				return
+				break freeLoop
 			}
 		case <-freeTimeout.C:
 			t.Fatal("timed out waiting for matching injected heap free trace")
 		}
 	}
+
+	// Link teardown must decrement both reference counters. Interposition stays
+	// installed, but the producer becomes inert.
+	cancel()
+	tr.Close()
+	trClosed = true
+	requireHeapShimSemaphore(t, pid, semaphores.allocation, 0)
+	requireHeapShimSemaphore(t, pid, semaphores.free, 0)
+
+	// Simulate a profiler restart. Existing memfd discovery must attach to the
+	// same object without injecting another copy, then detach cleanly again.
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	tr2, err := tracer.NewTracer(ctx2, &tracer.Config{
+		Intervals: &mockIntervals{}, InterpretersConfig: interpreterconfig.AllInterpreters(),
+		ProbesConfig: probes, SamplesPerSecond: 20,
+		ProbabilisticInterval: 100, ProbabilisticThreshold: 100,
+		OffCPUThreshold: uint32(math.MaxUint32 / 100),
+		LiveHeapTracker: liveheap.NewTracker(1024),
+	})
+	require.NoError(t, err)
+	tr2Closed := false
+	defer func() {
+		if !tr2Closed {
+			cancel2()
+			tr2.Close()
+		}
+	}()
+	tr2.ProcessManager().SynchronizeProcess(process.New(pid, pid))
+	restartedSemaphores := locateHeapShimSemaphores(t, pid, injectionShim)
+	require.Equal(t, 1, restartedSemaphores.objects,
+		"profiler restart reinjected the heap shim")
+	require.Equal(t, semaphores.allocation, restartedSemaphores.allocation)
+	require.Equal(t, semaphores.free, restartedSemaphores.free)
+	requireHeapShimSemaphore(t, pid, semaphores.allocation, 1)
+	requireHeapShimSemaphore(t, pid, semaphores.free, 1)
+	cancel2()
+	tr2.Close()
+	tr2Closed = true
+	requireHeapShimSemaphore(t, pid, semaphores.allocation, 0)
+	requireHeapShimSemaphore(t, pid, semaphores.free, 0)
+
+	_, err = fmt.Fprintln(stdin)
+	require.NoError(t, err)
+	require.True(t, scanner.Scan())
+	require.Equal(t, "allocated", scanner.Text())
+	require.True(t, scanner.Scan())
+	require.Equal(t, "freed", scanner.Text())
+	require.True(t, scanner.Scan())
+	require.Equal(t, "done", scanner.Text())
 }
