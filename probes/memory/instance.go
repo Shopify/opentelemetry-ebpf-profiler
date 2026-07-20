@@ -175,34 +175,53 @@ func (m *Manager) Reconcile(
 	inst.mu.Lock()
 	var detachErrs []error
 	numDetached := 0
-	for key, attached := range inst.attached {
-		if _, keep := desired[key]; keep {
-			continue
+	// In live mode, disable allocation producers before free producers. The
+	// shim rechecks its allocation semaphore at the marker call, so this order
+	// prevents a newly sampled allocation from outliving the free link during
+	// detach. Map iteration order must not decide this lifecycle contract.
+	for _, event := range []EventKind{EventAllocation, EventDeallocation} {
+		for key, attached := range inst.attached {
+			if key.Event != event {
+				continue
+			}
+			if _, keep := desired[key]; keep {
+				continue
+			}
+			if _, scanFailed := failedFiles[key.FileID]; scanFailed {
+				continue
+			}
+			if err := closeLinks(attached.Links); err != nil {
+				detachErrs = append(detachErrs, fmt.Errorf("detach %v: %w", key, err))
+			}
+			delete(inst.attached, key)
+			numDetached++
 		}
-		if _, scanFailed := failedFiles[key.FileID]; scanFailed {
-			continue
-		}
-		if err := closeLinks(attached.Links); err != nil {
-			detachErrs = append(detachErrs, fmt.Errorf("detach %v: %w", key, err))
-		}
-		delete(inst.attached, key)
-		numDetached++
 	}
 
 	var attachErrs []error
 	numAttached := 0
-	for key, entry := range desired {
-		if _, exists := inst.attached[key]; exists {
-			continue
+	attachOrder := []EventKind{EventAllocation, EventDeallocation}
+	if m.config.Live {
+		// Arm the free producer before allocations can enter the live set.
+		attachOrder = []EventKind{EventDeallocation, EventAllocation}
+	}
+	for _, event := range attachOrder {
+		for key, entry := range desired {
+			if key.Event != event {
+				continue
+			}
+			if _, exists := inst.attached[key]; exists {
+				continue
+			}
+			mapping := &process.RawMapping{Vaddr: entry.vaddr, Length: entry.length}
+			links, err := m.attach(pid, mapping, entry.hook)
+			if err != nil {
+				attachErrs = append(attachErrs, fmt.Errorf("attach %v: %w", key, err))
+				continue
+			}
+			inst.attached[key] = AttachedHook{Key: key, Links: links}
+			numAttached++
 		}
-		mapping := &process.RawMapping{Vaddr: entry.vaddr, Length: entry.length}
-		links, err := m.attach(pid, mapping, entry.hook)
-		if err != nil {
-			attachErrs = append(attachErrs, fmt.Errorf("attach %v: %w", key, err))
-			continue
-		}
-		inst.attached[key] = AttachedHook{Key: key, Links: links}
-		numAttached++
 	}
 
 	hasAllocation := false
@@ -250,11 +269,16 @@ func (inst *Instance) Detach() error {
 	defer inst.mu.Unlock()
 
 	var errs []error
-	for key, attached := range inst.attached {
-		if err := closeLinks(attached.Links); err != nil {
-			errs = append(errs, fmt.Errorf("close %v: %w", key, err))
+	for _, event := range []EventKind{EventAllocation, EventDeallocation} {
+		for key, attached := range inst.attached {
+			if key.Event != event {
+				continue
+			}
+			if err := closeLinks(attached.Links); err != nil {
+				errs = append(errs, fmt.Errorf("close %v: %w", key, err))
+			}
+			delete(inst.attached, key)
 		}
-		delete(inst.attached, key)
 	}
 	return errors.Join(errs...)
 }
