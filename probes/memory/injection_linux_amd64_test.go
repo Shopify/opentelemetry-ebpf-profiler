@@ -60,7 +60,8 @@ func TestExperimentalGOTInjection(t *testing.T) {
 		t.Fatal("target did not become ready")
 	}
 
-	injector, err := newAllocatorInjector(shim, InjectionGOT, DefaultSamplingIntervalBytes)
+	injector, err := newAllocatorInjector(
+		shim, InjectionGOT, DefaultSamplingIntervalBytes, false)
 	require.NoError(t, err)
 	result, err := injector.Inject(libpf.PID(cmd.Process.Pid))
 	require.NoError(t, err)

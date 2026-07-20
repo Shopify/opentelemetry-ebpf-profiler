@@ -7,6 +7,6 @@ package memory
 
 import "fmt"
 
-func newAllocatorInjector(_ string, mode InjectionMode, _ uint64) (allocatorInjector, error) {
+func newAllocatorInjector(_ string, mode InjectionMode, _ uint64, _ bool) (allocatorInjector, error) {
 	return nil, fmt.Errorf("experimental allocator injection mode %q is only implemented on linux/amd64", mode)
 }

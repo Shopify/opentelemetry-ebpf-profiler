@@ -66,7 +66,7 @@ func NewManager(cfg Config, progs map[ProgramKind]*cebpf.Program) (*Manager, err
 	if cfg.ExperimentalInjectionMode != InjectionDisabled {
 		m.injector, err = newAllocatorInjector(
 			cfg.ExperimentalShimPath, cfg.ExperimentalInjectionMode,
-			cfg.SamplingIntervalBytes)
+			cfg.SamplingIntervalBytes, cfg.Live)
 		if err != nil {
 			return nil, fmt.Errorf("memory probe: initialize experimental injector: %w", err)
 		}

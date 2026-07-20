@@ -39,10 +39,11 @@ type ptraceAllocatorInjector struct {
 	shim             []byte
 	mode             InjectionMode
 	samplingInterval uint64
+	requireFree      bool
 }
 
 func newAllocatorInjector(path string, mode InjectionMode,
-	samplingInterval uint64) (allocatorInjector, error) {
+	samplingInterval uint64, requireFree bool) (allocatorInjector, error) {
 	shim, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read experimental allocator shim %q: %w", path, err)
@@ -57,6 +58,7 @@ func newAllocatorInjector(path string, mode InjectionMode,
 	}
 	return &ptraceAllocatorInjector{
 		shim: shim, mode: mode, samplingInterval: samplingInterval,
+		requireFree: requireFree,
 	}, nil
 }
 
@@ -139,11 +141,15 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 	}
 	result.GOTPatched = status&(shimGOTMallocBit|shimGOTFreeBit) != 0
 	result.PatchedSlots = uint32(status >> 32)
-	if status&shimGOTMallocBit != 0 {
+	gotSufficient := status&shimGOTMallocBit != 0
+	if i.requireFree {
+		gotSufficient = gotSufficient && status&shimGOTFreeBit != 0
+	}
+	if gotSufficient {
 		return result, nil
 	}
 	if i.mode != InjectionGOTThenInline {
-		return result, fmt.Errorf("shim loaded but no malloc GOT/PLT relocation was patched (status=%#x)", status)
+		return result, fmt.Errorf("shim loaded but required malloc/free GOT/PLT relocations were not patched (status=%#x)", status)
 	}
 
 	// The fallback overwrites executable allocator text. Suspend every thread to
