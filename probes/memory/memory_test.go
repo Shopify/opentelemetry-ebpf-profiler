@@ -248,6 +248,12 @@ func TestResolveConfiguredHooks(t *testing.T) {
 	}, got[1])
 }
 
+func TestAttachmentLifecycleOrder(t *testing.T) {
+	assert.Equal(t, [2]EventKind{EventAllocation, EventDeallocation}, attachmentOrder(false))
+	assert.Equal(t, [2]EventKind{EventDeallocation, EventAllocation}, attachmentOrder(true))
+	assert.Equal(t, [2]EventKind{EventAllocation, EventDeallocation}, detachmentOrder())
+}
+
 func TestInstanceAndManagerRetryState(t *testing.T) {
 	inst := &Instance{
 		pid: 1,
@@ -313,6 +319,28 @@ func TestNewManager(t *testing.T) {
 }
 
 func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result InjectionResult
+	}{
+		{name: "does not retry a successful injection", result: InjectionResult{GOTMallocPatched: true}},
+		{name: "does not retry an already-present shim", result: InjectionResult{AlreadyPresent: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			injector := &recordingInjector{result: test.result}
+			manager := &Manager{config: Config{Enabled: true}, injector: injector}
+			pr := processWithExecutable{executable: libpf.Intern("/usr/bin/ruby")}
+
+			inst, err := manager.Reconcile(1234, pr, nil)
+			require.NoError(t, err)
+			require.Equal(t, 1, injector.calls)
+
+			_, err = manager.Reconcile(1234, pr, inst)
+			require.NoError(t, err)
+			assert.Equal(t, 1, injector.calls, "a completed PID mutation is never retried")
+		})
+	}
+
 	t.Run("does not retry a failed injection", func(t *testing.T) {
 		injector := &recordingInjector{err: errors.New("synthetic mutation failure")}
 		manager := &Manager{

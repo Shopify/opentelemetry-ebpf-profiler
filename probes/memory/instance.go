@@ -106,6 +106,17 @@ func (inst *Instance) completeInjection(result InjectionResult, err error) {
 	inst.injectionErr = err
 }
 
+func attachmentOrder(live bool) [2]EventKind {
+	if live {
+		return [2]EventKind{EventDeallocation, EventAllocation}
+	}
+	return [2]EventKind{EventAllocation, EventDeallocation}
+}
+
+func detachmentOrder() [2]EventKind {
+	return [2]EventKind{EventAllocation, EventDeallocation}
+}
+
 // Reconcile discovers the hooks currently exposed by pid's executable mappings,
 // attaches newly desired links, and detaches links whose mappings disappeared.
 func (m *Manager) Reconcile(
@@ -179,7 +190,7 @@ func (m *Manager) Reconcile(
 	// shim rechecks its allocation semaphore at the marker call, so this order
 	// prevents a newly sampled allocation from outliving the free link during
 	// detach. Map iteration order must not decide this lifecycle contract.
-	for _, event := range []EventKind{EventAllocation, EventDeallocation} {
+	for _, event := range detachmentOrder() {
 		for key, attached := range inst.attached {
 			if key.Event != event {
 				continue
@@ -200,12 +211,8 @@ func (m *Manager) Reconcile(
 
 	var attachErrs []error
 	numAttached := 0
-	attachOrder := []EventKind{EventAllocation, EventDeallocation}
-	if m.config.Live {
-		// Arm the free producer before allocations can enter the live set.
-		attachOrder = []EventKind{EventDeallocation, EventAllocation}
-	}
-	for _, event := range attachOrder {
+	// In live mode, arm the free producer before allocations can enter the live set.
+	for _, event := range attachmentOrder(m.config.Live) {
 		for key, entry := range desired {
 			if key.Event != event {
 				continue
@@ -269,7 +276,7 @@ func (inst *Instance) Detach() error {
 	defer inst.mu.Unlock()
 
 	var errs []error
-	for _, event := range []EventKind{EventAllocation, EventDeallocation} {
+	for _, event := range detachmentOrder() {
 		for key, attached := range inst.attached {
 			if key.Event != event {
 				continue
