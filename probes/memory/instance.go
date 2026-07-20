@@ -228,6 +228,9 @@ func (m *Manager) Reconcile(
 		inst.completeInjection(result, err)
 		if err != nil {
 			injectionErr = fmt.Errorf("experimental allocator injection pid=%d: %w", pid, err)
+		} else if result.AlreadyPresent {
+			log.Warnf("EXPERIMENTAL allocator shim already present in pid=%d; no new mutation: %s",
+				pid, result)
 		} else {
 			log.Warnf("EXPERIMENTAL allocator injection mutated pid=%d: %s", pid, result)
 		}
