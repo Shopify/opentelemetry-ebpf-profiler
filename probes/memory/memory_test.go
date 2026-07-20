@@ -159,8 +159,8 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 
 type processWithExecutable struct {
 	process.Process
-	executable    libpf.String
-	mappings      []process.RawMapping
+	executable     libpf.String
+	mappings       []process.RawMapping
 	mappingOpenErr error
 }
 
@@ -414,10 +414,10 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 			8, util.OnDiskFileIdentifier.Hash32)
 		require.NoError(t, err)
 		manager := &Manager{
-			config:    Config{Enabled: true},
-			needsUSDT: true,
+			config:     Config{Enabled: true},
+			needsUSDT:  true,
 			parseCache: cache,
-			injector:  &recordingInjector{},
+			injector:   &recordingInjector{},
 		}
 		pr := processWithExecutable{
 			executable:     libpf.Intern("/usr/bin/ruby"),
