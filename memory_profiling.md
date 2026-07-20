@@ -202,9 +202,12 @@ itself remains installed.
 
 These modes permanently mutate a target for its remaining lifetime. They do not unload or
 unpatch when profiling stops; ptrace, loader-lock, relocation, seccomp, libc-version, and
-instruction-race failures can deadlock, crash, or corrupt the process. They are diagnostic
-prototypes, never fleet-safe defaults. Direct allocator uprobes remain the no-mutation
-fallback.
+instruction-race failures can deadlock, crash, or corrupt the process. Each injected shim
+reserves about 2 MiB for its fixed-capacity live-pointer table. In an incident, setting the
+mode to `disabled` prevents new mutations and detaching eBPF links stops sample emission,
+but only restarting each already-mutated target removes allocator interposition. These are
+diagnostic prototypes, never fleet-safe defaults. Direct allocator uprobes remain the
+no-mutation fallback.
 
 ## Next producer and probe work
 
