@@ -28,6 +28,10 @@ func TestParseHook(t *testing.T) {
 		{"uprobe:libheap_sampler.so:record_alloc", UprobeHook("libheap_sampler.so", "record_alloc")},
 		{"uprobe:/opt/runtime/*/libheap.so:record_free", UprobeHook("/opt/runtime/*/libheap.so", "record_free")},
 		{"uprobe:/opt/runtime:v2/libheap.so:record_free", UprobeHook("/opt/runtime:v2/libheap.so", "record_free")},
+		{"weighted-uprobe:libheap-shim.so:sampled_alloc", Hook{
+			Type: HookTypeUprobe, ABI: ABIWeightedAllocation,
+			Executable: "libheap-shim.so", Symbol: "sampled_alloc",
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
@@ -97,6 +101,39 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	badABI := allocator
 	badABI.AllocationHooks[0].ABI = ABIFree
 	require.ErrorContains(t, badABI.Validate(), "allocation hooks require")
+
+	experimental := DefaultConfig()
+	experimental.Enabled = true
+	experimental.ProcessExecutablePatterns = []string{"ruby*"}
+	experimental.ExperimentalInjectionMode = InjectionGOTThenInline
+	experimental.ExperimentalShimPath = "/opt/prophiler/libprophiler-heap-shim.so"
+	experimental.ApplyDefaults()
+	require.NoError(t, experimental.Validate())
+	assert.Contains(t, experimental.AllocationHooks, Hook{
+		Type: HookTypeUprobe, ABI: ABIWeightedAllocation,
+		Executable: ExperimentalShimExecutable, Symbol: ExperimentalShimAllocSymbol,
+	})
+	assert.False(t, experimental.Live, "free hook is only installed for live profiles")
+
+	experimental.Live = true
+	experimental.ApplyDefaults()
+	require.NoError(t, experimental.Validate())
+	assert.Contains(t, experimental.DeallocationHooks, Hook{
+		Type: HookTypeUprobe, ABI: ABIFree,
+		Executable: ExperimentalShimExecutable, Symbol: ExperimentalShimFreeSymbol,
+	})
+
+	missingSelector := experimental
+	missingSelector.ProcessExecutablePatterns = nil
+	require.ErrorContains(t, missingSelector.Validate(), "process_executables")
+	missingShim := experimental
+	missingShim.ExperimentalShimPath = ""
+	require.ErrorContains(t, missingShim.Validate(), "experimental_shim_path")
+
+	var mode InjectionMode
+	require.NoError(t, mode.Set("GOT"))
+	assert.Equal(t, InjectionGOT, mode)
+	require.Error(t, mode.Set("please-corrupt-everything"))
 }
 
 type processWithExecutable struct {

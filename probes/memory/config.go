@@ -20,10 +20,53 @@ const (
 	// DefaultSamplingIntervalBytes is the average allocation volume represented
 	// by one sample from a directly instrumented allocator.
 	DefaultSamplingIntervalBytes = 512 * 1024
+
+	// ExperimentalShimExecutable matches the memfd name used when the profiler
+	// injects its allocator shim into another process.
+	ExperimentalShimExecutable  = "*prophiler-heap-shim*"
+	ExperimentalShimAllocSymbol = "prophiler_heap_alloc"
+	ExperimentalShimFreeSymbol  = "prophiler_heap_free"
 )
 
 // HookType identifies how a process-local memory event hook is discovered.
 type HookType string
+
+// InjectionMode controls experimental mutation of target processes. Every
+// non-disabled value can crash or permanently corrupt the target process and
+// must be explicitly selected by an operator.
+type InjectionMode string
+
+const (
+	// InjectionDisabled never mutates target processes.
+	InjectionDisabled InjectionMode = "disabled"
+	// InjectionGOT asks an injected shim to rewrite allocator GOT/PLT slots.
+	InjectionGOT InjectionMode = "got"
+	// InjectionGOTThenInline falls back to overwriting allocator function
+	// prologues with architecture-specific jumps when GOT rewriting fails.
+	InjectionGOTThenInline InjectionMode = "got-then-inline"
+)
+
+// Set implements flag.Value. Empty is accepted as the safe disabled value.
+func (m *InjectionMode) Set(value string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		value = string(InjectionDisabled)
+	}
+	switch InjectionMode(value) {
+	case InjectionDisabled, InjectionGOT, InjectionGOTThenInline:
+		*m = InjectionMode(value)
+		return nil
+	default:
+		return fmt.Errorf("unknown experimental allocator injection mode %q", value)
+	}
+}
+
+func (m InjectionMode) String() string {
+	if m == "" {
+		return string(InjectionDisabled)
+	}
+	return string(m)
+}
 
 const (
 	// HookTypeUSDT discovers an ELF .note.stapsdt provider/name pair and attaches
@@ -84,16 +127,17 @@ func UprobeHook(executable, symbol string) Hook {
 //
 //   - usdt:<provider>:<name>
 //   - uprobe:<executable-pattern>:<symbol>
+//   - weighted-uprobe:<executable-pattern>:<symbol>
 //
-// The containing allocation/deallocation flag determines the default ABI. YAML
-// configuration can set abi explicitly when targeting a custom weighted entry
-// function instead of malloc.
+// The containing allocation/deallocation flag determines the default ABI for
+// the first two forms. weighted-uprobe explicitly targets a sampled function
+// exposing (pointer, size, weight), such as an LD_PRELOAD shim marker.
 func ParseHook(spec string) (Hook, error) {
 	typeName, target, found := strings.Cut(spec, ":")
 	if !found {
 		return Hook{}, fmt.Errorf(
-			"invalid memory hook %q: expected usdt:<provider>:<name> or "+
-				"uprobe:<executable-pattern>:<symbol>", spec)
+			"invalid memory hook %q: expected usdt:<provider>:<name>, "+
+				"uprobe:<executable-pattern>:<symbol>, or weighted-uprobe:<executable-pattern>:<symbol>", spec)
 	}
 
 	var hook Hook
@@ -104,7 +148,7 @@ func ParseHook(spec string) (Hook, error) {
 			return Hook{}, fmt.Errorf("invalid memory hook %q: expected usdt:<provider>:<name>", spec)
 		}
 		hook = USDTHook(strings.TrimSpace(provider), strings.TrimSpace(name))
-	case HookTypeUprobe:
+	case HookTypeUprobe, HookType("weighted-uprobe"):
 		// Split on the final colon so Linux paths containing ':' remain valid.
 		separator := strings.LastIndexByte(target, ':')
 		if separator < 0 {
@@ -113,6 +157,9 @@ func ParseHook(spec string) (Hook, error) {
 		}
 		hook = UprobeHook(
 			strings.TrimSpace(target[:separator]), strings.TrimSpace(target[separator+1:]))
+		if HookType(strings.ToLower(strings.TrimSpace(typeName))) == HookType("weighted-uprobe") {
+			hook.ABI = ABIWeightedAllocation
+		}
 	default:
 		return Hook{}, fmt.Errorf("invalid memory hook %q: unknown type %q", spec, typeName)
 	}
@@ -231,6 +278,14 @@ type Config struct {
 
 	AllocationHooks   []Hook `mapstructure:"allocation_hooks" json:"allocation_hooks,omitempty"`
 	DeallocationHooks []Hook `mapstructure:"deallocation_hooks" json:"deallocation_hooks,omitempty"`
+
+	// ExperimentalInjectionMode enables progressively more invasive allocator
+	// interposition when no configured producer hook exists. The profiler first
+	// injects ExperimentalShimPath with ptrace+dlopen and asks it to rewrite
+	// GOT/PLT slots. got-then-inline additionally permits direct allocator text
+	// patching. Both modes are intentionally disabled by default.
+	ExperimentalInjectionMode InjectionMode `mapstructure:"experimental_injection_mode" json:"experimental_injection_mode,omitempty"`
+	ExperimentalShimPath      string        `mapstructure:"experimental_shim_path" json:"experimental_shim_path,omitempty"`
 }
 
 // DefaultConfig returns the default-off memory probe configuration with the
@@ -251,6 +306,9 @@ func DefaultConfig() Config {
 // ApplyDefaults fills optional values that callers constructing Config structs
 // directly commonly omit. A non-empty hook list fully replaces the defaults.
 func (cfg *Config) ApplyDefaults() {
+	if cfg.ExperimentalInjectionMode == "" {
+		cfg.ExperimentalInjectionMode = InjectionDisabled
+	}
 	if cfg.MaxEntriesPerPID == 0 {
 		cfg.MaxEntriesPerPID = DefaultMaxEntriesPerPID
 	}
@@ -263,10 +321,58 @@ func (cfg *Config) ApplyDefaults() {
 	if len(cfg.DeallocationHooks) == 0 {
 		cfg.DeallocationHooks = []Hook{USDTHook(DefaultUSDTProvider, "free")}
 	}
+	if cfg.ExperimentalInjectionMode != InjectionDisabled {
+		cfg.AllocationHooks = appendHookIfMissing(cfg.AllocationHooks, Hook{
+			Type: HookTypeUprobe, ABI: ABIWeightedAllocation,
+			Executable: ExperimentalShimExecutable, Symbol: ExperimentalShimAllocSymbol,
+		})
+		if cfg.Live {
+			cfg.DeallocationHooks = appendHookIfMissing(cfg.DeallocationHooks, Hook{
+				Type: HookTypeUprobe, ABI: ABIFree,
+				Executable: ExperimentalShimExecutable, Symbol: ExperimentalShimFreeSymbol,
+			})
+		}
+	}
+}
+
+func appendHookIfMissing(hooks []Hook, candidate Hook) []Hook {
+	for _, hook := range hooks {
+		if hook.Type == candidate.Type && hook.ABI == candidate.ABI &&
+			hook.Executable == candidate.Executable && hook.Symbol == candidate.Symbol {
+			return hooks
+		}
+	}
+	return append(hooks, candidate)
 }
 
 // Validate checks memory probe configuration and hook adapters.
 func (cfg Config) Validate() error {
+	mode := cfg.ExperimentalInjectionMode
+	if mode == "" {
+		mode = InjectionDisabled
+	}
+	switch mode {
+	case InjectionDisabled:
+		if cfg.ExperimentalShimPath != "" {
+			return fmt.Errorf("experimental shim path requires a non-disabled injection mode")
+		}
+	case InjectionGOT, InjectionGOTThenInline:
+		if !cfg.Enabled {
+			return fmt.Errorf("experimental allocator injection requires memory profiling to be enabled")
+		}
+		if cfg.ExperimentalShimPath == "" {
+			return fmt.Errorf("experimental allocator injection requires experimental_shim_path")
+		}
+		if !path.IsAbs(cfg.ExperimentalShimPath) {
+			return fmt.Errorf("experimental allocator shim path must be absolute")
+		}
+		if len(cfg.ProcessExecutablePatterns) == 0 {
+			return fmt.Errorf("experimental allocator injection requires at least one process_executables selector")
+		}
+	default:
+		return fmt.Errorf("unknown experimental allocator injection mode %q", mode)
+	}
+
 	if cfg.Live && !cfg.Enabled {
 		return fmt.Errorf("live memory profiling requires memory profiling to be enabled")
 	}

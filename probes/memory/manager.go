@@ -34,6 +34,10 @@ type Manager struct {
 
 	// parseCache deduplicates ELF note/symbol inspection across processes.
 	parseCache *lru.SyncedLRU[util.OnDiskFileIdentifier, parsedFile]
+
+	// injector is non-nil only after an operator explicitly enables destructive
+	// allocator interposition. Normal memory profiling never constructs it.
+	injector allocatorInjector
 }
 
 // NewManager constructs the process-scoped memory hook manager. It returns
@@ -58,6 +62,13 @@ func NewManager(cfg Config, progs map[ProgramKind]*cebpf.Program) (*Manager, err
 		progs:         progs,
 		parseCache:    parseCache,
 		uprobeSymbols: make(map[string]struct{}),
+	}
+	if cfg.ExperimentalInjectionMode != InjectionDisabled {
+		m.injector, err = newAllocatorInjector(
+			cfg.ExperimentalShimPath, cfg.ExperimentalInjectionMode)
+		if err != nil {
+			return nil, fmt.Errorf("memory probe: initialize experimental injector: %w", err)
+		}
 	}
 
 	var nextID uint32 = 1

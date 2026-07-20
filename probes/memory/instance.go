@@ -27,6 +27,12 @@ type Instance struct {
 	applicabilityEvaluated bool
 	eligible               bool
 	attached               map[AttachmentKey]AttachedHook
+
+	// injectionAttempted makes destructive mutation at most once per process.
+	// A failed injection is never retried automatically.
+	injectionAttempted bool
+	injectionResult    InjectionResult
+	injectionErr       error
 }
 
 type desiredEntry struct {
@@ -81,6 +87,23 @@ func (inst *Instance) setApplicability(eligible bool) {
 	defer inst.mu.Unlock()
 	inst.applicabilityEvaluated = true
 	inst.eligible = eligible
+}
+
+func (inst *Instance) beginInjection() bool {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if inst.injectionAttempted {
+		return false
+	}
+	inst.injectionAttempted = true
+	return true
+}
+
+func (inst *Instance) completeInjection(result InjectionResult, err error) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	inst.injectionResult = result
+	inst.injectionErr = err
 }
 
 // Reconcile discovers the hooks currently exposed by pid's executable mappings,
@@ -138,9 +161,15 @@ func (m *Manager) Reconcile(
 		return inst, errors.Join(scanErrs...)
 	}
 
-	inst.mu.Lock()
-	defer inst.mu.Unlock()
+	allocationHookDiscovered := false
+	for key := range desired {
+		if key.Event == EventAllocation {
+			allocationHookDiscovered = true
+			break
+		}
+	}
 
+	inst.mu.Lock()
 	var detachErrs []error
 	numDetached := 0
 	for key, attached := range inst.attached {
@@ -173,12 +202,36 @@ func (m *Manager) Reconcile(
 		numAttached++
 	}
 
+	hasAllocation := false
+	for key := range inst.attached {
+		if key.Event == EventAllocation {
+			hasAllocation = true
+			break
+		}
+	}
+	liveAttachments := len(inst.attached)
+	inst.mu.Unlock()
+
 	if numAttached > 0 || numDetached > 0 {
 		log.Debugf("memory probes pid=%d live=%d (+%d,-%d)",
-			pid, len(inst.attached), numAttached, numDetached)
+			pid, liveAttachments, numAttached, numDetached)
+	}
+
+	var injectionErr error
+	if m.injector != nil && !allocationHookDiscovered && !hasAllocation && inst.beginInjection() {
+		// This permanently mutates the target. It is reachable only through an
+		// explicitly selected experimental mode and is never retried implicitly.
+		result, err := m.injector.Inject(pid)
+		inst.completeInjection(result, err)
+		if err != nil {
+			injectionErr = fmt.Errorf("experimental allocator injection pid=%d: %w", pid, err)
+		} else {
+			log.Warnf("EXPERIMENTAL allocator injection mutated pid=%d: %s", pid, result)
+		}
 	}
 
 	allErrs := append(append(scanErrs, detachErrs...), attachErrs...)
+	allErrs = append(allErrs, injectionErr)
 	return inst, errors.Join(allErrs...)
 }
 

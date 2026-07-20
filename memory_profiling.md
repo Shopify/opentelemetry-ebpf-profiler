@@ -102,6 +102,7 @@ The daemon/Prophiler flag forms are:
 --heap-process-executable=ruby*
 --heap-allocation-hook=usdt:ddheap:alloc
 --heap-allocation-hook=uprobe:libc.so.6:malloc
+--heap-allocation-hook=weighted-uprobe:libprophiler-heap-shim.so:prophiler_heap_alloc
 --live-heap-profiling
 --heap-deallocation-hook=uprobe:libc.so.6:free
 --live-heap-max-entries-per-pid=10000
@@ -111,6 +112,7 @@ Compact allocation hook defaults are event-aware:
 
 - `usdt:<provider>:<name>` → `weighted_allocation`;
 - `uprobe:<executable-pattern>:<symbol>` → paired `malloc` entry/return;
+- `weighted-uprobe:<executable-pattern>:<symbol>` → sampled `(pointer,size,weight)` entry;
 - any deallocation hook → `free(pointer)` entry.
 
 Direct allocator hooks require at least one `process_executables` selector, preventing an
@@ -165,12 +167,42 @@ Kernel `mmap`/`brk`/`munmap` instrumentation may later provide a distinct low-ov
 virtual-memory-growth profile. It cannot replace allocator profiling because most small
 allocations and frees are satisfied entirely inside userspace arenas.
 
+## Experimental transparent shim injection
+
+The safe default remains discovery-only: an existing `LD_PRELOAD`/runtime producer is
+found through its USDT note or sampled-event symbol, and the profiler only attaches. Two
+explicitly unsafe fallback modes are available on Linux x86-64:
+
+```text
+--heap-experimental-injection=got
+--heap-experimental-injection=got-then-inline
+--heap-experimental-shim=/opt/prophiler/libprophiler-heap-shim.so
+```
+
+Both require `--heap-profiling` and at least one `--heap-process-executable` selector. They
+are disabled by default and attempted at most once per eligible PID, only after no producer
+allocation hook was discovered.
+
+The injector ptrace-stops a target thread, creates a memfd inside the target, copies the
+local shim into it, and remotely invokes `dlopen`. It first calls the shim's GOT/PLT
+rewriter. `got-then-inline` additionally stops every target thread and permits the shim to
+copy allocator prologues into trampolines and overwrite libc `malloc`/`free` entries with
+jumps. The inline decoder refuses unknown instruction encodings but cannot make arbitrary
+hot patching safe.
+
+These modes permanently mutate a target for its remaining lifetime. They do not unload or
+unpatch when profiling stops; ptrace, loader-lock, relocation, seccomp, libc-version, and
+instruction-race failures can deadlock, crash, or corrupt the process. They are diagnostic
+prototypes, never fleet-safe defaults. Direct allocator uprobes remain the no-mutation
+fallback.
+
 ## Next producer and probe work
 
-A lightweight `LD_PRELOAD` producer can interpose allocator functions, make the same
-byte-proportional sampling decision in userspace, track sampled pointers for live mode, and
-fire the configurable weighted USDT ABI. That removes per-call breakpoint overhead while
-keeping the profiler-side event contract runtime-neutral.
+The Prophiler shim performs byte-proportional sampling in userspace, tracks sampled pointers
+for live mode, and calls the configurable weighted sampled-event ABI. This removes per-call
+breakpoint overhead while keeping the profiler-side event contract runtime-neutral. The
+prototype currently covers only glibc `malloc`/`free`; additional allocator APIs need typed
+adapters.
 
 After the memory prototype, extend the same typed configuration and process/mapping
 lifecycle to bpftrace-like network and disk latency probes, including stateful entry/return

@@ -88,13 +88,17 @@ var (
 		"various user or kernel space hooks."
 	heapProfilingHelper = "Enable allocation profiling through configured process-local " +
 		"USDT or allocator function hooks."
-	heapAllocationHookHelper = "Allocation hook (repeatable): usdt:<provider>:<name> consumes " +
-		"a weighted allocation event; uprobe:<executable-pattern>:<symbol> pairs allocator " +
-		"entry and return probes (for example libc.so.6:malloc)."
+	heapAllocationHookHelper = "Allocation hook (repeatable): usdt:<provider>:<name> or " +
+		"weighted-uprobe:<executable-pattern>:<symbol> consumes a weighted event; " +
+		"uprobe:<executable-pattern>:<symbol> pairs allocator entry and return probes."
 	heapDeallocationHookHelper = "Deallocation hook (repeatable): usdt:<provider>:<name> or " +
 		"uprobe:<executable-pattern>:<symbol>; both consume a pointer at function entry."
 	heapProcessExecutableHelper = "Process executable basename or full-path glob eligible for " +
 		"memory hooks (repeatable and required for direct allocator uprobes)."
+	heapExperimentalInjectionHelper = "EXPERIMENTAL/RISKY target mutation: disabled, got, or " +
+		"got-then-inline. Injects the heap shim with ptrace; the final mode may overwrite libc text."
+	heapExperimentalShimHelper = "Absolute local path to the x86-64 heap shim used by " +
+		"experimental allocator injection. Required when injection is not disabled."
 	liveHeapProfilingHelper = "Additionally track deallocations to report the live " +
 		"(in-use) heap by attaching the heap-sampler free probe. " +
 		"Requires -heap-profiling."
@@ -200,6 +204,11 @@ func parseArgs() (*controller.Config, error) {
 		args.Probes.Memory.DeallocationHooks = append(args.Probes.Memory.DeallocationHooks, hook)
 		return nil
 	})
+
+	fs.Var(&args.Probes.Memory.ExperimentalInjectionMode,
+		"heap-experimental-injection", heapExperimentalInjectionHelper)
+	fs.StringVar(&args.Probes.Memory.ExperimentalShimPath,
+		"heap-experimental-shim", "", heapExperimentalShimHelper)
 
 	fs.BoolVar(&args.Probes.Memory.Enabled, "heap-profiling", false, heapProfilingHelper)
 
