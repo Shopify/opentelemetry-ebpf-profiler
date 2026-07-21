@@ -186,7 +186,6 @@ func TestReportTraceEventResourceKeyContextKey(t *testing.T) {
 	}
 
 	trace := &libpf.Trace{
-		Hash: libpf.NewTraceHash(0x1, 0x0),
 		Frames: func() libpf.Frames {
 			frames := make(libpf.Frames, 0, 1)
 			frames.Append(&libpf.Frame{
@@ -202,7 +201,7 @@ func TestReportTraceEventResourceKeyContextKey(t *testing.T) {
 	baseMeta := func(resource *pcommon.Resource) *samples.TraceEventMeta {
 		return &samples.TraceEventMeta{
 			Timestamp:      now,
-			Comm:           libpf.Intern("svc"),
+			Comm:           libpf.NewCommFromString("svc"),
 			ProcessName:    libpf.Intern("svc"),
 			ExecutablePath: libpf.Intern("/usr/bin/svc"),
 			ContainerID:    libpf.Intern("c1"),
