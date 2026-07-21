@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind"
@@ -33,6 +34,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/times"
 	"go.opentelemetry.io/ebpf-profiler/traceutil"
+	"go.opentelemetry.io/ebpf-profiler/usdt"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -48,6 +50,11 @@ const (
 
 	// TTL of entries in the frame cache.
 	frameCacheLifetime = 5 * time.Minute
+
+	// maxConcurrentPIDCleanups bounds the number of background per-PID cleanup
+	// operations (USDT detach, eBPF map deletes) that run concurrently, so
+	// process churn cannot spawn unbounded concurrent kernel work.
+	maxConcurrentPIDCleanups = 16
 )
 
 // dummyPrefix is the LPM prefix installed to indicate the process is known
@@ -64,7 +71,8 @@ var (
 func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monitorInterval time.Duration,
 	executableUnloadDelay time.Duration, ebpf pmebpf.EbpfHandler, traceReporter reporter.TraceReporter,
 	exeReporter reporter.ExecutableReporter, sdp nativeunwind.StackDeltaProvider,
-	filterErrorFrames bool, includeEnvVars libpf.Set[string]) (*ProcessManager, error) {
+	filterErrorFrames bool, includeEnvVars libpf.Set[string],
+	usdtMgr *usdt.Manager, liveHeapTracker *liveheap.Tracker) (*ProcessManager, error) {
 	if exeReporter == nil {
 		exeReporter = executableReporterStub{}
 	}
@@ -117,6 +125,10 @@ func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monit
 		includeEnvVars:           includeEnvVars,
 		selfCgroupIno:            selfCgroupIno,
 		selfContainerID:          selfContainerID,
+		usdtManager:              usdtMgr,
+		usdtInstances:            make(map[libpf.PID]*usdt.Instance),
+		cleanupSem:               make(chan struct{}, maxConcurrentPIDCleanups),
+		liveHeapTracker:          liveHeapTracker,
 	}
 
 	collectInterpreterMetrics(ctx, pm, monitorInterval)
@@ -186,12 +198,62 @@ func collectInterpreterMetrics(ctx context.Context, pm *ProcessManager,
 		summary.Add(dotnet.GetAndResetMetrics())
 		summary.Add(pm.ebpf.CollectMetrics())
 
+		if pm.liveHeapTracker != nil {
+			summary.Add(pm.liveHeapTracker.GetAndResetMetrics())
+		}
+
 		pm.eim.UpdateMetricSummary(summary)
 		pm.metricsAddSlice(metricSummaryToSlice(summary))
 	})
 }
 
 func (pm *ProcessManager) Close() {
+	// Tear down any remaining per-PID USDT attachments. Detach() closes kernel
+	// uprobe links and must run without pm.mu held, so collect the instances
+	// under the lock, clear the map, then detach outside it. Done synchronously
+	// since this is terminal shutdown; without it the uprobe links leak across
+	// receiver start/stop cycles.
+	pm.mu.Lock()
+	instances := make([]*usdt.Instance, 0, len(pm.usdtInstances))
+	for pid, inst := range pm.usdtInstances {
+		instances = append(instances, inst)
+		delete(pm.usdtInstances, pid)
+	}
+	pm.mu.Unlock()
+
+	for _, inst := range instances {
+		if err := inst.Detach(); err != nil {
+			log.Errorf("USDT detach during shutdown: %v", err)
+		}
+	}
+
+	// Wait for any in-flight background cleanups (per-PID detach / eBPF map
+	// deletes spawned from the exit path) to drain before releasing manager
+	// resources. Relies on the caller having stopped feeding new exit events
+	// before Close, so no deferCleanup runs concurrently with this Wait.
+	pm.cleanupWG.Wait()
+
+	// Release manager-owned USDT resources (parse cache). Nil-safe when USDT
+	// is disabled.
+	if err := pm.usdtManager.Close(); err != nil {
+		log.Errorf("USDT manager close during shutdown: %v", err)
+	}
+}
+
+// deferCleanup runs fn on a background goroutine, tracked by cleanupWG so
+// Close can wait for it, and gated by cleanupSem so at most
+// maxConcurrentPIDCleanups run at once. Used for per-PID teardown (USDT
+// detach, eBPF map deletes) that must not hold pm.mu. Safe to call while
+// holding pm.mu: the semaphore is acquired inside the goroutine, so the
+// caller never blocks.
+func (pm *ProcessManager) deferCleanup(fn func()) {
+	pm.cleanupWG.Add(1)
+	go func() {
+		defer pm.cleanupWG.Done()
+		pm.cleanupSem <- struct{}{}
+		defer func() { <-pm.cleanupSem }()
+		fn()
+	}()
 }
 
 func (pm *ProcessManager) symbolizeFrame(pid libpf.PID, data []uint64, frames *libpf.Frames, mapping libpf.FrameMapping) error {
@@ -319,7 +381,8 @@ func hashFrameCacheKey(fk frameCacheKey) uint32 {
 // is not re-entrant due to frameCache not being synced. If the tracer is
 // later updated to distribute trace handling to goroutine pool, the caching
 // strategy needs to be updated accordingly.
-func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
+// Returns the computed trace hash and symbolized frames.
+func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) (libpf.TraceHash, libpf.Frames) {
 	meta := &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(times.KTime(bpfTrace.KTime).UnixNano()),
 		Comm:           bpfTrace.Comm,
@@ -332,6 +395,7 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 		ContainerID:    bpfTrace.ContainerID,
 		Origin:         bpfTrace.Origin,
 		Value:          bpfTrace.Value,
+		AllocSize:      int64(bpfTrace.Size),
 		EnvVars:        bpfTrace.EnvVars,
 		TraceID:        bpfTrace.APMTraceID,
 		SpanID:         bpfTrace.APMTransactionID,
@@ -398,4 +462,6 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	if err := pm.traceReporter.ReportTraceEvent(trace, meta); err != nil {
 		log.Errorf("Failed to report trace event: %v", err)
 	}
+
+	return traceutil.HashTrace(trace), trace.Frames
 }
