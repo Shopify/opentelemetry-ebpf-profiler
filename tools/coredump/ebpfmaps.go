@@ -103,6 +103,7 @@ func (emc *ebpfMapsCoredump) DeleteProcData(t libpf.InterpreterType, pid libpf.P
 	case libpf.LuaJIT:
 		emc.ctx.delMap(unsafe.Pointer(&C.luajit_procs), C.u32(pid))
 	}
+
 	return nil
 }
 

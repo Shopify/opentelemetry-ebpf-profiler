@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/pacmask"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 
@@ -352,7 +353,7 @@ func determineSysConfig(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
 		}
 
 		if !interpretersConfig.Perl.IsDisabled() || !interpretersConfig.Python.IsDisabled() ||
-			!interpretersConfig.Labels.IsDisabled() {
+			!interpretersConfig.Go.IsLabelsDisabled() {
 			var tpbaseOffset uint64
 			tpbaseOffset, err = loadTPBaseOffset(coll, maps, kmod)
 			if err != nil {
@@ -370,7 +371,7 @@ func determineSysConfig(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
 		}
 	}
 
-	log.Infof("Found offsets: task stack %#x, pt_regs %#x, tpbase %#x, vma vm_file %#x, vma vm_flags %#x",
+	log.Debugf("Found offsets: task stack %#x, pt_regs %#x, tpbase %#x, vma vm_file %#x, vma vm_flags %#x",
 		vars.task_stack_offset,
 		vars.stack_ptregs_offset,
 		vars.tpbase_offset,
@@ -500,7 +501,7 @@ func stripProgramExtInfos(insns asm.Instructions) {
 
 // loadRodataVars initializes RODATA variables for the eBPF programs.
 func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Config,
-	major, minor uint32,
+	major, minor uint32, origins *originRegistry,
 ) error {
 	if cfg.VerboseMode {
 		if err := coll.Variables["with_debug_output"].Set(uint32(1)); err != nil {
@@ -518,12 +519,21 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 		}
 	}
 
+	if err := setOriginIDs(coll, cfg, origins); err != nil {
+		return err
+	}
+
 	if err := coll.Variables["off_cpu_threshold"].Set(cfg.OffCPUThreshold); err != nil {
 		return fmt.Errorf("failed to set off_cpu_threshold: %v", err)
 	}
 
 	if err := coll.Variables["filter_error_frames"].Set(cfg.FilterErrorFrames); err != nil {
 		return fmt.Errorf("failed to set drop_error_only_traces: %v", err)
+	}
+
+	if err := coll.Variables["go_labels_disabled"].Set(
+		cfg.InterpretersConfig.Go.IsLabelsDisabled()); err != nil {
+		return fmt.Errorf("failed to set go_labels_disabled: %v", err)
 	}
 
 	if err := coll.Variables["filter_idle_frames"].Set(cfg.FilterIdleFrames); err != nil {
@@ -536,7 +546,7 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 
 	pacMask := pacmask.GetPACMask()
 	if pacMask != 0 {
-		log.Infof("Determined PAC mask to be 0x%016X", pacMask)
+		log.Debugf("Determined PAC mask to be 0x%016X", pacMask)
 	} else {
 		log.Debug("PAC is not enabled on the system.")
 	}
@@ -572,6 +582,75 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 	}
 	if err := coll.Variables["vma_vm_flags_offset"].Set(rodataVars.vma_vm_flags_offset); err != nil {
 		return fmt.Errorf("failed to set vma_vm_flags_offset: %v", err)
+	}
+
+	return nil
+}
+
+// setOriginIDs assigns an origin ID to every kind of sample the tracer's
+// eBPF programs can produce and writes each ID into the corresponding
+// RODATA variable. Sampling is always active. Off-CPU and probe profiling
+// only get one if enabled.
+// TODO: this is a temporary helper and will be removed once tracer manages
+// custom probes.
+func setOriginIDs(coll *cebpf.CollectionSpec, cfg *Config, origins *originRegistry) error {
+	sampling, err := origins.register(&samples.TypeMetadata{
+		PeriodType: "cpu",
+		PeriodUnit: "nanoseconds",
+		SampleType: "samples",
+		SampleUnit: "count",
+	})
+	if err != nil {
+		return err
+	}
+	if err := coll.Variables["origin_id_sampling"].Set(sampling); err != nil {
+		return fmt.Errorf("failed to set origin_id_sampling: %v", err)
+	}
+
+	if cfg.OffCPUThreshold > 0 {
+		offCPU, err := origins.register(&samples.TypeMetadata{
+			SampleType:   "off_cpu",
+			SampleUnit:   "nanoseconds",
+			ReportValues: true,
+		})
+		if err != nil {
+			return err
+		}
+		if err := coll.Variables["origin_id_off_cpu"].Set(uint16(offCPU)); err != nil {
+			return fmt.Errorf("failed to set origin_id_off_cpu: %v", err)
+		}
+	}
+
+	if len(cfg.ProbeLinks) > 0 || cfg.LoadProbe {
+		probe, err := origins.register(&samples.TypeMetadata{
+			SampleType: "events",
+			SampleUnit: "count",
+		})
+		if err != nil {
+			return err
+		}
+		if err := coll.Variables["origin_id_probe"].Set(uint16(probe)); err != nil {
+			return fmt.Errorf("failed to set origin_id_probe: %v", err)
+		}
+	}
+
+	if cfg.HeapProfiling {
+		if err := origins.registerFixed(support.TraceOriginHeapAlloc, &samples.TypeMetadata{
+			SampleType:   "alloc_space",
+			SampleUnit:   "bytes",
+			ReportValues: true,
+		}); err != nil {
+			return err
+		}
+	}
+	if cfg.LiveHeapProfiling {
+		if err := origins.registerFixed(support.TraceOriginHeapFree, &samples.TypeMetadata{
+			SampleType:   "heap_free",
+			SampleUnit:   "bytes",
+			ReportValues: true,
+		}); err != nil {
+			return err
+		}
 	}
 
 	return nil

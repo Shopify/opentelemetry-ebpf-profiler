@@ -13,7 +13,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/pdata"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/traceutil"
 )
 
@@ -42,7 +41,13 @@ type baseReporter struct {
 	collectionStartTime time.Time
 }
 
-var errUnknownOrigin = errors.New("unknown trace origin")
+var errUnknownProfileType = errors.New("unknown trace profile type")
+
+func isHeapAllocProfileType(profileType *samples.TypeMetadata) bool {
+	return profileType != nil &&
+		profileType.SampleType == "alloc_space" &&
+		profileType.SampleUnit == "bytes"
+}
 
 // SetLiveHeapTracker sets the live heap tracker for inuse profile reporting.
 // Must be called before Start().
@@ -59,32 +64,9 @@ func (b *baseReporter) Stop() {
 	b.runLoop.Stop()
 }
 
-func countHeapProfileEvents(tree samples.TraceEventsTree) (stacks, samplesCount int, valueSum int64) {
-	for _, resource := range tree {
-		for _, events := range resource.Events[support.TraceOriginHeapAlloc] {
-			stacks++
-			samplesCount += len(events.Timestamps)
-			for _, value := range events.Values {
-				valueSum += value
-			}
-		}
-	}
-	return stacks, samplesCount, valueSum
-}
-
 func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {
-	switch meta.Origin {
-	case support.TraceOriginSampling:
-	case support.TraceOriginOffCPU:
-	case support.TraceOriginProbe:
-	case support.TraceOriginHeapAlloc:
-	case support.TraceOriginHeapFree:
-		// Free events are handled by the live heap tracker, not the reporter.
-		// They should not reach here; guard defensively.
-		return nil
-	default:
-		return fmt.Errorf("skip reporting trace for %d origin: %w", meta.Origin,
-			errUnknownOrigin)
+	if meta.ProfileType == nil {
+		return fmt.Errorf("skip reporting trace: %w", errUnknownProfileType)
 	}
 
 	var extraMeta any
@@ -106,13 +88,13 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 	if _, exists := (*eventsTree)[key]; !exists {
 		(*eventsTree)[key] = samples.ResourceToProfiles{
 			EnvVars: meta.EnvVars,
-			Events:  make(map[libpf.Origin]samples.SampleToEvents),
+			Events:  make(map[*samples.TypeMetadata]samples.SampleToEvents),
 		}
 	}
 
 	rtp := (*eventsTree)[key]
-	if _, exists := rtp.Events[meta.Origin]; !exists {
-		rtp.Events[meta.Origin] = make(samples.SampleToEvents)
+	if _, exists := rtp.Events[meta.ProfileType]; !exists {
+		rtp.Events[meta.ProfileType] = make(samples.SampleToEvents)
 	}
 
 	sampleKey := samples.SampleKey{
@@ -124,10 +106,11 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 		TraceID:   meta.TraceID,
 		ExtraMeta: extraMeta,
 	}
-	if events, exists := rtp.Events[meta.Origin][sampleKey]; exists {
+	isHeapAlloc := isHeapAllocProfileType(meta.ProfileType)
+	if events, exists := rtp.Events[meta.ProfileType][sampleKey]; exists {
 		events.Timestamps = append(events.Timestamps, uint64(meta.Timestamp))
 		events.Values = append(events.Values, meta.Value)
-		if meta.Origin == support.TraceOriginHeapAlloc {
+		if isHeapAlloc {
 			events.AllocSizes = append(events.AllocSizes, meta.AllocSize)
 		}
 		return nil
@@ -139,9 +122,9 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 		Values:     []int64{meta.Value},
 		Labels:     trace.CustomLabels,
 	}
-	if meta.Origin == support.TraceOriginHeapAlloc {
+	if isHeapAlloc {
 		newEvents.AllocSizes = []int64{meta.AllocSize}
 	}
-	rtp.Events[meta.Origin][sampleKey] = newEvents
+	rtp.Events[meta.ProfileType][sampleKey] = newEvents
 	return nil
 }

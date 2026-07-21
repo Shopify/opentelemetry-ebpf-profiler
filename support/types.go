@@ -167,7 +167,7 @@ type Trace struct {
 	Frame_data_len     uint16
 	Num_frames         uint16
 	Num_kernel_frames  uint16
-	Origin             uint32
+	Origin             uint16
 	Value              uint64
 	Ptr                uint64
 	Size               uint64
@@ -198,7 +198,7 @@ type BEAMProcInfo struct {
 type DotnetProcInfo struct {
 	Version uint32
 }
-type GoLabelsOffsets struct {
+type GoRuntimeOffsets struct {
 	M_offset               uint32
 	Curg                   uint32
 	Labels                 uint32
@@ -516,17 +516,19 @@ var MetricsTranslation = []metrics.MetricID{
 	0x5d: metrics.IDUnwindDotnetErrBadFP,
 	0x5e: metrics.IDUnwindDotnetErrCodeHeader,
 	0x5f: metrics.IDUnwindDotnetErrCodeTooLarge,
-	0x66: metrics.IDUnwindRubyErrInvalidIseq,
-	0x67: metrics.IDUnwindRubyErrReadMethodDef,
-	0x68: metrics.IDUnwindRubyErrReadMethodType,
-	0x69: metrics.IDUnwindRubyErrReadSvar,
-	0x6a: metrics.IDUnwindRubyErrReadRbasicFlags,
-	0x6b: metrics.IDUnwindRubyErrCmeMaxEp,
-	0x6c: metrics.IDUnwindErrBadDTVRead,
-	0x6d: metrics.IDBPFRingbufOutputErr,
-	0x6e: metrics.IDUnwindNativeErrNoVMA,
-	0x6f: metrics.IDUnwindNativeErrUnsupportedAnonymousMapping,
-	0x70: metrics.IDUnwindNativeErrNonExecutableVMA,
+	0x62: metrics.IDUnwindRubyErrInvalidIseq,
+	0x63: metrics.IDUnwindRubyErrReadMethodDef,
+	0x64: metrics.IDUnwindRubyErrReadMethodType,
+	0x65: metrics.IDUnwindRubyErrReadSvar,
+	0x66: metrics.IDUnwindRubyErrReadRbasicFlags,
+	0x67: metrics.IDUnwindRubyErrCmeMaxEp,
+	0x68: metrics.IDUnwindErrBadDTVRead,
+	0x69: metrics.IDBPFRingbufOutputErr,
+	0x6a: metrics.IDUnwindNativeErrNoVMA,
+	0x6b: metrics.IDUnwindNativeErrUnsupportedAnonymousMapping,
+	0x6c: metrics.IDUnwindNativeErrNonExecutableVMA,
+	0x6d: metrics.IDUnwindLuaJITAttempts,
+	0x6e: metrics.IDUnwindLuaJITErrNoProcInfo,
 	0x71: metrics.IDHeapLiveMapFull,
 	0x72: metrics.IDHeapPerPIDLimitHit,
 }

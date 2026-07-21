@@ -301,18 +301,6 @@ enum {
   // number of failures to unwind code object due to its large size
   metricID_UnwindDotnetErrCodeTooLarge,
 
-  // number of attempts to unwind LuaJIT
-  metricID_UnwindLuaJITAttempts,
-
-  // number of failures to read LuaJIT proc info
-  metricID_UnwindLuaJITErrNoProcInfo,
-
-  // number of failures to read LuaJIT context pointer
-  metricID_UnwindLuaJITErrNoContext,
-
-  // number of failures in context pointer validity check
-  metricID_UnwindLuaJITErrLMismatch,
-
   // number of attempts to read Go custom labels
   metricID_UnwindGoLabelsAttempts,
 
@@ -351,6 +339,18 @@ enum {
 
   // number of times the current PC was found in a non-executable VMA
   metricID_UnwindNativeErrNonExecutableVMA,
+
+  // number of attempts to unwind LuaJIT
+  metricID_UnwindLuaJITAttempts,
+
+  // number of failures to read LuaJIT proc info
+  metricID_UnwindLuaJITErrNoProcInfo,
+
+  // number of failures to read LuaJIT context pointer
+  metricID_UnwindLuaJITErrNoContext,
+
+  // number of failures in LuaJIT context pointer validity checks
+  metricID_UnwindLuaJITErrLMismatch,
 
   // number of dropped heap alloc entries due to map full
   metricID_HeapLiveMapFull,
@@ -680,8 +680,9 @@ typedef struct Trace {
   // These are raw u64 addresses from bpf_get_stack(), not encoded frames.
   u16 num_kernel_frames;
 
-  // origin indicates the source of the trace.
-  TraceOrigin origin;
+  // origin indicates the source of the trace and it is set as
+  // RODATA variable at load time.
+  u16 origin;
 
   // value stores context-specific data that was collected with the stack.
   // e.g. time in nanoseconds for off-CPU traces
@@ -922,6 +923,16 @@ typedef struct GoMapBucket {
   void *overflow;
 } GoMapBucket;
 
+typedef struct GoRuntimeOffsets {
+  u32 m_offset;
+  u32 curg;
+  u32 labels;
+  u32 hmap_count;
+  u32 hmap_log2_bucket_count;
+  u32 hmap_buckets;
+  s32 tls_offset;
+} GoRuntimeOffsets;
+
 typedef struct CustomLabelsState {
   void *go_m_ptr;
 } CustomLabelsState;
@@ -945,6 +956,9 @@ typedef struct PerCPURecord {
   LJUnwindState luajitUnwindState;
   // State for Go and Native custom labels
   CustomLabelsState customLabelsState;
+  // Per-process Go runtime offsets, preloaded once per trace from go_procs in
+  // collect_trace. m_offset is always non-zero for a Go process.
+  GoRuntimeOffsets goOffsets;
   union {
     // Scratch space for the Dotnet unwinder.
     DotnetUnwindScratchSpace dotnetUnwindScratch;
@@ -1172,15 +1186,5 @@ typedef struct PIDPageMappingInfo {
 typedef struct ApmIntProcInfo {
   u64 tls_offset;
 } ApmIntProcInfo;
-
-typedef struct GoLabelsOffsets {
-  u32 m_offset;
-  u32 curg;
-  u32 labels;
-  u32 hmap_count;
-  u32 hmap_log2_bucket_count;
-  u32 hmap_buckets;
-  s32 tls_offset;
-} GoLabelsOffsets;
 
 #endif // OPTI_TYPES_H

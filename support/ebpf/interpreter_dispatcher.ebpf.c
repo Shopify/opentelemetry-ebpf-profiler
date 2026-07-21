@@ -18,6 +18,17 @@ struct per_cpu_records_t {
   __uint(max_entries, 1);
 } per_cpu_records SEC(".maps");
 
+// per_cpu_records_kp is a second per-CPU record used by the probe unwinder.
+// At load time loadProbeUnwinders repoints its get_per_cpu_record() from
+// per_cpu_records to this map, so a perf sampler interrupting an in-flight uprobe
+// unwind (uprobes are not covered by bpf_prog_active) cannot clobber its record.
+struct per_cpu_records_kp_t {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, int);
+  __type(value, PerCPURecord);
+  __uint(max_entries, 1);
+} per_cpu_records_kp SEC(".maps");
+
 // metrics maps metric ID to a value
 struct metrics_t {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -138,6 +149,11 @@ struct apm_int_procs_t {
 // filter_error_frames is set during load time.
 BPF_RODATA_VAR(bool, filter_error_frames, false)
 
+// go_labels_disabled gates Go custom-label extraction. It mirrors the Go labels
+// configuration (Config.IsLabelsDisabled). The Go runtime offsets are loaded
+// independently whenever Go support is enabled.
+BPF_RODATA_VAR(bool, go_labels_disabled, true)
+
 static EBPF_INLINE u64 go_get_g_register(UNUSED UnwindState *state)
 {
 #if defined(__aarch64__)
@@ -150,7 +166,7 @@ static EBPF_INLINE u64 go_get_g_register(UNUSED UnwindState *state)
 #endif
 }
 
-static EBPF_INLINE u64 go_get_g_ptr(struct GoLabelsOffsets *offs, UnwindState *state)
+static EBPF_INLINE u64 go_get_g_ptr(struct GoRuntimeOffsets *offs, UnwindState *state)
 {
   u64 g_register = go_get_g_register(state);
 
@@ -177,7 +193,7 @@ static EBPF_INLINE u64 go_get_g_ptr(struct GoLabelsOffsets *offs, UnwindState *s
   return g_addr ? g_addr : g_register;
 }
 
-static EBPF_INLINE void *go_get_m_ptr(struct GoLabelsOffsets *offs, UnwindState *state)
+static EBPF_INLINE void *go_get_m_ptr(struct GoRuntimeOffsets *offs, UnwindState *state)
 {
   u64 g_addr = go_get_g_ptr(offs, state);
   if (!g_addr) {
@@ -196,12 +212,15 @@ static EBPF_INLINE void *go_get_m_ptr(struct GoLabelsOffsets *offs, UnwindState 
 
 static EBPF_INLINE void maybe_add_go_custom_labels(struct pt_regs *ctx, PerCPURecord *record)
 {
-  u32 pid                  = record->trace.pid;
-  GoLabelsOffsets *offsets = bpf_map_lookup_elem(&go_labels_procs, &pid);
-  if (!offsets) {
-    DEBUG_PRINT("cl: no offsets, %d not recognized as a go binary", pid);
+  if (go_labels_disabled) {
     return;
   }
+
+  if (record->goOffsets.m_offset == 0) {
+    DEBUG_PRINT("cl: no offsets, %d not recognized as a go binary", record->trace.pid);
+    return;
+  }
+  GoRuntimeOffsets *offsets = &record->goOffsets;
 
   void *m_ptr_addr = go_get_m_ptr(offsets, &record->state);
   if (!m_ptr_addr) {

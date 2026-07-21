@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -21,20 +22,15 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/orderedset"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
 const (
 	ExecutableCacheLifetime = 1 * time.Hour
 )
 
-// profileKind is a sub-profile discriminator used when a single origin
-// produces more than one OTLP Profile message from the same event set.
-// For example, TraceOriginHeapAlloc emits both an alloc_space (bytes) and
-// an alloc_objects (count) profile; the kind tells setProfile which
-// value-type semantics to apply. Origins that emit only one profile use
-// profileKindDefault. The type is intentionally generic so future origins
-// can extend it without changing the setProfile signature.
+// profileKind is a sub-profile discriminator used when a single event set
+// produces more than one OTLP Profile message. For example, heap allocation
+// events emit both alloc_space (bytes) and alloc_objects (count) profiles.
 type profileKind uint8
 
 const (
@@ -43,6 +39,12 @@ const (
 	profileKindHeapInuseSpace
 	profileKindHeapInuseObjects
 )
+
+func isHeapAllocProfileType(profileType *samples.TypeMetadata) bool {
+	return profileType != nil &&
+		profileType.SampleType == "alloc_space" &&
+		profileType.SampleUnit == "bytes"
+}
 
 // sampleKeys returns the sample keys of events. When sortKeys is true the
 // keys are returned in a deterministic order (via compareSampleKeys).
@@ -55,10 +57,6 @@ const (
 // guarantees that property. It is NOT a general contract that arbitrary
 // profiles share index alignment; consumers must not assume it unless
 // the profiles are explicitly documented as paired.
-//
-// Origins that produce only a single profile (CPU, off-CPU, probe) pass
-// sortKeys=false to skip the sort entirely, so there is zero cost on
-// those hot paths.
 func sampleKeys(events samples.SampleToEvents, sortKeys bool) []samples.SampleKey {
 	keys := make([]samples.SampleKey, 0, len(events))
 	for sampleKey := range events {
@@ -152,6 +150,24 @@ func (p *Pdata) Generate(tree samples.TraceEventsTree,
 
 	attrMgr := samples.NewAttrTableManager(stringSet, dic.AttributeTable())
 
+	// Collect the profile types present anywhere in the tree once, in a stable
+	// order, so that the order profiles are appended in is deterministic.
+	seenProfileTypes := make(libpf.Set[*samples.TypeMetadata])
+	for _, resourceToEvents := range tree {
+		for profileType := range resourceToEvents.Events {
+			if profileType != nil {
+				seenProfileTypes[profileType] = libpf.Void{}
+			}
+		}
+	}
+	profileTypes := seenProfileTypes.ToSlice()
+	slices.SortFunc(profileTypes, func(a, b *samples.TypeMetadata) int {
+		if c := strings.Compare(a.SampleType, b.SampleType); c != 0 {
+			return c
+		}
+		return strings.Compare(a.PeriodType, b.PeriodType)
+	})
+
 	for resource, toEvents := range tree {
 		if len(toEvents.Events) == 0 {
 			continue
@@ -166,40 +182,34 @@ func (p *Pdata) Generate(tree samples.TraceEventsTree,
 		sp.Scope().SetVersion(agentVersion)
 		sp.SetSchemaUrl(semconv.SchemaURL)
 
-		for _, origin := range []libpf.Origin{
-			support.TraceOriginSampling,
-			support.TraceOriginOffCPU,
-			support.TraceOriginProbe,
-			support.TraceOriginHeapAlloc,
-		} {
-			if len(toEvents.Events[origin]) == 0 {
+		for _, profileType := range profileTypes {
+			if len(toEvents.Events[profileType]) == 0 {
 				// Do not append empty profiles.
 				continue
 			}
 
-			// For most origins this emits a single profile. Heap-alloc is
-			// special: it emits a paired alloc_space (bytes) + alloc_objects
-			// (count) from the same events. Both calls use the same sorted
+			// For most profile types this emits a single profile. Heap allocation
+			// is special: it emits paired alloc_space (bytes) + alloc_objects
+			// (count) profiles from the same events. Both calls use the same sorted
 			// key order so their sample indices line up (see sampleKeys doc).
 			prof := sp.Profiles().AppendEmpty()
 			if err := p.setProfile(dic, attrMgr,
 				stringSet, funcSet, mappingSet, stackSet, locationSet, linkSet,
-				origin, profileKindDefault, toEvents.Events[origin], prof,
+				profileType, profileKindDefault, toEvents.Events[profileType], prof,
 				collectionStartTime, collectionEndTime); err != nil {
 				return profiles, err
 			}
 
-			if origin == support.TraceOriginHeapAlloc {
+			if isHeapAllocProfileType(profileType) {
 				prof := sp.Profiles().AppendEmpty()
 				if err := p.setProfile(dic, attrMgr,
 					stringSet, funcSet, mappingSet, stackSet, locationSet, linkSet,
-					origin, profileKindHeapAllocObjects, toEvents.Events[origin], prof,
+					profileType, profileKindHeapAllocObjects, toEvents.Events[profileType], prof,
 					collectionStartTime, collectionEndTime); err != nil {
 					return profiles, err
 				}
 			}
 		}
-
 	}
 
 	// Append inuse (live heap) profiles if provided.
@@ -241,88 +251,57 @@ func (p *Pdata) setProfile(
 	stackSet orderedset.OrderedSet[stackInfo],
 	locationSet orderedset.OrderedSet[locationInfo],
 	linkSet orderedset.OrderedSet[linkInfo],
-	origin libpf.Origin,
+	profileType *samples.TypeMetadata,
 	kind profileKind,
 	events samples.SampleToEvents,
 	profile pprofile.Profile,
 	collectionStartTime, collectionEndTime time.Time,
 ) error {
-	st := profile.SampleType()
-	switch origin {
-	case support.TraceOriginSampling:
+	if profileType.PeriodType != "" {
 		profile.SetPeriod(1e9 / int64(p.samplesPerSecond))
 		pt := profile.PeriodType()
-		pt.SetTypeStrindex(stringSet.Add("cpu"))
-		pt.SetUnitStrindex(stringSet.Add("nanoseconds"))
+		pt.SetTypeStrindex(stringSet.Add(profileType.PeriodType))
+		pt.SetUnitStrindex(stringSet.Add(profileType.PeriodUnit))
+	}
 
-		st.SetTypeStrindex(stringSet.Add("samples"))
+	st := profile.SampleType()
+	if kind == profileKindHeapAllocObjects {
+		st.SetTypeStrindex(stringSet.Add("alloc_objects"))
 		st.SetUnitStrindex(stringSet.Add("count"))
-	case support.TraceOriginOffCPU:
-		st.SetTypeStrindex(stringSet.Add("off_cpu"))
-		st.SetUnitStrindex(stringSet.Add("nanoseconds"))
-	case support.TraceOriginProbe:
-		st.SetTypeStrindex(stringSet.Add("events"))
-		st.SetUnitStrindex(stringSet.Add("count"))
-	case support.TraceOriginHeapAlloc:
-		if kind == profileKindHeapAllocObjects {
-			st.SetTypeStrindex(stringSet.Add("alloc_objects"))
-			st.SetUnitStrindex(stringSet.Add("count"))
-		} else {
-			st.SetTypeStrindex(stringSet.Add("alloc_space"))
-			st.SetUnitStrindex(stringSet.Add("bytes"))
-		}
-	default:
-		// Should never happen
-		return fmt.Errorf("generating profile for unsupported origin %d", origin)
+	} else {
+		st.SetTypeStrindex(stringSet.Add(profileType.SampleType))
+		st.SetUnitStrindex(stringSet.Add(profileType.SampleUnit))
 	}
 
 	// Heap-alloc uses a deterministic key order so that the paired
 	// alloc_space and alloc_objects profiles list samples in the same
 	// sequence; downstream consumers that opt into correlating them by
-	// index rely on this. Other origins emit a single profile and skip
-	// the sort (no performance cost on the CPU/off-CPU/probe paths).
-	for _, sampleKey := range sampleKeys(events, origin == support.TraceOriginHeapAlloc) {
+	// index rely on this. Other profile types emit a single profile and
+	// skip the sort.
+	for _, sampleKey := range sampleKeys(events, isHeapAllocProfileType(profileType)) {
 		traceInfo := events[sampleKey]
 		sample := profile.Samples().AppendEmpty()
 
 		sample.TimestampsUnixNano().FromRaw(traceInfo.Timestamps)
-		if origin == support.TraceOriginOffCPU {
-			sample.Values().Append(traceInfo.Values...)
-		}
-		if origin == support.TraceOriginHeapAlloc {
-			if kind == profileKindHeapAllocObjects {
-				// The profiler uses sampling: only a subset of allocations
-				// are observed, and for each observed allocation the eBPF
-				// probe reports:
-				//   weight = unbiased byte estimator (nsamples * interval)
-				//   size   = raw allocation size in bytes
-				//
-				// To derive an equally unbiased object-count estimator we
-				// compute weight/size: a sample representing `weight` bytes
-				// of `size`-byte objects represents weight/size objects.
-				// This is the standard convention used by tcmalloc, jemalloc,
-				// and Go's pprof runtime.
-				//
-				// We do this division here in userspace (rather than in the
-				// eBPF program) so that the raw size remains available for
-				// potential future use (e.g. allocation-size histograms) and
-				// so formula changes don't require an eBPF blob rebuild.
-				//
-				// Fall back to 1 if size is unknown/zero (malformed sampler
-				// output) rather than dividing by zero.
-				for i, weight := range traceInfo.Values {
-					objects := int64(1)
-					if i < len(traceInfo.AllocSizes) && traceInfo.AllocSizes[i] > 0 {
-						objects = weight / traceInfo.AllocSizes[i]
-						if objects < 1 {
-							objects = 1
-						}
+		if kind == profileKindHeapAllocObjects {
+			// The profiler uses sampling: only a subset of allocations are
+			// observed. For each observed allocation the eBPF probe reports:
+			//   weight = unbiased byte estimator (nsamples * interval)
+			//   size   = raw allocation size in bytes
+			// The object-count estimator is weight/size, matching conventions
+			// used by tcmalloc, jemalloc, and Go's pprof runtime.
+			for i, weight := range traceInfo.Values {
+				objects := int64(1)
+				if i < len(traceInfo.AllocSizes) && traceInfo.AllocSizes[i] > 0 {
+					objects = weight / traceInfo.AllocSizes[i]
+					if objects < 1 {
+						objects = 1
 					}
-					sample.Values().Append(objects)
 				}
-			} else {
-				sample.Values().Append(traceInfo.Values...)
+				sample.Values().Append(objects)
 			}
+		} else if profileType.ReportValues {
+			sample.Values().Append(traceInfo.Values...)
 		}
 
 		if sampleKey.SpanID != libpf.InvalidAPMSpanID &&
