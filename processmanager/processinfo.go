@@ -609,7 +609,7 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	}
 
 	// interpreterMappings collects the subset of mappings relevant to interpreters:
-	// executable anonymous mappings (JIT) and DLL file-backed mappings (.NET PE).
+	// anonymous mappings (JIT) and DLL file-backed mappings (.NET PE).
 	// Pending mappings are retained from the first /proc/PID/maps pass and flushed
 	// if an interpreter attaches later during the same synchronization.
 	interpreterMappings := newInterpreterMappingCollector(8)
