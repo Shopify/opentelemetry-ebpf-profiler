@@ -35,14 +35,14 @@ type Instance struct {
 	attached map[ProbeKey]AttachedProbe
 }
 
-// desiredEntry pairs a parsed probe with the minimal mapping coordinates
-// needed to (a) attach the uprobe and (b) build the /proc/<pid>/map_files
-// path. We don't retain the full RawMapping because its Path field may
-// point into a scanner buffer that gets recycled after IterateMappings'
-// callback returns.
+// desiredEntry pairs a parsed probe with the minimal mapping information
+// needed to attach the uprobe. We don't retain the full RawMapping because
+// its Path field may point into a scanner buffer that gets recycled after
+// IterateMappings' callback returns; path is explicitly interned instead.
 type desiredEntry struct {
 	vaddr  uint64
 	length uint64
+	path   libpf.String
 	probe  parsedProbe
 }
 
@@ -134,6 +134,7 @@ func (m *Manager) Reconcile(
 			desired[key] = desiredEntry{
 				vaddr:  rm.Vaddr,
 				length: rm.Length,
+				path:   libpf.Intern(rm.Path),
 				probe:  p,
 			}
 		}
@@ -180,6 +181,7 @@ func (m *Manager) Reconcile(
 		mapping := &process.RawMapping{
 			Vaddr:  de.vaddr,
 			Length: de.length,
+			Path:   de.path.String(),
 		}
 		lnk, err := m.attach(pid, mapping, de.probe)
 		if err != nil {
