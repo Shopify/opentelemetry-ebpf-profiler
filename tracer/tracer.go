@@ -1544,7 +1544,8 @@ func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 		t.releaseTrace(bpfTrace)
 		return
 	case libpf.TraceEventAsyncComplete:
-		if !t.asyncCorrelator.complete(bpfTrace) {
+		if !t.asyncCorrelator.complete(bpfTrace) ||
+			bpfTrace.AsyncAttributes&libpf.AsyncAttrFiltered != 0 {
 			t.releaseTrace(bpfTrace)
 			return
 		}

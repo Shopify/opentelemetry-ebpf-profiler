@@ -707,6 +707,9 @@ const (
 	// Number of asynchronous initiating traces currently awaiting completion
 	IDAsyncCorrelationPending = 306
 
+	// Number of correlated asynchronous completions suppressed by a duration filter
+	IDAsyncCorrelationFilteredCompletions = 307
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 307
+	IDMax = 308
 )

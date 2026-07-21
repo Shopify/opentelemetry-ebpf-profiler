@@ -2237,5 +2237,12 @@
     "name": "AsyncCorrelationPending",
     "field": "agent.async_correlation.pending",
     "id": 306
+  },
+  {
+    "description": "Number of correlated asynchronous completions suppressed by a duration filter",
+    "type": "counter",
+    "name": "AsyncCorrelationFilteredCompletions",
+    "field": "agent.async_correlation.filtered_completions",
+    "id": 307
   }
 ]

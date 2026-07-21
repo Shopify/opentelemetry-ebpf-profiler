@@ -235,17 +235,9 @@ int io_uring_complete(void *ctx)
   u64 timestamp = bpf_ktime_get_ns();
   u32 cflags =
     io_uring_complete_has_flags ? io_uring_read_u32(ctx, io_uring_complete_flags_offset) : 0;
-  bool more = (cflags & (1U << 1)) != 0; // IORING_CQE_F_MORE
-  if (timestamp < request->timestamp || timestamp - request->timestamp < io_uring_min_ns) {
-    if (!more) {
-      bpf_map_delete_elem(&io_uring_correlations, &request_fallback_id);
-      if (request_request_ptr) {
-        bpf_map_delete_elem(&io_uring_request_aliases, &request_request_ptr);
-      }
-      bpf_map_delete_elem(&io_uring_requests, &correlation_id);
-    }
-    return 0;
-  }
+  bool more     = (cflags & (1U << 1)) != 0; // IORING_CQE_F_MORE
+  u64 latency   = timestamp >= request->timestamp ? timestamp - request->timestamp : 0;
+  bool filtered = latency < io_uring_min_ns;
 
   PerCPURecord *record = get_pristine_per_cpu_record();
   if (!record) {
@@ -264,7 +256,7 @@ int io_uring_complete(void *ctx)
   trace->pid              = request->pid;
   trace->tid              = request->tid;
   trace->ktime            = timestamp;
-  trace->value            = timestamp - request->timestamp;
+  trace->value            = latency;
   trace->correlation_id   = request->correlation_id;
   trace->async_user_data  = request->user_data;
   trace->async_result     = io_uring_complete_result_size == 8
@@ -274,8 +266,9 @@ int io_uring_complete(void *ctx)
   trace->async_operation  = request->operation;
   trace->event_kind       = TRACE_EVENT_ASYNC_COMPLETE;
   trace->async_kind       = TRACE_ASYNC_IO_URING;
-  trace->async_attributes = request->attributes | (more ? TRACE_ASYNC_ATTR_MORE : 0);
-  trace->cpu_id           = bpf_get_smp_processor_id();
+  trace->async_attributes = request->attributes | (more ? TRACE_ASYNC_ATTR_MORE : 0) |
+                            (filtered ? TRACE_ASYNC_ATTR_FILTERED : 0);
+  trace->cpu_id = bpf_get_smp_processor_id();
   __builtin_memcpy(trace->comm, request->comm, sizeof(trace->comm));
 
   send_trace(ctx, trace);

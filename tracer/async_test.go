@@ -113,6 +113,40 @@ func TestAsyncCorrelatorReplacesFallbackWithRicherStart(t *testing.T) {
 	require.Equal(t, uint64(1), correlator.stats.duplicateStarts)
 }
 
+func TestAsyncCorrelatorAddsBlockLabels(t *testing.T) {
+	correlator := newAsyncTraceCorrelator(2, time.Minute)
+	correlator.add(&libpf.EbpfTrace{
+		Origin: 1, CorrelationID: 2, KTime: 10,
+		AsyncKind: libpf.AsyncKindBlock, EventKind: libpf.TraceEventAsyncStart,
+	})
+	completion := &libpf.EbpfTrace{
+		Origin: 1, CorrelationID: 2, KTime: 20, Value: 10,
+		AsyncKind: libpf.AsyncKindBlock, AsyncOperation: 1,
+		AsyncUserData: uint64(8)<<32 | 1,
+		EventKind:     libpf.TraceEventAsyncComplete,
+	}
+	require.True(t, correlator.complete(completion))
+	require.Equal(t, libpf.Intern("write"),
+		completion.CustomLabels[libpf.Intern("io.operation")])
+	require.Equal(t, libpf.Intern("8:1"),
+		completion.CustomLabels[libpf.Intern("io.device")])
+	require.Equal(t, libpf.Intern("ok"),
+		completion.CustomLabels[libpf.Intern("io.status")])
+}
+
+func TestAsyncCorrelatorConsumesFilteredCompletion(t *testing.T) {
+	correlator := newAsyncTraceCorrelator(2, time.Minute)
+	correlator.add(&libpf.EbpfTrace{Origin: 1, CorrelationID: 2, KTime: 10})
+	completion := &libpf.EbpfTrace{
+		Origin: 1, CorrelationID: 2, KTime: 20,
+		EventKind:       libpf.TraceEventAsyncComplete,
+		AsyncAttributes: libpf.AsyncAttrFiltered,
+	}
+	require.True(t, correlator.complete(completion))
+	require.Empty(t, correlator.pending)
+	require.Equal(t, uint64(1), correlator.stats.filteredCompletions)
+}
+
 func TestAsyncCorrelatorBoundsExpiresAndCountsOrphans(t *testing.T) {
 	correlator := newAsyncTraceCorrelator(1, 10*time.Nanosecond)
 	correlator.add(&libpf.EbpfTrace{Origin: 1, CorrelationID: 1, KTime: 10})

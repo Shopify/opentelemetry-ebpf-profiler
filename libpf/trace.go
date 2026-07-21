@@ -143,6 +143,8 @@ type AsyncKind uint8
 const (
 	AsyncKindNone AsyncKind = iota
 	AsyncKindIOUring
+	AsyncKindBlock
+	AsyncKindTCPConnect
 )
 
 // AsyncAttributes are lifecycle attributes carried by asynchronous events.
@@ -151,6 +153,7 @@ type AsyncAttributes uint8
 const (
 	AsyncAttrMore AsyncAttributes = 1 << iota
 	AsyncAttrSQPoll
+	AsyncAttrFiltered
 )
 
 // EbpfTrace represents a stack trace from Ebpf code.
