@@ -245,6 +245,8 @@ type Config struct {
 	// LiveHeapMaxEntriesPerPID is the per-process cap on live heap entries
 	// enforced in the eBPF map. 0 means no per-PID limit.
 	LiveHeapMaxEntriesPerPID int
+	// ProcessObserver receives optional non-blocking process lifecycle callbacks.
+	ProcessObserver pm.ProcessObserver
 	// BPFFSRoot is the root path to BPF filesystem for pinned maps and programs.
 	BPFFSRoot string
 	// OBIProcessCtx enable the use of a known shared eBPF map with OBI.
@@ -351,6 +353,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		IncludeEnvVars:        cfg.IncludeEnvVars,
 		USDTManager:           usdtMgr,
 		LiveHeapTracker:       liveTracker,
+		ProcessObserver:       cfg.ProcessObserver,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create processManager: %v", err)

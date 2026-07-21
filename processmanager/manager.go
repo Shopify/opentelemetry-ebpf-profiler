@@ -77,6 +77,7 @@ type Config struct {
 	IncludeEnvVars        libpf.Set[string]
 	USDTManager           *usdt.Manager
 	LiveHeapTracker       *liveheap.Tracker
+	ProcessObserver       ProcessObserver
 }
 
 // New creates a new ProcessManager which is responsible for keeping track of loading
@@ -140,6 +141,7 @@ func New(ctx context.Context, cfg Config) (*ProcessManager, error) {
 		usdtInstances:            make(map[libpf.PID]*usdt.Instance),
 		cleanupSem:               make(chan struct{}, maxConcurrentPIDCleanups),
 		liveHeapTracker:          cfg.LiveHeapTracker,
+		processObserver:          cfg.ProcessObserver,
 	}
 
 	collectInterpreterMetrics(ctx, pm, cfg.MonitorInterval)

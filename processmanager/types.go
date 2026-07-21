@@ -42,6 +42,14 @@ type frameCacheKey struct {
 	data [3]uint64
 }
 
+// ProcessObserver receives process lifecycle notifications from the process manager.
+// Implementations must return quickly and hand blocking work to their own workers: callbacks may
+// run on the PID event processor and, for exits, while the process manager lock is held.
+type ProcessObserver interface {
+	OnProcessDiscovered(pid libpf.PID, meta process.ProcessMeta)
+	OnProcessExit(pid libpf.PID)
+}
+
 // ProcessManager is responsible for managing the events happening throughout the lifespan of a
 // process.
 type ProcessManager struct {
@@ -148,6 +156,9 @@ type ProcessManager struct {
 	// process manager removes entries for the dead PID and batch-deletes
 	// the corresponding eBPF map entries.
 	liveHeapTracker *liveheap.Tracker
+
+	// processObserver receives optional, non-blocking lifecycle callbacks.
+	processObserver ProcessObserver
 }
 
 // Mapping represents an executable memory mapping of a process.

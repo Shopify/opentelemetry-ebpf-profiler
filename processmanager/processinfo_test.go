@@ -413,6 +413,57 @@ func TestProcessPIDExitRemovesInterpreters(t *testing.T) {
 	require.NotContains(pm.interpreters, pid)
 }
 
+type recordingProcessObserver struct {
+	discovered chan libpf.PID
+	exited     chan libpf.PID
+}
+
+func newRecordingProcessObserver() *recordingProcessObserver {
+	return &recordingProcessObserver{
+		discovered: make(chan libpf.PID, 8),
+		exited:     make(chan libpf.PID, 8),
+	}
+}
+
+func (o *recordingProcessObserver) OnProcessDiscovered(pid libpf.PID, _ process.ProcessMeta) {
+	o.discovered <- pid
+}
+
+func (o *recordingProcessObserver) OnProcessExit(pid libpf.PID) {
+	o.exited <- pid
+}
+
+func TestProcessObserverReceivesDiscoveryAndExit(t *testing.T) {
+	require := require.New(t)
+	pid := libpf.PID(4242)
+	observer := newRecordingProcessObserver()
+	pm := &ProcessManager{
+		ebpf:             &testEbpfHandler{},
+		interpreters:     map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance{},
+		pidToProcessInfo: map[libpf.PID]*processInfo{},
+		exitEvents:       make(map[libpf.PID]times.KTime),
+		cleanupSem:       make(chan struct{}, 1),
+		processObserver:  observer,
+	}
+
+	pm.SynchronizeProcess(&testProcess{pid: pid})
+	select {
+	case got := <-observer.discovered:
+		require.Equal(pid, got)
+	default:
+		t.Fatal("expected discovery notification")
+	}
+
+	pm.processPIDExit(pid)
+	pm.cleanupWG.Wait()
+	select {
+	case got := <-observer.exited:
+		require.Equal(pid, got)
+	default:
+		t.Fatal("expected exit notification")
+	}
+}
+
 func TestSynchronizeProcessUpdatesAnonymousMappingInterest(t *testing.T) {
 	require := require.New(t)
 	pid := libpf.PID(123)

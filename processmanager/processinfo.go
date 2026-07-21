@@ -484,6 +484,14 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 		return
 	}
 
+	// Notify the observer of the first exit for this PID. Scheduled off the
+	// lock so a slow observer cannot stall exit handling.
+	if pm.processObserver != nil {
+		pm.deferCleanup(func() {
+			pm.processObserver.OnProcessExit(pid)
+		})
+	}
+
 	// Delete all entries we have for this particular PID from pid_page_to_mapping_info.
 	deleted, err2 := pm.ebpf.DeletePidPageMappingInfo(pid, []lpm.Prefix{dummyPrefix})
 	if err2 != nil {
@@ -826,6 +834,18 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 
 	if newProcess {
 		log.Debugf("+ PID: %v", pid)
+		if pm.processObserver != nil {
+			// Read the freshly published metadata under the lock, then notify
+			// outside it so a slow observer cannot stall synchronization.
+			pm.mu.RLock()
+			info := pm.pidToProcessInfo[pid]
+			var observedMeta process.ProcessMeta
+			if info != nil {
+				observedMeta = info.meta
+			}
+			pm.mu.RUnlock()
+			pm.processObserver.OnProcessDiscovered(pid, observedMeta)
+		}
 		// TODO: Fine-grained reported_pids handling (evaluate per-PID mapping
 		// synchronization based on per-PID state such as time since last
 		// synchronization). Currently we only remove a PID from reported_pids
