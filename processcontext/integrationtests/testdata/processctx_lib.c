@@ -30,7 +30,7 @@ int init_process_context(void) {
   const char *attribute_key_map[] = {"http_route", "http_method", "user_id",
                                      NULL};
   const otel_thread_ctx_config_data thread_ctx_config = {
-      .schema_version = "tlsdesc_v1_dev",
+      .schema_version = "tls_v1",
       .attribute_key_map = attribute_key_map,
   };
   const char *resource_attributes[] = {"resource.key1", "resource.value1",
