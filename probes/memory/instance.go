@@ -139,7 +139,7 @@ func (m *Manager) Reconcile(
 		inst = NewInstance(pid)
 	}
 
-	eligible, err := m.matchesProcess(pr)
+	eligible, selectedExecutable, err := m.matchesProcess(pr)
 	if err != nil {
 		return inst, err
 	}
@@ -263,29 +263,44 @@ func (m *Manager) Reconcile(
 	}
 
 	var injectionErr error
-	if m.injector != nil && len(scanErrs) == 0 && !allocationHookDiscovered &&
-		inst.beginInjectionIfNoAllocation() {
+	if m.injector != nil && !m.injectionHalted.Load() && len(scanErrs) == 0 &&
+		!allocationHookDiscovered {
 		// This permanently mutates the target. It is reachable only through an
 		// explicitly selected experimental mode and is never retried implicitly.
 		// Any ambiguous mapping scan suppresses injection for this cycle because
 		// an unreadable mapping may already contain the preferred producer.
-		m.injectionAttempts.Add(1)
-		result, err := m.injector.Inject(pid)
-		inst.completeInjection(result, err)
-		if err != nil {
-			m.injectionFailures.Add(1)
-			log.Errorf("EXPERIMENTAL allocator injection failed pid=%d; target may be "+
-				"partially mutated and must be restarted: result=%s error=%v", pid, result, err)
-			injectionErr = fmt.Errorf("experimental allocator injection pid=%d (%s): %w",
-				pid, result, err)
-		} else if result.AlreadyPresent {
-			m.injectionAlreadyPresent.Add(1)
-			log.Warnf("EXPERIMENTAL allocator shim already present in pid=%d; no new mutation: %s",
-				pid, result)
-		} else {
-			m.injectionSuccesses.Add(1)
-			log.Warnf("EXPERIMENTAL allocator injection mutated pid=%d: %s", pid, result)
-		}
+		func() {
+			m.injectionMu.Lock()
+			defer m.injectionMu.Unlock()
+			if !m.injectionHalted.Load() && inst.beginInjectionIfNoAllocation() {
+				m.injectionAttempts.Add(1)
+				result, err := m.injector.Inject(pid, selectedExecutable)
+				inst.completeInjection(result, err)
+				if err != nil {
+					// Fail closed before another serialized PID can start. An error may
+					// follow partial target mutation, so automatic retries are unsafe.
+					m.injectionHalted.Store(true)
+					m.injectionFailures.Add(1)
+					killedTarget := errors.Is(err, errUnsafeTraceeTerminated)
+					if killedTarget {
+						m.injectionKilledTargets.Add(1)
+					}
+					log.Errorf("EXPERIMENTAL allocator injection failed pid=%d mode=%s "+
+						"killed_target=%t; new injection attempts are halted and the target "+
+						"may be partially mutated: result=%s error=%v", pid,
+						m.config.ExperimentalInjectionMode, killedTarget, result, err)
+					injectionErr = fmt.Errorf("experimental allocator injection pid=%d (%s): %w",
+						pid, result, err)
+				} else if result.AlreadyPresent {
+					m.injectionAlreadyPresent.Add(1)
+					log.Warnf("EXPERIMENTAL allocator shim already present in pid=%d; "+
+						"no new mutation: %s", pid, result)
+				} else {
+					m.injectionSuccesses.Add(1)
+					log.Warnf("EXPERIMENTAL allocator injection mutated pid=%d: %s", pid, result)
+				}
+			}
+		}()
 	}
 
 	allErrs := append(append(scanErrs, detachErrs...), attachErrs...)

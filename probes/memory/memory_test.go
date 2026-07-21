@@ -7,6 +7,7 @@ import (
 	"debug/elf"
 	"errors"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	cebpf "github.com/cilium/ebpf"
@@ -95,11 +96,28 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	allocator.Enabled = true
 	allocator.AllocationHooks = []Hook{UprobeHook("libc.so.6", "malloc")}
 	require.ErrorContains(t, allocator.Validate(), "process_executables")
+	for _, selector := range []string{"*", "**"} {
+		allocator.ProcessExecutablePatterns = []string{selector}
+		require.ErrorContains(t, allocator.Validate(), "too broad")
+	}
 	allocator.ProcessExecutablePatterns = []string{"ruby*"}
 	require.NoError(t, allocator.Validate())
+	assert.True(t, allocator.UsesDirectAllocatorAdapter())
 	assert.True(t, allocator.UsesMallocAdapter())
 	assert.False(t, allocator.UsesWeightedAllocation())
 	assert.True(t, allocator.IsMapEnabled("heap_pending_allocs"))
+
+	directFree := DefaultConfig()
+	directFree.Enabled = true
+	directFree.Live = true
+	directFree.DeallocationHooks = []Hook{UprobeHook("libc.so.6", "free")}
+	require.ErrorContains(t, directFree.Validate(), "process_executables")
+	directFree.ProcessExecutablePatterns = []string{"*"}
+	require.ErrorContains(t, directFree.Validate(), "too broad")
+	directFree.ProcessExecutablePatterns = []string{"ruby*"}
+	require.NoError(t, directFree.Validate())
+	assert.True(t, directFree.UsesDirectAllocatorAdapter())
+	assert.False(t, directFree.UsesMallocAdapter())
 
 	badABI := allocator
 	badABI.AllocationHooks[0].ABI = ABIFree
@@ -107,7 +125,7 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 
 	experimental := DefaultConfig()
 	experimental.Enabled = true
-	experimental.ProcessExecutablePatterns = []string{"ruby*"}
+	experimental.ProcessExecutablePatterns = []string{"/usr/bin/ruby"}
 	experimental.ExperimentalInjectionMode = InjectionGOTThenInline
 	experimental.ExperimentalShimPath = "/opt/prophiler/libprophiler-heap-shim.so"
 	experimental.ApplyDefaults()
@@ -129,6 +147,18 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	missingSelector := experimental
 	missingSelector.ProcessExecutablePatterns = nil
 	require.ErrorContains(t, missingSelector.Validate(), "process_executables")
+	for _, selector := range []string{"ruby*", "/usr/bin/ruby?", "/usr/bin/ruby[0-9]"} {
+		wildcardSelector := experimental
+		wildcardSelector.ProcessExecutablePatterns = []string{selector}
+		require.ErrorContains(t, wildcardSelector.Validate(),
+			"exact absolute process_executables", "selector %q", selector)
+	}
+	basenameSelector := experimental
+	basenameSelector.ProcessExecutablePatterns = []string{"ruby"}
+	require.ErrorContains(t, basenameSelector.Validate(), "exact absolute process_executables")
+	whitespaceSelector := experimental
+	whitespaceSelector.ProcessExecutablePatterns = []string{"/usr/bin/ruby "}
+	require.ErrorContains(t, whitespaceSelector.Validate(), "exact absolute process_executables")
 	missingShim := experimental
 	missingShim.ExperimentalShimPath = ""
 	require.ErrorContains(t, missingShim.Validate(), "experimental_shim_path")
@@ -161,6 +191,7 @@ type processWithExecutable struct {
 	process.Process
 	executable     libpf.String
 	mappings       []process.RawMapping
+	iterateErr     error
 	mappingOpenErr error
 }
 
@@ -176,7 +207,7 @@ func (p processWithExecutable) IterateMappings(
 			return 0, process.ErrCallbackStopped
 		}
 	}
-	return 0, nil
+	return 0, p.iterateErr
 }
 
 func (p processWithExecutable) OpenMappingFile(
@@ -198,14 +229,32 @@ func memoryMetricValue(values []metrics.Metric, id metrics.MetricID) metrics.Met
 }
 
 type recordingInjector struct {
-	calls  int
-	result InjectionResult
-	err    error
+	calls              int
+	expectedExecutable libpf.String
+	result             InjectionResult
+	err                error
 }
 
-func (i *recordingInjector) Inject(libpf.PID) (InjectionResult, error) {
+func (i *recordingInjector) Inject(_ libpf.PID,
+	expectedExecutable libpf.String,
+) (InjectionResult, error) {
 	i.calls++
+	i.expectedExecutable = expectedExecutable
 	return i.result, i.err
+}
+
+type blockingFailInjector struct {
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (i *blockingFailInjector) Inject(libpf.PID, libpf.String) (InjectionResult, error) {
+	if i.calls.Add(1) == 1 {
+		close(i.started)
+		<-i.release
+	}
+	return InjectionResult{}, errors.New("synthetic concurrent mutation failure")
 }
 
 func TestManagerProcessSelector(t *testing.T) {
@@ -213,17 +262,55 @@ func TestManagerProcessSelector(t *testing.T) {
 		ProcessExecutablePatterns: []string{"ruby*", "/opt/tarantool/*"},
 	}}
 
-	matched, err := manager.matchesProcess(processWithExecutable{
+	matched, executable, err := manager.matchesProcess(processWithExecutable{
 		executable: libpf.Intern("/usr/bin/ruby3.3"),
 	})
 	require.NoError(t, err)
 	assert.True(t, matched)
+	assert.Equal(t, libpf.Intern("/usr/bin/ruby3.3"), executable)
 
-	matched, err = manager.matchesProcess(processWithExecutable{
+	matched, executable, err = manager.matchesProcess(processWithExecutable{
 		executable: libpf.Intern("/usr/bin/python3"),
 	})
 	require.NoError(t, err)
 	assert.False(t, matched)
+	assert.Equal(t, libpf.Intern("/usr/bin/python3"), executable)
+}
+
+func TestReconcilePreservesAttachmentsOnMappingIterationError(t *testing.T) {
+	manager := &Manager{config: Config{Enabled: true}}
+	inst := NewInstance(1234)
+	key := AttachmentKey{PID: 1234, Event: EventAllocation, Offset: 0x10}
+	inst.attached[key] = AttachedHook{Key: key}
+
+	got, err := manager.Reconcile(1234, processWithExecutable{
+		executable: libpf.Intern("/usr/bin/ruby"),
+		iterateErr: errors.New("synthetic partial mapping view"),
+	}, inst)
+	require.ErrorContains(t, err, "synthetic partial mapping view")
+	assert.Same(t, inst, got)
+	assert.Contains(t, inst.attached, key,
+		"a partial mapping view is not evidence that an existing hook disappeared")
+}
+
+func TestReconcileDetachesAttachmentsWhenSelectorNoLongerMatches(t *testing.T) {
+	manager := &Manager{config: Config{
+		Enabled:                   true,
+		ProcessExecutablePatterns: []string{"ruby"},
+	}}
+	inst := NewInstance(1234)
+	key := AttachmentKey{PID: 1234, Event: EventAllocation, Offset: 0x10}
+	inst.attached[key] = AttachedHook{Key: key}
+
+	got, err := manager.Reconcile(1234, processWithExecutable{
+		executable: libpf.Intern("/usr/bin/python"),
+	}, inst)
+	require.NoError(t, err)
+	assert.Same(t, inst, got)
+	assert.Empty(t, inst.attached)
+	evaluated, eligible := inst.Applicability()
+	assert.True(t, evaluated)
+	assert.False(t, eligible)
 }
 
 func TestExecutableFileOffset(t *testing.T) {
@@ -332,6 +419,13 @@ func TestNewManager(t *testing.T) {
 	assert.Len(t, manager.hooks, 1)
 	assert.True(t, manager.needsUSDT)
 	assert.Nil(t, manager.injector, "disabled injection never constructs an injector")
+	assert.Nil(t, manager.GetAndResetMetrics(),
+		"ordinary memory profiling must not report injector-only metrics")
+	_, err = manager.Reconcile(1234,
+		processWithExecutable{executable: libpf.Intern("/usr/bin/ruby")}, nil)
+	require.NoError(t, err)
+	assert.Nil(t, manager.GetAndResetMetrics(),
+		"ordinary reconciliation must not report injector-only metrics")
 	assert.NoError(t, manager.Close())
 
 	allocator := DefaultConfig()
@@ -373,12 +467,15 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			injector := &recordingInjector{result: test.result}
-			manager := &Manager{config: Config{Enabled: true}, injector: injector}
+			manager := &Manager{config: Config{
+				Enabled: true, ProcessExecutablePatterns: []string{"/usr/bin/ruby"},
+			}, injector: injector}
 			pr := processWithExecutable{executable: libpf.Intern("/usr/bin/ruby")}
 
 			inst, err := manager.Reconcile(1234, pr, nil)
 			require.NoError(t, err)
 			require.Equal(t, 1, injector.calls)
+			assert.Equal(t, libpf.Intern("/usr/bin/ruby"), injector.expectedExecutable)
 
 			_, err = manager.Reconcile(1234, pr, inst)
 			require.NoError(t, err)
@@ -389,19 +486,23 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 				memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts))
 			assert.Equal(t, metrics.MetricValue(1),
 				memoryMetricValue(gotMetrics, test.outcomeMetric))
+			assert.Zero(t, memoryMetricValue(gotMetrics, metrics.IDHeapInjectionHalted))
 			outcomes := memoryMetricValue(gotMetrics, metrics.IDHeapInjectionSuccesses) +
 				memoryMetricValue(gotMetrics, metrics.IDHeapInjectionFailures) +
 				memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAlreadyPresent)
 			assert.Equal(t, memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts),
-				outcomes, "every attempt must have exactly one terminal outcome")
+				outcomes, "settled attempts must each have one terminal outcome")
 			assert.Equal(t, metrics.MetricValue(0),
 				memoryMetricValue(manager.GetAndResetMetrics(), metrics.IDHeapInjectionAttempts),
 				"injection counters must reset after collection")
 		})
 	}
 
-	t.Run("does not retry a failed injection", func(t *testing.T) {
-		injector := &recordingInjector{err: errors.New("synthetic mutation failure")}
+	t.Run("halts all injection after a failed partial mutation", func(t *testing.T) {
+		injector := &recordingInjector{
+			result: InjectionResult{GOTMallocPatched: true},
+			err:    errors.New("synthetic mutation failure"),
+		}
 		manager := &Manager{
 			config:   Config{Enabled: true},
 			injector: injector,
@@ -411,21 +512,99 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 		inst, err := manager.Reconcile(1234, pr, nil)
 		require.ErrorContains(t, err, "synthetic mutation failure")
 		require.Equal(t, 1, injector.calls)
+		assert.True(t, manager.injectionHalted.Load())
 
 		_, err = manager.Reconcile(1234, pr, inst)
 		require.NoError(t, err)
 		assert.Equal(t, 1, injector.calls, "a failed PID mutation is never retried")
+
+		haltedInst, err := manager.Reconcile(5678, pr, nil)
+		require.NoError(t, err)
+		assert.Equal(t, 1, injector.calls,
+			"a failure must halt destructive mutation of every later PID")
+		assert.False(t, haltedInst.injectionAttempted)
 
 		gotMetrics := manager.GetAndResetMetrics()
 		assert.Equal(t, metrics.MetricValue(1),
 			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts))
 		assert.Equal(t, metrics.MetricValue(1),
 			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionFailures))
+		assert.Equal(t, metrics.MetricValue(1),
+			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionHalted))
 		outcomes := memoryMetricValue(gotMetrics, metrics.IDHeapInjectionSuccesses) +
 			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionFailures) +
 			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAlreadyPresent)
 		assert.Equal(t, memoryMetricValue(gotMetrics, metrics.IDHeapInjectionAttempts),
-			outcomes, "every attempt must have exactly one terminal outcome")
+			outcomes, "settled attempts must each have one terminal outcome")
+		resetMetrics := manager.GetAndResetMetrics()
+		for _, id := range []metrics.MetricID{
+			metrics.IDHeapInjectionAttempts,
+			metrics.IDHeapInjectionSuccesses,
+			metrics.IDHeapInjectionFailures,
+			metrics.IDHeapInjectionKilledTargets,
+			metrics.IDHeapInjectionAlreadyPresent,
+			metrics.IDHeapInjectionProbeDiscoveryFailures,
+		} {
+			assert.Zero(t, memoryMetricValue(resetMetrics, id),
+				"injection counter %d must reset after collection", id)
+		}
+		assert.Equal(t, metrics.MetricValue(1),
+			memoryMetricValue(resetMetrics, metrics.IDHeapInjectionHalted),
+			"halted is a persistent gauge, not an interval counter")
+	})
+
+	t.Run("reports a fail-closed target termination", func(t *testing.T) {
+		injector := &recordingInjector{
+			err: errors.Join(errUnsafeTraceeTerminated,
+				errors.New("synthetic target termination")),
+		}
+		manager := &Manager{config: Config{Enabled: true}, injector: injector}
+		pr := processWithExecutable{executable: libpf.Intern("/usr/bin/ruby")}
+
+		_, err := manager.Reconcile(1234, pr, nil)
+		require.ErrorContains(t, err, "synthetic target termination")
+		gotMetrics := manager.GetAndResetMetrics()
+		assert.Equal(t, metrics.MetricValue(1),
+			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionFailures))
+		assert.Equal(t, metrics.MetricValue(1),
+			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionKilledTargets))
+		assert.Equal(t, metrics.MetricValue(1),
+			memoryMetricValue(gotMetrics, metrics.IDHeapInjectionHalted))
+	})
+
+	t.Run("a concurrent failure halts queued injection", func(t *testing.T) {
+		injector := &blockingFailInjector{
+			started: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		manager := &Manager{config: Config{Enabled: true}, injector: injector}
+		pr := processWithExecutable{executable: libpf.Intern("/usr/bin/ruby")}
+
+		type reconcileResult struct {
+			inst *Instance
+			err  error
+		}
+		firstResult := make(chan reconcileResult, 1)
+		secondResult := make(chan reconcileResult, 1)
+		go func() {
+			inst, err := manager.Reconcile(1234, pr, nil)
+			firstResult <- reconcileResult{inst: inst, err: err}
+		}()
+		<-injector.started
+		go func() {
+			inst, err := manager.Reconcile(5678, pr, nil)
+			secondResult <- reconcileResult{inst: inst, err: err}
+		}()
+		close(injector.release)
+
+		first := <-firstResult
+		require.ErrorContains(t, first.err, "synthetic concurrent mutation failure")
+		second := <-secondResult
+		require.NoError(t, second.err)
+		require.NotNil(t, second.inst)
+		assert.False(t, second.inst.injectionAttempted)
+		assert.Equal(t, int32(1), injector.calls.Load(),
+			"a queued PID must recheck the global halt under the injection lock")
 	})
 
 	t.Run("records injected shim discovery failure once per PID", func(t *testing.T) {
@@ -490,8 +669,18 @@ func TestReconcileExperimentalInjectionPolicy(t *testing.T) {
 		require.ErrorIs(t, err, os.ErrPermission)
 		assert.Zero(t, injector.calls)
 		assert.False(t, inst.injectionAttempted)
-		assert.Zero(t, memoryMetricValue(
-			manager.GetAndResetMetrics(), metrics.IDHeapInjectionAttempts))
+		gotMetrics := manager.GetAndResetMetrics()
+		for _, id := range []metrics.MetricID{
+			metrics.IDHeapInjectionAttempts,
+			metrics.IDHeapInjectionSuccesses,
+			metrics.IDHeapInjectionFailures,
+			metrics.IDHeapInjectionKilledTargets,
+			metrics.IDHeapInjectionAlreadyPresent,
+			metrics.IDHeapInjectionProbeDiscoveryFailures,
+		} {
+			assert.Zero(t, memoryMetricValue(gotMetrics, id),
+				"scan suppression must not increment injection counter %d", id)
+		}
 	})
 
 	t.Run("discovered memfd producer prevents injection", func(t *testing.T) {

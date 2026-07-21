@@ -61,14 +61,17 @@ type EbpfHandler interface {
 	SupportsLPMTrieBatchOperations() bool
 
 	// SetHeapLivePID adds or removes a PID from the heap_live_pids eBPF map.
-	SetHeapLivePID(pid libpf.PID, enabled bool)
+	// Callers must not assume tracking changed unless this succeeds.
+	SetHeapLivePID(pid libpf.PID, enabled bool) error
 
-	// DeleteHeapAllocLiveEntries removes entries from the heap_alloc_live eBPF map
-	// for the given PID and pointers. Used for cleanup on process exit.
-	DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64)
+	// DeleteHeapAllocLiveEntries removes every entry from heap_alloc_live for
+	// the PID. ptrs provides a fast path; implementations must also find records
+	// not yet observed in userspace. Callers must not clear the PID count unless
+	// this succeeds, so PID reuse cannot inherit an under-counted live set.
+	DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64) error
 
 	// DeleteHeapPIDAllocCount removes the per-PID alloc count for process exit cleanup.
-	DeleteHeapPIDAllocCount(pid libpf.PID)
+	DeleteHeapPIDAllocCount(pid libpf.PID) error
 
 	// SetHeapPIDAllocLimit writes the per-PID allocation limit to the eBPF map.
 	SetHeapPIDAllocLimit(limit uint32)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/open-telemetry/sig-profiling/profcheck"
 
+	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -22,6 +23,23 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
+
+type inuseTestAttrProducer struct{}
+
+func (inuseTestAttrProducer) CollectExtraSampleMeta(
+	*libpf.Trace, *samples.TraceEventMeta,
+) any {
+	return nil
+}
+
+func (inuseTestAttrProducer) ExtraSampleAttrs(
+	attrMgr *samples.AttrTableManager, meta any,
+) []int32 {
+	attrs := pcommon.NewInt32Slice()
+	value, _ := meta.(string)
+	attrMgr.AppendOptionalString(attrs, attribute.Key("test.inuse.metadata"), value)
+	return attrs.AsRaw()
+}
 
 var (
 	// Test collection window: 60 second duration
@@ -914,8 +932,8 @@ func TestHeapAllocProducesSpaceAndObjectsProfiles(t *testing.T) {
 
 // TestHeapAllocObjectsUsesAllocSizeWeighting verifies that alloc_objects is
 // derived from Values (byte-weight) divided by the per-event AllocSizes
-// (raw allocation size), not a flat count of 1 per sample, and that a
-// missing/zero size falls back to 1 rather than dividing by zero.
+// (raw allocation size), with unbiased integer rounding rather than a flat
+// count of 1 per sample. A missing/zero size falls back to 1.
 func TestHeapAllocObjectsUsesAllocSizeWeighting(t *testing.T) {
 	d, err := New(100, nil)
 	require.NoError(t, err)
@@ -932,6 +950,7 @@ func TestHeapAllocObjectsUsesAllocSizeWeighting(t *testing.T) {
 		uint64(time.Unix(1010, 0).UnixNano()),
 		uint64(time.Unix(1020, 0).UnixNano()),
 		uint64(time.Unix(1030, 0).UnixNano()),
+		uint64(time.Unix(1040, 0).UnixNano()),
 	}
 	tree := samples.TraceEventsTree{
 		{ExecutablePath: libpf.Intern("/bin/heap-app")}: samples.ResourceToProfiles{
@@ -943,8 +962,9 @@ func TestHeapAllocObjectsUsesAllocSizeWeighting(t *testing.T) {
 						// weight=1000 @ size=100 -> 10 objects.
 						// weight=64 @ size=64 -> 1 object.
 						// weight=500 @ size=0 (unknown) -> falls back to 1.
-						Values:     []int64{1000, 64, 500},
-						AllocSizes: []int64{100, 64, 0},
+						// weight=10 @ size=3 -> stochastically rounded 3 or 4.
+						Values:     []int64{1000, 64, 500, 10},
+						AllocSizes: []int64{100, 64, 0, 3},
 					},
 				},
 			},
@@ -964,7 +984,9 @@ func TestHeapAllocObjectsUsesAllocSizeWeighting(t *testing.T) {
 		}
 	}
 	require.Equal(t, 1, allocObjects.Samples().Len())
-	assert.Equal(t, []int64{10, 1, 1}, allocObjects.Samples().At(0).Values().AsRaw())
+	fractional := liveheap.EstimateObjectWeight(10, 3, timestamps[3]^3)
+	assert.Equal(t, []int64{10, 1, 1, fractional},
+		allocObjects.Samples().At(0).Values().AsRaw())
 }
 
 // TestCompareSampleKeys exercises the sample-key comparator that gives the
@@ -1116,7 +1138,7 @@ func TestGenerate_HeapAllocProfilesAligned(t *testing.T) {
 // with the correct values, and (regression for the shared frame-walk) the
 // same frame-type and build-ID attributes as the main profile path.
 func TestGenerate_InuseProfiles(t *testing.T) {
-	d, err := New(100, nil)
+	d, err := New(100, inuseTestAttrProducer{})
 	require.NoError(t, err)
 
 	mappingFile := libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
@@ -1126,7 +1148,8 @@ func TestGenerate_InuseProfiles(t *testing.T) {
 	frames := singleFrameNative(mappingFile, 0x2000, 0x2000, 0x3000, 0x200)
 
 	inuse := []liveheap.InuseEntry{
-		{PID: 42, TraceHash: libpf.NewTraceHash(0, 1), Frames: frames, Space: 4096, Objects: 3},
+		{PID: 42, TraceHash: libpf.NewTraceHash(0, 1), Frames: frames,
+			Space: 4096, Objects: 3, ExtraMeta: "pod-a"},
 	}
 
 	// Empty event tree: the inuse profiles stand alone and create their own
@@ -1144,6 +1167,7 @@ func TestGenerate_InuseProfiles(t *testing.T) {
 
 	require.Equal(t, 1, profiles.ResourceProfiles().Len())
 	rp := profiles.ResourceProfiles().At(0)
+	assert.Equal(t, semconv.SchemaURL, rp.SchemaUrl())
 	pidVal, ok := rp.Resource().Attributes().Get(string(semconv.ProcessPIDKey))
 	require.True(t, ok, "inuse resource must carry the process PID")
 	assert.Equal(t, int64(42), pidVal.Int())
@@ -1159,6 +1183,7 @@ func TestGenerate_InuseProfiles(t *testing.T) {
 
 	require.Equal(t, 1, rp.ScopeProfiles().Len())
 	sp := rp.ScopeProfiles().At(0)
+	assert.Equal(t, semconv.SchemaURL, sp.SchemaUrl())
 	require.Equal(t, 2, sp.Profiles().Len(), "inuse_space + inuse_objects")
 
 	strings := profiles.Dictionary().StringTable()
@@ -1170,6 +1195,8 @@ func TestGenerate_InuseProfiles(t *testing.T) {
 
 	space, ok := byType["inuse_space"]
 	require.True(t, ok, "inuse_space profile present")
+	assert.Equal(t, pcommon.Timestamp(testCollectionEnd.UnixNano()), space.Time())
+	assert.Zero(t, space.DurationNano(), "inuse profiles are instantaneous snapshots")
 	assert.Equal(t, "bytes", strings.At(int(space.SampleType().UnitStrindex())))
 	require.Equal(t, 1, space.Samples().Len())
 	assert.Equal(t, []int64{4096}, space.Samples().At(0).Values().AsRaw())
@@ -1178,11 +1205,27 @@ func TestGenerate_InuseProfiles(t *testing.T) {
 
 	objects, ok := byType["inuse_objects"]
 	require.True(t, ok, "inuse_objects profile present")
+	assert.Equal(t, pcommon.Timestamp(testCollectionEnd.UnixNano()), objects.Time())
+	assert.Zero(t, objects.DurationNano(), "inuse profiles are instantaneous snapshots")
 	assert.Equal(t, "count", strings.At(int(objects.SampleType().UnitStrindex())))
 	require.Equal(t, 1, objects.Samples().Len())
 	assert.Equal(t, []int64{3}, objects.Samples().At(0).Values().AsRaw())
 	assert.Equal(t, []uint64{uint64(testCollectionEnd.UnixNano())},
 		objects.Samples().At(0).TimestampsUnixNano().AsRaw())
+
+	for _, prof := range []pprofile.Profile{space, objects} {
+		sample := prof.Samples().At(0)
+		found := false
+		for _, index := range sample.AttributeIndices().AsRaw() {
+			attr := profiles.Dictionary().AttributeTable().At(int(index))
+			key := strings.At(int(attr.KeyStrindex()))
+			if key == "test.inuse.metadata" {
+				found = true
+				assert.Equal(t, "pod-a", attr.Value().AsRaw())
+			}
+		}
+		assert.True(t, found, "inuse samples must retain allocation-time extra metadata")
+	}
 
 	// The only frames in this request are the inuse ones, so the presence of
 	// these attribute keys proves appendInuseProfiles attached them (via the
@@ -1191,6 +1234,108 @@ func TestGenerate_InuseProfiles(t *testing.T) {
 		"inuse locations must carry the frame-type attribute")
 	assert.True(t, attrKeyPresent(profiles.Dictionary(), string(semconv.ProcessExecutableBuildIDHtlhashKey)),
 		"inuse mappings must carry the build-ID attribute")
+}
+
+func TestMatchingInuseResourceFallsBackOnlyWhenUnambiguous(t *testing.T) {
+	profiles := pprofile.NewProfiles()
+	first := profiles.ResourceProfiles().AppendEmpty()
+	first.Resource().Attributes().PutInt(string(semconv.ProcessPIDKey), 42)
+	first.Resource().Attributes().PutStr(
+		string(semconv.ProcessExecutablePathKey), "/usr/bin/ruby")
+	first.Resource().Attributes().PutStr(string(semconv.ContainerIDKey), "container-42")
+
+	matched, ok := matchingInuseResource(
+		[]pprofile.ResourceProfiles{first}, liveheap.ProcessMeta{
+			ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+		}, true)
+	require.True(t, ok, "partial current metadata may select one unambiguous resource")
+	assert.Equal(t, "container-42", matched.Resource().Attributes().AsRaw()[string(semconv.ContainerIDKey)])
+
+	matched, ok = matchingInuseResource(
+		[]pprofile.ResourceProfiles{first}, liveheap.ProcessMeta{}, false)
+	require.True(t, ok)
+	assert.Equal(t, "/usr/bin/ruby", matched.Resource().Attributes().AsRaw()[string(semconv.ProcessExecutablePathKey)])
+
+	second := profiles.ResourceProfiles().AppendEmpty()
+	second.Resource().Attributes().PutInt(string(semconv.ProcessPIDKey), 42)
+	second.Resource().Attributes().PutStr(
+		string(semconv.ProcessExecutablePathKey), "/usr/bin/ruby")
+	second.Resource().Attributes().PutStr(string(semconv.ContainerIDKey), "container-99")
+	_, ok = matchingInuseResource(
+		[]pprofile.ResourceProfiles{first, second}, liveheap.ProcessMeta{}, false)
+	assert.False(t, ok, "missing metadata must not choose arbitrarily after PID reuse")
+
+	_, ok = matchingInuseResource(
+		[]pprofile.ResourceProfiles{first, second}, liveheap.ProcessMeta{
+			ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+		}, true)
+	assert.False(t, ok,
+		"partial metadata must not choose between ambiguous PID generations")
+}
+
+func TestGenerate_InuseProfilesMatchFullProcessResource(t *testing.T) {
+	d, err := New(100, nil)
+	require.NoError(t, err)
+
+	frames := singleFrameNative(libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+		FileID: libpf.NewFileID(7, 8), FileName: libpf.Intern("/lib/libheap.so"),
+	}), 0x2000, 0x2000, 0x3000, 0x200)
+	makeEvents := func() map[libpf.Origin]samples.SampleToEvents {
+		return map[libpf.Origin]samples.SampleToEvents{
+			support.TraceOriginSampling: {
+				{}: &samples.TraceEvents{
+					Frames: frames,
+					Timestamps: []uint64{
+						uint64(testCollectionEnd.UnixNano()),
+					},
+				},
+			},
+		}
+	}
+	tree := samples.TraceEventsTree{
+		{PID: 42, ExecutablePath: libpf.Intern("/old/app"),
+			ContainerID: libpf.Intern("old-container")}: {
+			Events: makeEvents(),
+		},
+		{PID: 42, ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+			ContainerID: libpf.Intern("container-42")}: {
+			Events: makeEvents(),
+		},
+	}
+	inuse := []liveheap.InuseEntry{{
+		PID: 42, TraceHash: libpf.NewTraceHash(0, 1), Frames: frames,
+		ProcessMeta: liveheap.ProcessMeta{
+			ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+			ContainerID:    libpf.Intern("container-42"),
+		},
+		Space: 4096, Objects: 8,
+	}}
+	profiles, err := d.Generate(tree, "agent", "v1",
+		testCollectionStart, testCollectionEnd, inuse, func(libpf.PID) liveheap.ProcessMeta {
+			// Simulate PID reuse between Snapshot and Generate. Embedded allocation-
+			// time metadata must win over this now-current process identity.
+			return liveheap.ProcessMeta{
+				ExecutablePath: libpf.Intern("/old/app"),
+				ContainerID:    libpf.Intern("old-container"),
+			}
+		})
+	require.NoError(t, err)
+	require.Equal(t, 2, profiles.ResourceProfiles().Len(),
+		"PID reuse must not create or merge into an unrelated resource")
+
+	for i := range profiles.ResourceProfiles().Len() {
+		rp := profiles.ResourceProfiles().At(i)
+		path, ok := rp.Resource().Attributes().Get(string(semconv.ProcessExecutablePathKey))
+		require.True(t, ok)
+		profilesLen := rp.ScopeProfiles().At(0).Profiles().Len()
+		if path.Str() == "/usr/bin/ruby" {
+			assert.Equal(t, 3, profilesLen,
+				"matching resource contains sampling plus paired inuse profiles")
+		} else {
+			assert.Equal(t, 1, profilesLen,
+				"stale PID resource must not receive current inuse profiles")
+		}
+	}
 }
 
 // attrKeyPresent reports whether any entry in the dictionary's attribute table

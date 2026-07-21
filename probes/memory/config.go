@@ -380,6 +380,13 @@ func (cfg Config) Validate() error {
 		if len(cfg.ProcessExecutablePatterns) == 0 {
 			return fmt.Errorf("experimental allocator injection requires at least one process_executables selector")
 		}
+		for _, pattern := range cfg.ProcessExecutablePatterns {
+			trimmed := strings.TrimSpace(pattern)
+			if trimmed == "" || trimmed != pattern || strings.ContainsAny(trimmed, "*?[") ||
+				!path.IsAbs(trimmed) {
+				return fmt.Errorf("experimental allocator injection requires exact absolute process_executables paths, got %q", pattern)
+			}
+		}
 	default:
 		return fmt.Errorf("unknown experimental allocator injection mode %q", mode)
 	}
@@ -432,13 +439,19 @@ func (cfg Config) Validate() error {
 	if err := validateHooks("deallocation", EventDeallocation, cfg.DeallocationHooks); err != nil {
 		return err
 	}
-	if cfg.Enabled && cfg.UsesMallocAdapter() {
-		if cfg.SamplingIntervalBytes == 0 {
-			return fmt.Errorf("malloc hooks require a non-zero sampling interval bytes")
-		}
+	if cfg.Enabled && cfg.UsesDirectAllocatorAdapter() {
 		if len(cfg.ProcessExecutablePatterns) == 0 {
-			return fmt.Errorf("malloc hooks require at least one process_executables selector")
+			return fmt.Errorf("direct allocator hooks require at least one process_executables selector")
 		}
+		for _, pattern := range cfg.ProcessExecutablePatterns {
+			trimmed := strings.TrimSpace(pattern)
+			if trimmed == "*" || trimmed == "**" {
+				return fmt.Errorf("process executable pattern %q is too broad for direct allocator hooks", pattern)
+			}
+		}
+	}
+	if cfg.Enabled && cfg.UsesMallocAdapter() && cfg.SamplingIntervalBytes == 0 {
+		return fmt.Errorf("malloc hooks require a non-zero sampling interval bytes")
 	}
 	return nil
 }
@@ -453,6 +466,30 @@ func (cfg Config) UsesWeightedAllocation() bool {
 		normalized, err := normalizeHook(EventAllocation, hook)
 		if err == nil && normalized.ABI == ABIWeightedAllocation {
 			return true
+		}
+	}
+	return false
+}
+
+// UsesDirectAllocatorAdapter reports whether any enabled hook instruments a
+// process allocator entry/return directly. Unlike producer-weighted hooks,
+// these adapters trap on every matching allocator call.
+func (cfg Config) UsesDirectAllocatorAdapter() bool {
+	if !cfg.Enabled {
+		return false
+	}
+	for _, hook := range cfg.AllocationHooks {
+		normalized, err := normalizeHook(EventAllocation, hook)
+		if err == nil && normalized.Type == HookTypeUprobe && normalized.ABI == ABIMalloc {
+			return true
+		}
+	}
+	if cfg.Live {
+		for _, hook := range cfg.DeallocationHooks {
+			normalized, err := normalizeHook(EventDeallocation, hook)
+			if err == nil && normalized.Type == HookTypeUprobe && normalized.ABI == ABIFree {
+				return true
+			}
 		}
 	}
 	return false

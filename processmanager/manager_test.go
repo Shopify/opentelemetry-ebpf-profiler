@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
+	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -51,6 +52,26 @@ func TestReconcileMemoryProbesMarksIneligibleProcessComplete(t *testing.T) {
 	assert.False(t, manager.ShouldRetry(inst))
 }
 
+func TestReconcileMemoryProbesSkipsPendingHeapCleanup(t *testing.T) {
+	manager, err := memory.NewManager(memory.Config{Enabled: true},
+		map[memory.ProgramKind]*ebpf.Program{memory.ProgramWeightedAllocation: {}})
+	require.NoError(t, err)
+	defer manager.Close()
+
+	pid := libpf.PID(os.Getpid())
+	pm := &ProcessManager{
+		memoryProbeManager:   manager,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {lastSeenTID: pid}},
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+		heapCleanupPending:   map[libpf.PID]struct{}{pid: {}},
+		cleanupSem:           make(chan struct{}, 1),
+	}
+
+	pm.ReconcileMemoryProbes(1)
+	assert.NotContains(t, pm.memoryProbeInstances, pid,
+		"a cleanup-failed generation must not attach fresh producers")
+}
+
 func TestCloseDrainsDeferredCleanup(t *testing.T) {
 	pm := &ProcessManager{cleanupSem: make(chan struct{}, 2)}
 	var completed atomic.Uint32
@@ -63,12 +84,24 @@ func TestCloseDrainsDeferredCleanup(t *testing.T) {
 }
 
 type traceCapture struct {
-	traces []*libpf.Trace
+	traces    []*libpf.Trace
+	extraMeta any
 }
 
-func (tc *traceCapture) ReportTraceEvent(trace *libpf.Trace, _ *samples.TraceEventMeta) error {
+func (tc *traceCapture) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {
 	tc.traces = append(tc.traces, trace)
+	meta.ExtraMeta = tc.extraMeta
 	return nil
+}
+
+func TestHandleTraceWithMetadataReturnsReporterMetadata(t *testing.T) {
+	capture := &traceCapture{extraMeta: "pod-a"}
+	pm := &ProcessManager{traceReporter: capture}
+
+	_, _, extraMeta := pm.HandleTraceWithMetadata(&libpf.EbpfTrace{
+		PID: 1, TID: 1, Origin: support.TraceOriginHeapAlloc,
+	})
+	assert.Equal(t, "pod-a", extraMeta)
 }
 
 func TestFrameCacheCrossProcessPollution(t *testing.T) {

@@ -493,44 +493,95 @@ func (impl *ebpfMapsImpl) RemoveReportedPID(pid libpf.PID) {
 // SetHeapLivePID adds or removes a PID from the heap_live_pids eBPF map.
 // When present, uprobe_heap_alloc will record allocations for this PID
 // in heap_alloc_live for free correlation.
-func (impl *ebpfMapsImpl) SetHeapLivePID(pid libpf.PID, enabled bool) {
+func (impl *ebpfMapsImpl) SetHeapLivePID(pid libpf.PID, enabled bool) error {
 	if impl.HeapLivePids == nil {
-		return
+		return nil
 	}
 	key := uint32(pid)
 	if enabled {
 		val := uint8(1)
-		_ = impl.HeapLivePids.Put(unsafe.Pointer(&key), unsafe.Pointer(&val))
-	} else {
-		_ = impl.HeapLivePids.Delete(unsafe.Pointer(&key))
+		if err := impl.HeapLivePids.Put(unsafe.Pointer(&key), unsafe.Pointer(&val)); err != nil {
+			return fmt.Errorf("enable live heap tracking for PID %d: %w", pid, err)
+		}
+		return nil
 	}
+	if err := impl.HeapLivePids.Delete(unsafe.Pointer(&key)); err != nil &&
+		!errors.Is(err, cebpf.ErrKeyNotExist) {
+		return fmt.Errorf("disable live heap tracking for PID %d: %w", pid, err)
+	}
+	return nil
 }
 
-// DeleteHeapAllocLiveEntries removes entries from the heap_alloc_live map for
-// the given PID and pointers. Best-effort: errors are silently ignored.
-func (impl *ebpfMapsImpl) DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64) {
+// DeleteHeapAllocLiveEntries removes every entry from heap_alloc_live for pid.
+// ptrs is a fast path for allocations already observed in userspace; the full
+// scan also removes allocations whose ring-buffer records were delayed or lost.
+func (impl *ebpfMapsImpl) DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64) error {
 	if impl.HeapAllocLive == nil {
-		return
+		return nil
 	}
 	type heapAllocKey struct {
 		Pid uint32
 		Pad uint32
 		Ptr uint64
 	}
+	type heapAllocValue struct {
+		Weight uint64
+	}
+
 	for _, ptr := range ptrs {
 		key := heapAllocKey{Pid: uint32(pid), Ptr: ptr}
-		_ = impl.HeapAllocLive.Delete(unsafe.Pointer(&key))
+		if err := impl.HeapAllocLive.Delete(unsafe.Pointer(&key)); err != nil &&
+			!errors.Is(err, cebpf.ErrKeyNotExist) {
+			return fmt.Errorf("delete known heap_alloc_live key for PID %d: %w", pid, err)
+		}
 	}
+
+	// Do not delete while iterating: BPF_MAP_GET_NEXT_KEY restarts from the
+	// beginning when its current key disappears and can otherwise skip entries.
+	// Confirmation passes also tolerate concurrent structural changes from
+	// allocations belonging to other PIDs in this global hash map.
+	for attempt := 0; attempt < 4; attempt++ {
+		var staleKeys []heapAllocKey
+		var key heapAllocKey
+		var value heapAllocValue
+		iterator := impl.HeapAllocLive.Iterate()
+		for iterator.Next(&key, &value) {
+			if key.Pid == uint32(pid) {
+				staleKeys = append(staleKeys, key)
+			}
+		}
+		if err := iterator.Err(); err != nil {
+			return fmt.Errorf("scan heap_alloc_live while cleaning PID %d: %w", pid, err)
+		}
+		if len(staleKeys) == 0 {
+			return nil
+		}
+		if attempt == 3 {
+			return fmt.Errorf("%d heap_alloc_live entries remain for PID %d after cleanup",
+				len(staleKeys), pid)
+		}
+		for idx := range staleKeys {
+			if err := impl.HeapAllocLive.Delete(unsafe.Pointer(&staleKeys[idx])); err != nil &&
+				!errors.Is(err, cebpf.ErrKeyNotExist) {
+				return fmt.Errorf("delete heap_alloc_live key for PID %d: %w", pid, err)
+			}
+		}
+	}
+	return nil
 }
 
 // DeleteHeapPIDAllocCount removes the per-PID alloc count entry for the given PID.
 // Called on process exit to reclaim the map slot.
-func (impl *ebpfMapsImpl) DeleteHeapPIDAllocCount(pid libpf.PID) {
+func (impl *ebpfMapsImpl) DeleteHeapPIDAllocCount(pid libpf.PID) error {
 	if impl.HeapPIDAllocCount == nil {
-		return
+		return nil
 	}
 	key := uint32(pid)
-	_ = impl.HeapPIDAllocCount.Delete(unsafe.Pointer(&key))
+	if err := impl.HeapPIDAllocCount.Delete(unsafe.Pointer(&key)); err != nil &&
+		!errors.Is(err, cebpf.ErrKeyNotExist) {
+		return fmt.Errorf("delete live heap allocation count for PID %d: %w", pid, err)
+	}
+	return nil
 }
 
 // SetHeapPIDAllocLimit writes the per-PID allocation limit to the eBPF array map.

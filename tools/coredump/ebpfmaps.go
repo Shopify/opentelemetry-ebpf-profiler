@@ -266,13 +266,16 @@ func (emc *ebpfMapsCoredump) SupportsLPMTrieBatchOperations() bool {
 	return false
 }
 
-func (emc *ebpfMapsCoredump) SetHeapLivePID(_ libpf.PID, _ bool) {
+func (emc *ebpfMapsCoredump) SetHeapLivePID(_ libpf.PID, _ bool) error {
+	return nil
 }
 
-func (emc *ebpfMapsCoredump) DeleteHeapAllocLiveEntries(_ libpf.PID, _ []uint64) {
+func (emc *ebpfMapsCoredump) DeleteHeapAllocLiveEntries(_ libpf.PID, _ []uint64) error {
+	return nil
 }
 
-func (emc *ebpfMapsCoredump) DeleteHeapPIDAllocCount(_ libpf.PID) {
+func (emc *ebpfMapsCoredump) DeleteHeapPIDAllocCount(_ libpf.PID) error {
+	return nil
 }
 
 func (emc *ebpfMapsCoredump) SetHeapPIDAllocLimit(_ uint32) {

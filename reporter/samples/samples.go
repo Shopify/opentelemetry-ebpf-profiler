@@ -8,6 +8,11 @@ import (
 )
 
 type TraceEventMeta struct {
+	// ExtraMeta is allocation-time metadata produced by SampleAttrProducer.
+	// ReportTraceEvent populates it before returning so stateful consumers such
+	// as live-heap tracking can retain the same sample attributes.
+	ExtraMeta any
+
 	Comm           libpf.Comm
 	ProcessName    libpf.String
 	ExecutablePath libpf.String

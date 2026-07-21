@@ -39,6 +39,48 @@ func loadTracers(t *testing.T) *ebpfMapsImpl {
 	}
 }
 
+func TestDeleteHeapAllocLiveEntriesPurgesUnobservedPointers(t *testing.T) {
+	restoreRlimit, err := rlimit.MaximizeMemlock()
+	require.NoError(t, err)
+	defer restoreRlimit()
+
+	heapMap, err := cebpf.NewMap(&cebpf.MapSpec{
+		Name:       "test_heap_alloc_live",
+		Type:       cebpf.Hash,
+		KeySize:    16,
+		ValueSize:  8,
+		MaxEntries: 16,
+	})
+	require.NoError(t, err)
+	defer heapMap.Close()
+
+	type heapAllocKey struct {
+		Pid uint32
+		Pad uint32
+		Ptr uint64
+	}
+	const targetPID = libpf.PID(42)
+	keys := []heapAllocKey{
+		{Pid: uint32(targetPID), Ptr: 0xaaa},
+		{Pid: uint32(targetPID), Ptr: 0xbbb},
+		{Pid: 99, Ptr: 0xccc},
+	}
+	for _, key := range keys {
+		require.NoError(t, heapMap.Put(key, uint64(512)))
+	}
+
+	impl := &ebpfMapsImpl{HeapAllocLive: heapMap}
+	// Only 0xaaa reached the userspace tracker. The map scan must also find
+	// 0xbbb while retaining another process's allocation.
+	require.NoError(t, impl.DeleteHeapAllocLiveEntries(targetPID, []uint64{0xaaa}))
+
+	var value uint64
+	assert.ErrorIs(t, heapMap.Lookup(keys[0], &value), cebpf.ErrKeyNotExist)
+	assert.ErrorIs(t, heapMap.Lookup(keys[1], &value), cebpf.ErrKeyNotExist)
+	require.NoError(t, heapMap.Lookup(keys[2], &value))
+	assert.Equal(t, uint64(512), value)
+}
+
 func TestLPM(t *testing.T) {
 	tests := map[string]struct {
 		pid      libpf.PID

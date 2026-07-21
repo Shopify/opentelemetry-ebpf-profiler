@@ -3,7 +3,13 @@ package processmanager // import "go.opentelemetry.io/ebpf-profiler/processmanag
 import (
 	"debug/elf"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/stretchr/testify/assert"
@@ -17,6 +23,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
@@ -66,6 +73,7 @@ func (td *testInterpreterData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PI
 func (td *testInterpreterData) Unload(interpreter.EbpfHandler) {}
 
 type testEbpfHandler struct {
+	removedReportedPIDs       []libpf.PID
 	pidPageMappingInfoUpdates []struct {
 		pid    libpf.PID
 		prefix lpm.Prefix
@@ -76,7 +84,14 @@ type testEbpfHandler struct {
 		pid     libpf.PID
 		enabled bool
 	}
+	heapLivePIDErr           error
 	heapPIDAllocCountDeletes []libpf.PID
+	heapPIDAllocCountErr     error
+	heapCleanupOperations    []string
+	heapDeleteStarted        chan struct{}
+	heapDeleteRelease        chan struct{}
+	heapDeletePanic          bool
+	heapDeleteErr            error
 	heapAllocLiveDeletes     []struct {
 		pid  libpf.PID
 		ptrs []uint64
@@ -105,7 +120,9 @@ func (h *testEbpfHandler) DeletePidInterpreterMapping(libpf.PID, lpm.Prefix) err
 	return nil
 }
 
-func (h *testEbpfHandler) RemoveReportedPID(libpf.PID) {}
+func (h *testEbpfHandler) RemoveReportedPID(pid libpf.PID) {
+	h.removedReportedPIDs = append(h.removedReportedPIDs, pid)
+}
 
 func (h *testEbpfHandler) CoredumpTest() bool { return false }
 
@@ -155,30 +172,44 @@ func (h *testEbpfHandler) SupportsLPMTrieBatchOperations() bool {
 	return false
 }
 
-func (h *testEbpfHandler) SetHeapLivePID(pid libpf.PID, enabled bool) {
+func (h *testEbpfHandler) SetHeapLivePID(pid libpf.PID, enabled bool) error {
 	h.heapLivePIDUpdates = append(h.heapLivePIDUpdates, struct {
 		pid     libpf.PID
 		enabled bool
 	}{pid: pid, enabled: enabled})
+	return h.heapLivePIDErr
 }
 
-func (h *testEbpfHandler) DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64) {
+func (h *testEbpfHandler) DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64) error {
+	if h.heapDeleteStarted != nil {
+		close(h.heapDeleteStarted)
+		<-h.heapDeleteRelease
+	}
+	if h.heapDeletePanic {
+		panic("synthetic heap map cleanup panic")
+	}
+	h.heapCleanupOperations = append(h.heapCleanupOperations, "live entries")
 	h.heapAllocLiveDeletes = append(h.heapAllocLiveDeletes, struct {
 		pid  libpf.PID
 		ptrs []uint64
 	}{pid: pid, ptrs: append([]uint64(nil), ptrs...)})
+	return h.heapDeleteErr
 }
 
-func (h *testEbpfHandler) DeleteHeapPIDAllocCount(pid libpf.PID) {
+func (h *testEbpfHandler) DeleteHeapPIDAllocCount(pid libpf.PID) error {
+	h.heapCleanupOperations = append(h.heapCleanupOperations, "PID count")
 	h.heapPIDAllocCountDeletes = append(h.heapPIDAllocCountDeletes, pid)
+	return h.heapPIDAllocCountErr
 }
 
 func (h *testEbpfHandler) SetHeapPIDAllocLimit(uint32)    {}
 func (h *testEbpfHandler) SetHeapSamplingInterval(uint32) {}
 
 type testProcess struct {
-	pid      libpf.PID
-	mappings []process.RawMapping
+	pid           libpf.PID
+	exe           libpf.String
+	mappings      []process.RawMapping
+	beforeIterate func()
 }
 
 func (tp *testProcess) PID() libpf.PID {
@@ -198,10 +229,13 @@ func (tp *testProcess) GetProcessMeta(process.MetaConfig) process.ProcessMeta {
 }
 
 func (tp *testProcess) GetExe() (libpf.String, error) {
-	return libpf.NullString, nil
+	return tp.exe, nil
 }
 
 func (tp *testProcess) IterateMappings(callback func(process.RawMapping) bool) (uint32, error) {
+	if tp.beforeIterate != nil {
+		tp.beforeIterate()
+	}
 	for _, m := range tp.mappings {
 		if !callback(m) {
 			return 0, process.ErrCallbackStopped
@@ -436,6 +470,85 @@ func TestProcessPIDExitRemovesInterpreters(t *testing.T) {
 	require.NotContains(pm.interpreters, pid)
 }
 
+func TestPublishMemoryProbeStateRejectsExitingGeneration(t *testing.T) {
+	pid := libpf.PID(123)
+	instance := memory.NewInstance(pid)
+	ebpf := &testEbpfHandler{}
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:           map[libpf.PID]times.KTime{pid: 1},
+		memoryProbeInstances: map[libpf.PID]*memory.Instance{pid: instance},
+		liveHeapTracker:      liveheap.NewTracker(0),
+	}
+
+	assert.False(t, pm.publishMemoryProbeState(pid, instance))
+	assert.NotContains(t, pm.memoryProbeInstances, pid)
+	assert.Empty(t, ebpf.heapLivePIDUpdates,
+		"a stale reconciliation must not re-enable live tracking after exit")
+}
+
+func TestPublishMemoryProbeStatePreservesExecInjectionGuard(t *testing.T) {
+	pid := libpf.PID(123)
+	instance := memory.NewInstance(pid)
+	pm := &ProcessManager{
+		ebpf:                 &testEbpfHandler{},
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:           make(map[libpf.PID]times.KTime),
+		heapCleanupPending:   map[libpf.PID]struct{}{pid: {}},
+		memoryProbeInstances: map[libpf.PID]*memory.Instance{pid: instance},
+		liveHeapTracker:      liveheap.NewTracker(0),
+	}
+
+	assert.False(t, pm.publishMemoryProbeState(pid, instance))
+	assert.Same(t, instance, pm.memoryProbeInstances[pid],
+		"exec cleanup must retain the Instance and its one-shot injection guard")
+}
+
+func TestDeleteHeapLiveStatePreservesCountOnPointerCleanupFailure(t *testing.T) {
+	ebpf := &testEbpfHandler{heapDeleteErr: errors.New("synthetic delete failure")}
+	pm := &ProcessManager{ebpf: ebpf}
+
+	assert.False(t, pm.deleteHeapLiveState(123, []uint64{0xdeadbeef}))
+	assert.Empty(t, ebpf.heapPIDAllocCountDeletes,
+		"clearing the count after pointer cleanup fails would corrupt PID reuse")
+	assert.Equal(t, []string{"live entries"}, ebpf.heapCleanupOperations)
+}
+
+func TestDeleteHeapLiveStateReportsCountCleanupFailure(t *testing.T) {
+	ebpf := &testEbpfHandler{heapPIDAllocCountErr: errors.New("synthetic count delete failure")}
+	pm := &ProcessManager{ebpf: ebpf}
+
+	assert.False(t, pm.deleteHeapLiveState(123, []uint64{0xdeadbeef}))
+	assert.Equal(t, []string{"live entries", "PID count"}, ebpf.heapCleanupOperations)
+	assert.Equal(t, []libpf.PID{123}, ebpf.heapPIDAllocCountDeletes)
+}
+
+func TestPublishMemoryProbeStateCleansLiveStateWhenFreeHookIsLost(t *testing.T) {
+	pid := libpf.PID(123)
+	instance := memory.NewInstance(pid)
+	ebpf := &testEbpfHandler{}
+	tracker := liveheap.NewTracker(0)
+	tracker.SetPIDLiveHeapSupport(pid, true)
+	tracker.HandleAlloc(pid, 0xdeadbeef, libpf.NewTraceHash(0, 1), 100, nil)
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:           make(map[libpf.PID]times.KTime),
+		heapCleanupPending:   make(map[libpf.PID]struct{}),
+		memoryProbeInstances: map[libpf.PID]*memory.Instance{pid: instance},
+		liveHeapTracker:      tracker,
+	}
+
+	assert.True(t, pm.publishMemoryProbeState(pid, instance))
+	assert.Empty(t, tracker.Snapshot(),
+		"allocations cannot remain live after their free producer detaches")
+	assert.Equal(t, []string{"live entries", "PID count"}, ebpf.heapCleanupOperations)
+	assert.Same(t, instance, pm.memoryProbeInstances[pid])
+	require.Len(t, ebpf.heapLivePIDUpdates, 1)
+	assert.False(t, ebpf.heapLivePIDUpdates[0].enabled)
+}
+
 func TestProcessPIDExitCleansLiveHeapState(t *testing.T) {
 	pid := libpf.PID(123)
 	const ptr = uint64(0xdeadbeef)
@@ -445,26 +558,333 @@ func TestProcessPIDExitCleansLiveHeapState(t *testing.T) {
 	tracker.HandleAlloc(pid, ptr, libpf.NewTraceHash(0, 1), 100, nil)
 	require.Equal(t, 1, tracker.LiveCount())
 	pm := &ProcessManager{
-		ebpf:             ebpf,
-		pidToProcessInfo: map[libpf.PID]*processInfo{pid: {}},
-		exitEvents:       make(map[libpf.PID]times.KTime),
-		interpreters:     make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
-		liveHeapTracker:  tracker,
-		cleanupSem:       make(chan struct{}, 1),
+		ebpf:                 ebpf,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:           make(map[libpf.PID]times.KTime),
+		interpreters:         make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
+		memoryProbeInstances: map[libpf.PID]*memory.Instance{pid: memory.NewInstance(pid)},
+		liveHeapTracker:      tracker,
+		cleanupSem:           make(chan struct{}, 1),
 	}
 
 	pm.processPIDExit(pid)
 	pm.cleanupWG.Wait()
 
 	assert.Zero(t, tracker.LiveCount())
+	assert.NotContains(t, pm.memoryProbeInstances, pid,
+		"a reused PID must not inherit probe applicability or injection state")
 	assert.Equal(t, []struct {
 		pid     libpf.PID
 		enabled bool
 	}{{pid: pid, enabled: false}}, ebpf.heapLivePIDUpdates)
 	assert.Equal(t, []libpf.PID{pid}, ebpf.heapPIDAllocCountDeletes)
+	assert.Equal(t, []string{"live entries", "PID count"}, ebpf.heapCleanupOperations,
+		"stale pointer keys must be deleted before the per-PID count")
 	require.Len(t, ebpf.heapAllocLiveDeletes, 1)
 	assert.Equal(t, pid, ebpf.heapAllocLiveDeletes[0].pid)
 	assert.Equal(t, []uint64{ptr}, ebpf.heapAllocLiveDeletes[0].ptrs)
+}
+
+func TestProcessPIDExitSkipsHeapMapScanForUnsupportedPID(t *testing.T) {
+	pid := libpf.PID(123)
+	ebpf := &testEbpfHandler{}
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:           make(map[libpf.PID]times.KTime),
+		interpreters:         make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
+		liveHeapTracker:      liveheap.NewTracker(0),
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+	}
+
+	pm.processPIDExit(pid)
+
+	assert.Empty(t, ebpf.heapAllocLiveDeletes,
+		"unrelated process exits must not scan the global live-allocation map")
+	assert.Empty(t, ebpf.heapPIDAllocCountDeletes)
+}
+
+func TestProcessPIDExitScansHeapMapWithoutTrackedPointers(t *testing.T) {
+	pid := libpf.PID(123)
+	ebpf := &testEbpfHandler{}
+	tracker := liveheap.NewTracker(0)
+	tracker.SetPIDLiveHeapSupport(pid, true)
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:           make(map[libpf.PID]times.KTime),
+		interpreters:         make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
+		liveHeapTracker:      tracker,
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+	}
+
+	pm.processPIDExit(pid)
+
+	require.Len(t, ebpf.heapAllocLiveDeletes, 1,
+		"process exit must scan eBPF state even when no allocation record reached userspace")
+	assert.Equal(t, pid, ebpf.heapAllocLiveDeletes[0].pid)
+	assert.Empty(t, ebpf.heapAllocLiveDeletes[0].ptrs)
+	assert.Equal(t, []string{"live entries", "PID count"}, ebpf.heapCleanupOperations)
+}
+
+func TestProcessPIDExitRetainsBarrierWhenLiveDisableFails(t *testing.T) {
+	pid := libpf.PID(123)
+	ebpf := &testEbpfHandler{heapLivePIDErr: errors.New("synthetic disable failure")}
+	tracker := liveheap.NewTracker(0)
+	tracker.SetPIDLiveHeapSupport(pid, true)
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:           make(map[libpf.PID]times.KTime),
+		interpreters:         make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
+		liveHeapTracker:      tracker,
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+		heapCleanupPending:   make(map[libpf.PID]struct{}),
+	}
+
+	pm.processPIDExit(pid)
+
+	assert.Contains(t, pm.heapCleanupPending, pid)
+	assert.Empty(t, ebpf.heapAllocLiveDeletes)
+	assert.Empty(t, ebpf.heapPIDAllocCountDeletes)
+	pm.ProcessedUntil(times.GetKTime())
+	assert.Contains(t, pm.pidToProcessInfo, pid,
+		"PID generation must remain tombstoned when insertion could not be disabled")
+}
+
+func TestProcessPIDExitCleanupPanicLeavesManagerMutexUsable(t *testing.T) {
+	pid := libpf.PID(123)
+	ebpf := &testEbpfHandler{heapDeletePanic: true}
+	tracker := liveheap.NewTracker(0)
+	tracker.SetPIDLiveHeapSupport(pid, true)
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:           make(map[libpf.PID]times.KTime),
+		interpreters:         make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
+		liveHeapTracker:      tracker,
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+	}
+
+	assert.PanicsWithValue(t, "synthetic heap map cleanup panic", func() {
+		pm.processPIDExit(pid)
+	})
+	pm.mu.Lock()
+	pm.mu.Unlock()
+	assert.Contains(t, pm.heapCleanupPending, pid,
+		"panic recovery must fail closed for the affected PID generation")
+	pm.ProcessedUntil(times.GetKTime())
+	assert.Contains(t, pm.pidToProcessInfo, pid,
+		"a cleanup panic must not release the PID generation for reuse")
+}
+
+func TestResetMemoryProbeStateForExecClearsOldAddressSpace(t *testing.T) {
+	pid := libpf.PID(123)
+	ebpf := &testEbpfHandler{}
+	tracker := liveheap.NewTracker(0)
+	tracker.SetPIDLiveHeapSupport(pid, true)
+	tracker.HandleAlloc(pid, 0xdeadbeef, libpf.NewTraceHash(0, 1), 100, nil)
+	previous := memory.NewInstance(pid)
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		memoryProbeInstances: map[libpf.PID]*memory.Instance{pid: previous},
+		heapCleanupPending:   make(map[libpf.PID]struct{}),
+		liveHeapTracker:      tracker,
+	}
+
+	assert.True(t, pm.resetMemoryProbeStateForExec(pid))
+
+	assert.Same(t, previous, pm.memoryProbeInstances[pid],
+		"exec cleanup must preserve the PID's one-shot injection guard")
+	assert.NotContains(t, pm.heapCleanupPending, pid)
+	assert.Empty(t, tracker.Snapshot(), "pre-exec allocations belong to the old address space")
+	assert.Equal(t, []string{"live entries", "PID count"}, ebpf.heapCleanupOperations)
+	require.Len(t, ebpf.heapLivePIDUpdates, 1)
+	assert.False(t, ebpf.heapLivePIDUpdates[0].enabled)
+}
+
+func TestResetMemoryProbeStateForExecRetainsBarrierOnMapFailure(t *testing.T) {
+	pid := libpf.PID(123)
+	ebpf := &testEbpfHandler{heapDeleteErr: errors.New("synthetic delete failure")}
+	tracker := liveheap.NewTracker(0)
+	tracker.SetPIDLiveHeapSupport(pid, true)
+	tracker.HandleAlloc(pid, 0xdeadbeef, libpf.NewTraceHash(0, 1), 100, nil)
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		memoryProbeInstances: map[libpf.PID]*memory.Instance{pid: memory.NewInstance(pid)},
+		heapCleanupPending:   make(map[libpf.PID]struct{}),
+		liveHeapTracker:      tracker,
+	}
+
+	assert.False(t, pm.resetMemoryProbeStateForExec(pid))
+	assert.Contains(t, pm.heapCleanupPending, pid,
+		"failed cleanup must block the replacement image from publishing live state")
+	assert.Empty(t, ebpf.heapPIDAllocCountDeletes)
+}
+
+func TestResetMemoryProbeStateForExecRetainsBarrierOnDisableFailure(t *testing.T) {
+	pid := libpf.PID(123)
+	ebpf := &testEbpfHandler{heapLivePIDErr: errors.New("synthetic disable failure")}
+	tracker := liveheap.NewTracker(0)
+	tracker.SetPIDLiveHeapSupport(pid, true)
+	tracker.HandleAlloc(pid, 0xdeadbeef, libpf.NewTraceHash(0, 1), 100, nil)
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		memoryProbeInstances: map[libpf.PID]*memory.Instance{pid: memory.NewInstance(pid)},
+		heapCleanupPending:   make(map[libpf.PID]struct{}),
+		liveHeapTracker:      tracker,
+	}
+
+	assert.False(t, pm.resetMemoryProbeStateForExec(pid))
+	assert.Contains(t, pm.heapCleanupPending, pid)
+	assert.Empty(t, ebpf.heapAllocLiveDeletes,
+		"pointer cleanup cannot be race-free until kernel insertion is disabled")
+	assert.Empty(t, ebpf.heapPIDAllocCountDeletes)
+}
+
+func TestSynchronizeProcessDefersMemoryProbesWithoutImageIdentity(t *testing.T) {
+	pid := libpf.PID(99_999_999)
+	ebpf := &testEbpfHandler{}
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		memoryProbeManager:   &memory.Manager{},
+		pidToProcessInfo:     make(map[libpf.PID]*processInfo),
+		exitEvents:           make(map[libpf.PID]times.KTime),
+		interpreters:         make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+		heapCleanupPending:   make(map[libpf.PID]struct{}),
+	}
+
+	pm.SynchronizeProcess(&testProcess{pid: pid})
+	assert.Contains(t, ebpf.removedReportedPIDs, pid)
+	assert.Contains(t, pm.pidToProcessInfo, pid,
+		"identity failures must not suppress generic process synchronization")
+	assert.NotContains(t, pm.memoryProbeInstances, pid,
+		"an unverified process generation must not publish memory hooks")
+}
+
+func TestSynchronizeProcessRejectsExecDuringMappingScan(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("process image identity is read from Linux procfs")
+	}
+
+	cmd := exec.Command("sh", "-c", "read _; exec sleep 30")
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	pid := libpf.PID(cmd.Process.Pid)
+	initialIdentity, err := readProcessImageIdentity(pid)
+	require.NoError(t, err)
+	initialExecutable, err := os.Readlink("/proc/" + stringPID(pid) + "/exe")
+	require.NoError(t, err)
+	if strings.Contains(initialExecutable, "rosetta") || strings.Contains(initialExecutable, "qemu") {
+		t.Skip("userspace architecture emulation masks exec identity in /proc/PID/exe")
+	}
+
+	sentinelMappings := []Mapping{{Vaddr: 0x1234, Length: 0x1000}}
+	ebpf := &testEbpfHandler{}
+	pm := &ProcessManager{
+		ebpf:               ebpf,
+		memoryProbeManager: &memory.Manager{},
+		pidToProcessInfo: map[libpf.PID]*processInfo{pid: {
+			meta:     process.ProcessMeta{Executable: libpf.Intern(initialExecutable)},
+			mappings: sentinelMappings, imageIdentity: initialIdentity,
+		}},
+		exitEvents: make(map[libpf.PID]times.KTime),
+	}
+	pr := &testProcess{
+		pid: pid,
+		exe: libpf.Intern(initialExecutable),
+		beforeIterate: func() {
+			_, writeErr := stdin.Write([]byte("go\n"))
+			require.NoError(t, writeErr)
+			require.NoError(t, stdin.Close())
+			require.Eventually(t, func() bool {
+				target, readErr := os.Readlink("/proc/" + stringPID(pid) + "/exe")
+				return readErr == nil && strings.HasSuffix(target, "/sleep")
+			}, 2*time.Second, time.Millisecond)
+		},
+	}
+
+	pm.SynchronizeProcess(pr)
+	assert.Contains(t, ebpf.removedReportedPIDs, pid)
+	require.Equal(t, sentinelMappings, pm.pidToProcessInfo[pid].mappings,
+		"a mapping view spanning exec must not replace the prior generation")
+	assert.Equal(t, initialIdentity, pm.pidToProcessInfo[pid].imageIdentity)
+}
+
+func stringPID(pid libpf.PID) string {
+	return fmt.Sprintf("%d", pid)
+}
+
+func TestReadProcessImageIdentityIsStable(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("process image identity is read from Linux procfs")
+	}
+	first, err := readProcessImageIdentity(libpf.PID(os.Getpid()))
+	require.NoError(t, err)
+	second, err := readProcessImageIdentity(libpf.PID(os.Getpid()))
+	require.NoError(t, err)
+	assert.True(t, first.valid)
+	assert.NotZero(t, first.processStartTime)
+	assert.Equal(t, first, second)
+}
+
+func TestProcessPIDExitReleasesManagerLockDuringHeapMapCleanup(t *testing.T) {
+	pid := libpf.PID(123)
+	ebpf := &testEbpfHandler{
+		heapDeleteStarted: make(chan struct{}),
+		heapDeleteRelease: make(chan struct{}),
+	}
+	tracker := liveheap.NewTracker(0)
+	tracker.SetPIDLiveHeapSupport(pid, true)
+	tracker.HandleAlloc(pid, 0xdeadbeef, libpf.NewTraceHash(0, 1), 100, nil)
+	pm := &ProcessManager{
+		ebpf:                 ebpf,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {}},
+		exitEvents:           make(map[libpf.PID]times.KTime),
+		heapCleanupPending:   make(map[libpf.PID]struct{}),
+		interpreters:         make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
+		liveHeapTracker:      tracker,
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+	}
+
+	exitDone := make(chan struct{})
+	go func() {
+		pm.processPIDExit(pid)
+		close(exitDone)
+	}()
+	<-ebpf.heapDeleteStarted
+
+	pm.mu.RLock()
+	exitKTime := pm.exitEvents[pid]
+	_, cleanupPending := pm.heapCleanupPending[pid]
+	pm.mu.RUnlock()
+	assert.True(t, cleanupPending, "heap cleanup tombstone must protect the PID generation")
+
+	processed := make(chan struct{})
+	go func() {
+		pm.ProcessedUntil(exitKTime)
+		close(processed)
+	}()
+	select {
+	case <-processed:
+	case <-time.After(time.Second):
+		t.Fatal("heap map cleanup held the process-manager lock")
+	}
+	assert.Contains(t, pm.exitEvents, pid,
+		"ProcessedUntil must retain a PID while heap cleanup is pending")
+
+	close(ebpf.heapDeleteRelease)
+	<-exitDone
+	pm.ProcessedUntil(exitKTime)
+	assert.NotContains(t, pm.exitEvents, pid)
+	assert.NotContains(t, pm.pidToProcessInfo, pid)
 }
 
 func TestSynchronizeProcessUpdatesAnonymousMappingInterest(t *testing.T) {

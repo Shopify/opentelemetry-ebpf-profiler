@@ -82,8 +82,10 @@ func newAllocatorInjector(path string, mode InjectionMode,
 	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
 		return nil, fmt.Errorf("fstat experimental allocator shim %q: %w", path, err)
 	}
-	if os.Geteuid() == 0 && stat.Uid != 0 {
-		return nil, fmt.Errorf("experimental allocator shim %q must be root-owned when profiler runs as root", path)
+	euid := uint32(os.Geteuid())
+	if !trustedShimOwner(stat.Uid, euid) {
+		return nil, fmt.Errorf("experimental allocator shim %q must be owned by root or profiler uid %d, got uid %d",
+			path, euid, stat.Uid)
 	}
 	if info.Size() <= 0 || info.Size() > maxExperimentalShimSize {
 		return nil, fmt.Errorf("experimental allocator shim %q has invalid size %d", path, info.Size())
@@ -119,6 +121,10 @@ func newAllocatorInjector(path string, mode InjectionMode,
 	}, nil
 }
 
+func trustedShimOwner(fileUID, profilerUID uint32) bool {
+	return fileUID == 0 || fileUID == profilerUID
+}
+
 func validateExperimentalShimSymbols(parsed *elf.File, mode InjectionMode) error {
 	required := map[string]bool{
 		"malloc":                               false,
@@ -136,7 +142,8 @@ func validateExperimentalShimSymbols(parsed *elf.File, mode InjectionMode) error
 		return fmt.Errorf("read dynamic symbols: %w", err)
 	}
 	for _, symbol := range symbols {
-		if _, wanted := required[symbol.Name]; wanted && symbol.Section != elf.SHN_UNDEF {
+		if _, wanted := required[symbol.Name]; wanted && symbol.Section != elf.SHN_UNDEF &&
+			elf.ST_TYPE(symbol.Info) == elf.STT_FUNC {
 			required[symbol.Name] = true
 		}
 	}
@@ -165,6 +172,7 @@ func validateExperimentalShimProbes(shim []byte) error {
 	}
 
 	required := map[string]bool{"alloc": false, "free": false}
+	semaphoreOffsets := make(map[string]uint64, len(required))
 	for _, probe := range probes {
 		if probe.Provider != ExperimentalShimProvider {
 			continue
@@ -176,13 +184,21 @@ func validateExperimentalShimProbes(shim []byte) error {
 			return fmt.Errorf("USDT probe %s:%s has no semaphore offset",
 				probe.Provider, probe.Name)
 		}
+		if len(shim) < 2 || probe.SemaphoreOffset > uint64(len(shim)-2) {
+			return fmt.Errorf("USDT probe %s:%s semaphore offset %#x is outside the shim",
+				probe.Provider, probe.Name, probe.SemaphoreOffset)
+		}
 		required[probe.Name] = true
+		semaphoreOffsets[probe.Name] = probe.SemaphoreOffset
 	}
 	for name, found := range required {
 		if !found {
 			return fmt.Errorf("missing semaphore-gated USDT probe %s:%s",
 				ExperimentalShimProvider, name)
 		}
+	}
+	if semaphoreOffsets["alloc"] == semaphoreOffsets["free"] {
+		return errors.New("allocation and free USDT probes share one semaphore")
 	}
 	return nil
 }
@@ -210,6 +226,89 @@ func validateOpenedShimMemfd(file *os.File, stat *unix.Stat_t) error {
 	return nil
 }
 
+type targetExecutableIdentity struct {
+	path      string
+	device    uint64
+	inode     uint64
+	startTime uint64
+}
+
+func readProcessStartTime(pid int) (uint64, error) {
+	contents, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	// comm is parenthesized and may contain spaces or ')'. Fields after the
+	// final ')' begin at field 3; starttime is field 22, hence offset 19.
+	commEnd := bytes.LastIndexByte(contents, ')')
+	if commEnd < 0 {
+		return 0, errors.New("process stat has no closing comm parenthesis")
+	}
+	fields := strings.Fields(string(contents[commEnd+1:]))
+	if len(fields) <= 19 {
+		return 0, fmt.Errorf("process stat has %d fields after comm, need 20", len(fields))
+	}
+	startTime, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse process start time: %w", err)
+	}
+	return startTime, nil
+}
+
+func readTargetExecutableIdentity(pid int) (targetExecutableIdentity, error) {
+	startBefore, err := readProcessStartTime(pid)
+	if err != nil {
+		return targetExecutableIdentity{}, fmt.Errorf("read process start time: %w", err)
+	}
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+	resolved, err := os.Readlink(exePath)
+	if err != nil {
+		return targetExecutableIdentity{}, fmt.Errorf("read process executable path: %w", err)
+	}
+	file, err := os.Open(exePath)
+	if err != nil {
+		return targetExecutableIdentity{}, fmt.Errorf("open process executable: %w", err)
+	}
+	defer file.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return targetExecutableIdentity{}, fmt.Errorf("stat process executable: %w", err)
+	}
+	startAfter, err := readProcessStartTime(pid)
+	if err != nil {
+		return targetExecutableIdentity{}, fmt.Errorf("re-read process start time: %w", err)
+	}
+	if startBefore != startAfter {
+		return targetExecutableIdentity{}, errors.New("process identity changed while reading executable")
+	}
+	return targetExecutableIdentity{
+		path: resolved, device: uint64(stat.Dev), inode: stat.Ino, startTime: startAfter,
+	}, nil
+}
+
+func sameTargetExecutable(first, second targetExecutableIdentity) bool {
+	return first.path == second.path && first.device == second.device &&
+		first.inode == second.inode && first.startTime == second.startTime
+}
+
+func validateExistingShimMapping(pid int, mapping processMapping, expected []byte) error {
+	mappingPath := fmt.Sprintf("/proc/%d/map_files/%x-%x", pid, mapping.start, mapping.end)
+	file, err := os.Open(mappingPath)
+	if err != nil {
+		return fmt.Errorf("open claimed existing shim mapping %s: %w", mappingPath, err)
+	}
+	defer file.Close()
+	contents, err := io.ReadAll(io.LimitReader(file, maxExperimentalShimSize+1))
+	if err != nil {
+		return fmt.Errorf("read claimed existing shim mapping %s: %w", mappingPath, err)
+	}
+	if !bytes.Equal(contents, expected) {
+		return fmt.Errorf("claimed existing shim mapping %s does not match configured shim image",
+			mappingPath)
+	}
+	return nil
+}
+
 func sealOpenedShimMemfd(file *os.File) error {
 	if file == nil {
 		return errors.New("missing opened memfd")
@@ -227,31 +326,23 @@ func sealOpenedShimMemfd(file *os.File) error {
 	return nil
 }
 
-func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult, retErr error) {
+func (i *ptraceAllocatorInjector) Inject(pid libpf.PID,
+	expectedExecutable libpf.String,
+) (result InjectionResult, retErr error) {
 	// Linux records ptrace ownership at thread granularity. Keep every attach,
 	// wait, register operation, and detach on one tracer thread.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	leader := int(pid)
-	mappings, err := readProcessMappings(leader)
+	initialIdentity, err := readTargetExecutableIdentity(leader)
 	if err != nil {
-		return result, fmt.Errorf("read target mappings before injection: %w", err)
+		return result, fmt.Errorf("read target identity before injection: %w", err)
 	}
-	for _, mapping := range mappings {
-		if isExperimentalShimMapping(mapping) {
-			result.AlreadyPresent = true
-			return result, nil
-		}
-	}
-
-	syscallAddr, err := resolveProcessSymbol(leader, "syscall", isAllocatorRuntimeMapping)
-	if err != nil {
-		return result, fmt.Errorf("resolve libc syscall: %w", err)
-	}
-	dlopenAddr, err := resolveProcessSymbol(leader, "dlopen", isAllocatorRuntimeMapping)
-	if err != nil {
-		return result, fmt.Errorf("resolve dlopen: %w", err)
+	if expectedExecutable == libpf.NullString ||
+		initialIdentity.path != expectedExecutable.String() {
+		return result, fmt.Errorf("target executable changed before injection: expected %q, got %q",
+			expectedExecutable.String(), initialIdentity.path)
 	}
 
 	// Keep other threads running while invoking the dynamic loader. Stopping all
@@ -266,6 +357,44 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 			retErr = errors.Join(retErr, closeErr)
 		}
 	}()
+
+	stoppedIdentity, err := readTargetExecutableIdentity(leader)
+	if err != nil {
+		return result, fmt.Errorf("verify stopped target identity: %w", err)
+	}
+	if !sameTargetExecutable(initialIdentity, stoppedIdentity) {
+		return result, fmt.Errorf("target executable changed before ptrace mutation: "+
+			"before=%q dev=%d ino=%d start=%d stopped=%q dev=%d ino=%d start=%d",
+			initialIdentity.path, initialIdentity.device, initialIdentity.inode,
+			initialIdentity.startTime, stoppedIdentity.path, stoppedIdentity.device,
+			stoppedIdentity.inode, stoppedIdentity.startTime)
+	}
+
+	mappings, err := readProcessMappings(leader)
+	if err != nil {
+		return result, fmt.Errorf("read stopped target mappings before injection: %w", err)
+	}
+	for _, mapping := range mappings {
+		if !isExperimentalShimMapping(mapping) {
+			continue
+		}
+		if err := validateExistingShimMapping(leader, mapping, i.shim); err != nil {
+			return result, err
+		}
+		result.AlreadyPresent = true
+		return result, nil
+	}
+
+	// Resolve remote call sites only after stopping and revalidating the leader;
+	// pre-attach addresses can refer to a replaced process image after exec/PID reuse.
+	syscallAddr, err := resolveProcessSymbol(leader, "syscall", isAllocatorRuntimeMapping)
+	if err != nil {
+		return result, fmt.Errorf("resolve libc syscall: %w", err)
+	}
+	dlopenAddr, err := resolveProcessSymbol(leader, "dlopen", isAllocatorRuntimeMapping)
+	if err != nil {
+		return result, fmt.Errorf("resolve dlopen: %w", err)
+	}
 
 	fdValue, err := session.CallWithData(syscallAddr,
 		[]uint64{remoteSysMemfdCreate, 0, remoteMfdFlags}, 1,
@@ -313,7 +442,7 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 
 	fdOpen := true
 	defer func() {
-		if fdOpen && session != nil && !session.closed {
+		if fdOpen && session != nil && !session.closed && len(session.unsafeToDetach) == 0 {
 			if _, err := session.Call(syscallAddr, remoteSysClose, uint64(fd)); err != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("close target shim memfd: %w", err))
 			}
@@ -394,6 +523,32 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 		}
 	}()
 
+	// Detaching the loader session creates an exec window. Revalidate both the
+	// selected executable and the exact injected memfd mapping while every target
+	// thread is stopped before calling the previously resolved inline installer.
+	inlineIdentity, err := readTargetExecutableIdentity(leader)
+	if err != nil {
+		return result, fmt.Errorf("verify inline target identity: %w", err)
+	}
+	if !sameTargetExecutable(initialIdentity, inlineIdentity) {
+		return result, errors.New("target executable changed before inline mutation")
+	}
+	inlineMappings, err := readProcessMappings(leader)
+	if err != nil {
+		return result, fmt.Errorf("read stopped target mappings before inline mutation: %w", err)
+	}
+	installerStillMapped := false
+	for _, mapping := range inlineMappings {
+		if injectedShimMapping(mapping) && installInline >= mapping.start &&
+			installInline < mapping.end {
+			installerStillMapped = true
+			break
+		}
+	}
+	if !installerStillMapped {
+		return result, errors.New("injected inline installer mapping changed before mutation")
+	}
+
 	inlineStatus, err := allSession.Call(installInline, requireFree)
 	if err != nil {
 		return result, fmt.Errorf("invoke injected inline installer: %w", err)
@@ -411,9 +566,11 @@ func (i *ptraceAllocatorInjector) Inject(pid libpf.PID) (result InjectionResult,
 }
 
 type ptraceSession struct {
-	leader  int
-	threads []int
-	closed  bool
+	leader         int
+	threads        []int
+	detachSignals  map[int][]unix.Signal
+	unsafeToDetach map[int]struct{}
+	closed         bool
 }
 
 func attachThreads(leader int, tids []int) (*ptraceSession, error) {
@@ -483,26 +640,47 @@ func (s *ptraceSession) attachThread(tid int) error {
 	// Track the relationship immediately so error cleanup at least attempts to
 	// detach a thread whose stop notification is delayed or lost.
 	s.threads = append(s.threads, tid)
-	status, stopped, err := pollWaitStatus(tid, remoteCallTimeout)
-	if err != nil {
-		return fmt.Errorf("wait for ptrace stop tid %d: %w", tid, err)
-	}
-	if !stopped {
-		// PTRACE_ATTACH normally supplies SIGSTOP. Retry explicitly but never
-		// follow a timed wait with an unbounded Wait4.
-		_ = unix.Tgkill(s.leader, tid, unix.SIGSTOP)
-		status, stopped, err = pollWaitStatus(tid, ptraceStopRecoveryTime)
+
+	timeout := remoteCallTimeout
+	recoveryStopSent := false
+	for range 6 {
+		status, stopped, err := pollWaitStatus(tid, timeout)
 		if err != nil {
-			return fmt.Errorf("recover ptrace stop tid %d: %w", tid, err)
+			return fmt.Errorf("wait for ptrace stop tid %d: %w", tid, err)
 		}
+		if !stopped {
+			if recoveryStopSent {
+				return fmt.Errorf("timed out waiting for ptrace stop tid %d", tid)
+			}
+			// PTRACE_ATTACH normally supplies SIGSTOP. Retry explicitly but never
+			// follow a timed wait with an unbounded Wait4.
+			if err := unix.Tgkill(s.leader, tid, unix.SIGSTOP); err != nil {
+				return fmt.Errorf("send recovery ptrace stop tid %d: %w", tid, err)
+			}
+			recoveryStopSent = true
+			timeout = ptraceStopRecoveryTime
+			continue
+		}
+		if status.Exited() || status.Signaled() {
+			return fmt.Errorf("tid %d exited while attaching: %v", tid, status)
+		}
+		if !status.Stopped() {
+			return fmt.Errorf("tid %d did not enter ptrace stop: %v", tid, status)
+		}
+		if status.StopSignal() == unix.SIGSTOP {
+			return nil
+		}
+
+		// A workload signal can win the race with PTRACE_ATTACH's SIGSTOP.
+		// Retain every such signal for detach, and continue with signal zero
+		// until the attach/recovery stop itself has been consumed.
+		s.preserveSignalOnDetach(tid, status.StopSignal())
+		if err := unix.PtraceCont(tid, 0); err != nil {
+			return fmt.Errorf("continue tid %d while consuming attach stop: %w", tid, err)
+		}
+		timeout = ptraceStopRecoveryTime
 	}
-	if !stopped {
-		return fmt.Errorf("timed out waiting for ptrace stop tid %d", tid)
-	}
-	if !status.Stopped() {
-		return fmt.Errorf("tid %d did not enter ptrace stop: %v", tid, status)
-	}
-	return nil
+	return fmt.Errorf("ptrace stop tid %d was starved by target signals", tid)
 }
 
 func (s *ptraceSession) Close() error {
@@ -512,17 +690,115 @@ func (s *ptraceSession) Close() error {
 	s.closed = true
 	var errs []error
 	for n := len(s.threads) - 1; n >= 0; n-- {
-		if err := s.detachThread(s.threads[n]); err != nil {
-			errs = append(errs, fmt.Errorf("ptrace detach tid %d: %w", s.threads[n], err))
+		tid := s.threads[n]
+		if _, unsafe := s.unsafeToDetach[tid]; unsafe {
+			errs = append(errs, fmt.Errorf(
+				"refusing to detach tid %d with unrestored remote-call state", tid))
+			continue
+		}
+		if err := s.detachThread(tid); err != nil {
+			errs = append(errs, fmt.Errorf("ptrace detach tid %d: %w", tid, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func terminateUnsafeTracee(tgid, tid int, reason string) (terminated bool, retErr error) {
+	// Use a process-directed fatal signal. The traced leader can exit while
+	// sibling threads remain alive; tgkill(leader) would then report ESRCH and
+	// leave a potentially partially mutated process running.
+	if err := unix.Kill(tgid, unix.SIGKILL); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return true, nil
+		}
+		return false, fmt.Errorf("%s; terminate target: %w", reason, err)
+	}
+
+	terminationErr := errors.Join(errUnsafeTraceeTerminated, fmt.Errorf(
+		"%s; sent SIGKILL rather than detach with injector state installed", reason))
+	status, observed, err := pollWaitStatus(tid, ptraceStopRecoveryTime)
+	if err != nil {
+		return false, errors.Join(terminationErr,
+			fmt.Errorf("wait for target termination: %w", err))
+	}
+	if !observed {
+		return false, errors.Join(terminationErr,
+			errors.New("target termination was not observed"))
+	}
+	if !status.Exited() && !status.Signaled() {
+		return false, errors.Join(terminationErr,
+			fmt.Errorf("unexpected target termination wait status: %v", status))
+	}
+	return true, terminationErr
+}
+
+func ptraceDetachWithSignal(tid int, signal unix.Signal) error {
+	_, _, errno := unix.Syscall6(unix.SYS_PTRACE, uintptr(unix.PTRACE_DETACH),
+		uintptr(tid), 0, uintptr(signal), 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func (s *ptraceSession) markUnsafeToDetach(tid int) {
+	if s.unsafeToDetach == nil {
+		s.unsafeToDetach = make(map[int]struct{})
+	}
+	s.unsafeToDetach[tid] = struct{}{}
+	delete(s.detachSignals, tid)
+}
+
+func (s *ptraceSession) forgetTerminatedThread(tid int) {
+	for idx, attachedTID := range s.threads {
+		if attachedTID == tid {
+			s.threads = append(s.threads[:idx], s.threads[idx+1:]...)
+			break
+		}
+	}
+	delete(s.detachSignals, tid)
+	delete(s.unsafeToDetach, tid)
+	if len(s.threads) == 0 {
+		s.closed = true
+	}
+}
+
+func (s *ptraceSession) preserveSignalOnDetach(tid int, signal unix.Signal) {
+	if signal == 0 || signal == unix.SIGSTOP {
+		return
+	}
+	if s.detachSignals == nil {
+		s.detachSignals = make(map[int][]unix.Signal)
+	}
+	s.detachSignals[tid] = append(s.detachSignals[tid], signal)
+}
+
+func (s *ptraceSession) requeueSignalsAfterDetach(tid int, signals []unix.Signal) error {
+	var errs []error
+	for _, signal := range signals {
+		if err := unix.Tgkill(s.leader, tid, signal); err != nil {
+			if errors.Is(err, unix.ESRCH) {
+				break
+			}
+			errs = append(errs, fmt.Errorf("requeue target signal %s after detach: %w",
+				signal, err))
 		}
 	}
 	return errors.Join(errs...)
 }
 
 func (s *ptraceSession) detachThread(tid int) error {
-	detachErr := unix.PtraceDetach(tid)
+	preserved := s.detachSignals[tid]
+	var detachSignal unix.Signal
+	var remaining []unix.Signal
+	if len(preserved) > 0 {
+		detachSignal = preserved[0]
+		remaining = preserved[1:]
+	}
+	detachErr := ptraceDetachWithSignal(tid, detachSignal)
 	if detachErr == nil {
-		return nil
+		delete(s.detachSignals, tid)
+		return s.requeueSignalsAfterDetach(tid, remaining)
 	}
 	// PTRACE_DETACH reports ESRCH when a still-live tracee is running rather
 	// than ptrace-stopped. Force one bounded stop and retry instead of silently
@@ -533,6 +809,7 @@ func (s *ptraceSession) detachThread(tid int) error {
 	}
 	stopErr := unix.Tgkill(s.leader, tid, unix.SIGSTOP)
 	if errors.Is(stopErr, unix.ESRCH) {
+		delete(s.detachSignals, tid)
 		return nil // The thread exited before cleanup.
 	}
 	if stopErr != nil {
@@ -546,15 +823,33 @@ func (s *ptraceSession) detachThread(tid int) error {
 		return errors.Join(detachErr, errors.New("timed out waiting for detach stop"))
 	}
 	if status.Exited() || status.Signaled() {
+		delete(s.detachSignals, tid)
 		return nil
 	}
 	if !status.Stopped() {
 		return errors.Join(detachErr, fmt.Errorf("unexpected detach wait status: %v", status))
 	}
-	if err := unix.PtraceDetach(tid); err != nil {
+
+	// Linux only guarantees PTRACE_DETACH signal injection from a
+	// signal-delivery stop. If cleanup observed its own SIGSTOP/group-stop,
+	// detach with zero and requeue every preserved workload signal afterward.
+	observedSignal := status.StopSignal()
+	if observedSignal == unix.SIGSTOP {
+		detachSignal = 0
+		remaining = preserved
+	} else if len(preserved) == 0 {
+		detachSignal = observedSignal
+	} else {
+		// Deliver the oldest retained signal atomically and requeue the newer
+		// signal that won the cleanup race after detach.
+		detachSignal = preserved[0]
+		remaining = append(remaining, observedSignal)
+	}
+	if err := ptraceDetachWithSignal(tid, detachSignal); err != nil {
 		return errors.Join(detachErr, fmt.Errorf("detach after recovery stop: %w", err))
 	}
-	return nil
+	delete(s.detachSignals, tid)
+	return s.requeueSignalsAfterDetach(tid, remaining)
 }
 
 func (s *ptraceSession) Call(fn uint64, args ...uint64) (uint64, error) {
@@ -578,6 +873,9 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 	}
 	if s == nil || s.closed || len(s.threads) == 0 {
 		return 0, errors.New("ptrace session is closed")
+	}
+	if len(s.unsafeToDetach) != 0 {
+		return 0, errors.New("ptrace session has unrestored remote-call state")
 	}
 
 	tid := s.threads[0]
@@ -616,12 +914,6 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 			return 0, errors.New("remote return address zero is mapped in target")
 		}
 	}
-	defer func() {
-		if err := unix.PtraceSetRegs(tid, &saved); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore registers: %w", err))
-		}
-	}()
-
 	// Enter the remote function with a synthetic SysV call frame well below the
 	// interrupted stack pointer. Preserve the bytes we explicitly overwrite.
 	callRSP := (saved.Rsp - 8192) &^ uint64(15)
@@ -635,9 +927,40 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 	if _, err := unix.PtracePeekData(tid, uintptr(callRSP), scratch); err != nil {
 		return 0, fmt.Errorf("read remote stack scratch: %w", err)
 	}
+	restoreRequired := false
+	traceeStopped := true
 	defer func() {
+		if !restoreRequired {
+			return
+		}
+		if !traceeStopped {
+			terminated, terminationErr := terminateUnsafeTracee(s.leader, tid,
+				"remote call state could not be restored because timeout recovery did not regain a ptrace stop")
+			if terminated {
+				s.forgetTerminatedThread(tid)
+			} else {
+				s.markUnsafeToDetach(tid)
+			}
+			retErr = errors.Join(retErr, terminationErr)
+			return
+		}
+
+		var restoreErrs []error
 		if _, err := unix.PtracePokeData(tid, uintptr(callRSP), scratch); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore remote stack scratch: %w", err))
+			restoreErrs = append(restoreErrs, fmt.Errorf("restore remote stack scratch: %w", err))
+		}
+		if err := unix.PtraceSetRegs(tid, &saved); err != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("restore registers: %w", err))
+		}
+		if restoreErr := errors.Join(restoreErrs...); restoreErr != nil {
+			terminated, terminationErr := terminateUnsafeTracee(
+				s.leader, tid, "remote call state restoration failed")
+			if terminated {
+				s.forgetTerminatedThread(tid)
+			} else {
+				s.markUnsafeToDetach(tid)
+			}
+			retErr = errors.Join(retErr, restoreErr, terminationErr)
 		}
 	}()
 
@@ -647,6 +970,7 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 		copy(frame[256:], data)
 		args[dataArg] = dataAddr
 	}
+	restoreRequired = true
 	if _, err := unix.PtracePokeData(tid, uintptr(callRSP), frame); err != nil {
 		return 0, fmt.Errorf("write remote call frame: %w", err)
 	}
@@ -664,14 +988,22 @@ func (s *ptraceSession) call(fn uint64, args []uint64, dataArg int, data []byte)
 	if err := unix.PtraceCont(tid, 0); err != nil {
 		return 0, fmt.Errorf("continue remote call: %w", err)
 	}
+	traceeStopped = false
 
 	status, pendingStop, err := waitForPtraceStop(s.leader, tid, remoteCallTimeout)
+	traceeStopped = status.Stopped()
 	recoveryStopPending = pendingStop
-	if pendingStop && status.Stopped() && !isInjectorFaultSignal(status.StopSignal()) {
-		// Preserve an asynchronous target signal (for example SIGTERM) that
-		// happened to win the timeout-recovery race. Fault signals raised by
-		// the synthetic remote call are suppressed after restoring registers.
-		recoveryResumeSignal = int(status.StopSignal())
+	if status.Stopped() && status.StopSignal() != unix.SIGSTOP &&
+		!isInjectorFaultSignal(status.StopSignal()) {
+		// Preserve an asynchronous target signal (for example SIGTERM). If a
+		// recovery SIGSTOP remains pending, consumePendingRecoveryStop requeues
+		// it after restoration. Otherwise PTRACE_DETACH must deliver the signal
+		// atomically instead of silently suppressing its signal-delivery stop.
+		if pendingStop {
+			recoveryResumeSignal = int(status.StopSignal())
+		} else {
+			s.preserveSignalOnDetach(tid, status.StopSignal())
+		}
 	}
 	if err != nil {
 		return 0, err
@@ -743,23 +1075,55 @@ func consumePendingRecoveryStop(tgid, tid, resumeSignal int) error {
 	// The tracee is currently in a different ptrace stop. Resume with signal 0
 	// until the timeout-recovery SIGSTOP is observed, thereby suppressing it
 	// instead of leaving an untraced process job-control-stopped after detach.
-	// Requeue any asynchronous signal only after SIGSTOP is consumed: injecting
-	// it on the first PTRACE_CONT can lose it when the pending group stop wins.
-	requeueSignal := func() error {
-		if resumeSignal == 0 {
-			return nil
-		}
-		return unix.Tgkill(tgid, tid, unix.Signal(resumeSignal))
+	// Requeue asynchronous signals only after SIGSTOP is consumed: injecting one
+	// on PTRACE_CONT can lose it when the pending group stop wins. Registers have
+	// already been restored, so preserve every additional signal observed here.
+	pendingSignals := make([]unix.Signal, 0, 5)
+	if resumeSignal != 0 {
+		pendingSignals = append(pendingSignals, unix.Signal(resumeSignal))
 	}
+	rememberSignal := func(status unix.WaitStatus) {
+		if status.Stopped() && status.StopSignal() != unix.SIGSTOP {
+			pendingSignals = append(pendingSignals, status.StopSignal())
+		}
+	}
+	requeueSignals := func() error {
+		var errs []error
+		for _, signal := range pendingSignals {
+			if err := unix.Tgkill(tgid, tid, signal); err != nil {
+				if errors.Is(err, unix.ESRCH) {
+					// The target exited; remaining signal delivery is moot.
+					break
+				}
+				errs = append(errs, fmt.Errorf("requeue signal %s: %w", signal, err))
+			}
+		}
+		return errors.Join(errs...)
+	}
+	clearRecoveryStop := func(context string) error {
+		if err := unix.Tgkill(tgid, tid, unix.SIGCONT); err != nil &&
+			!errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("%s: %w", context, err)
+		}
+		return nil
+	}
+
 	currentlyStopped := true
 	for range 4 {
 		if err := unix.PtraceCont(tid, 0); err != nil {
-			return err
+			if errors.Is(err, unix.ESRCH) {
+				return nil
+			}
+			return errors.Join(err,
+				clearRecoveryStop("clear original recovery stop after continue error"),
+				requeueSignals())
 		}
 		currentlyStopped = false
 		status, observed, err := pollWaitStatus(tid, ptraceStopRecoveryTime)
 		if err != nil {
-			return err
+			return errors.Join(err,
+				clearRecoveryStop("clear original recovery stop after wait error"),
+				requeueSignals())
 		}
 		if !observed {
 			break
@@ -769,44 +1133,79 @@ func consumePendingRecoveryStop(tgid, tid, resumeSignal int) error {
 		}
 		currentlyStopped = status.Stopped()
 		if currentlyStopped && status.StopSignal() == unix.SIGSTOP {
-			return requeueSignal()
+			return requeueSignals()
 		}
+		rememberSignal(status)
 	}
 
-	// The original signal should already be pending, but leave the session in
-	// a known ptrace stop even if signal ordering was unusual.
+	// The bounded loop can exhaust while the original recovery SIGSTOP is still
+	// pending. Cancel it before sending a fresh stop; otherwise the original can
+	// win immediately and leave the fresh SIGSTOP pending after detach.
+	if err := clearRecoveryStop("cancel original recovery stop before fallback"); err != nil {
+		return errors.Join(err, requeueSignals())
+	}
 	if currentlyStopped {
 		if err := unix.PtraceCont(tid, 0); err != nil {
-			return err
+			if errors.Is(err, unix.ESRCH) {
+				return nil
+			}
+			return errors.Join(err, requeueSignals())
 		}
 	}
 	if err := unix.Tgkill(tgid, tid, unix.SIGSTOP); err != nil {
-		return err
-	}
-	status, observed, err := pollWaitStatus(tid, ptraceStopRecoveryTime)
-	if err != nil {
-		return err
-	}
-	if !observed {
-		timeoutErr := errors.New("timed out waiting to consume recovery stop")
-		var clearErr error
-		if err := unix.Tgkill(tgid, tid, unix.SIGCONT); err != nil {
-			clearErr = fmt.Errorf("clear unobserved recovery stop: %w", err)
+		if errors.Is(err, unix.ESRCH) {
+			return nil
 		}
-		return errors.Join(timeoutErr, clearErr, requeueSignal())
+		return errors.Join(err, requeueSignals())
 	}
-	if status.Exited() || status.Signaled() {
-		return nil
-	}
-	if !status.Stopped() || status.StopSignal() != unix.SIGSTOP {
-		statusErr := fmt.Errorf("unexpected recovery stop status: %v", status)
-		var clearErr error
-		if err := unix.Tgkill(tgid, tid, unix.SIGCONT); err != nil {
-			clearErr = fmt.Errorf("clear unexpected recovery stop: %w", err)
+
+	// SIGCONT above is itself observable under ptrace and sorts before SIGSTOP.
+	// Suppress that injector-generated stop, while retaining any workload signal
+	// that also wins the race, until the fresh recovery SIGSTOP is consumed.
+	for range 4 {
+		status, observed, err := pollWaitStatus(tid, ptraceStopRecoveryTime)
+		if err != nil {
+			return errors.Join(err,
+				clearRecoveryStop("clear fallback recovery stop after wait error"),
+				requeueSignals())
 		}
-		return errors.Join(statusErr, clearErr, requeueSignal())
+		if !observed {
+			return errors.Join(
+				errors.New("timed out waiting to consume fallback recovery stop"),
+				clearRecoveryStop("clear unobserved fallback recovery stop"),
+				requeueSignals(),
+			)
+		}
+		if status.Exited() || status.Signaled() {
+			return nil
+		}
+		if !status.Stopped() {
+			return errors.Join(
+				fmt.Errorf("unexpected fallback recovery status: %v", status),
+				clearRecoveryStop("clear unexpected fallback recovery stop"),
+				requeueSignals(),
+			)
+		}
+		if status.StopSignal() == unix.SIGSTOP {
+			return requeueSignals()
+		}
+		if status.StopSignal() != unix.SIGCONT {
+			rememberSignal(status)
+		}
+		if err := unix.PtraceCont(tid, 0); err != nil {
+			if errors.Is(err, unix.ESRCH) {
+				return nil
+			}
+			return errors.Join(err,
+				clearRecoveryStop("clear fallback recovery stop after continue error"),
+				requeueSignals())
+		}
 	}
-	return requeueSignal()
+	return errors.Join(
+		errors.New("fallback recovery stop was starved by target signals"),
+		clearRecoveryStop("clear starved fallback recovery stop"),
+		requeueSignals(),
+	)
 }
 
 // pollWaitStatus bounds every ptrace wait. The boolean reports whether Wait4
@@ -975,7 +1374,8 @@ func resolveProcessSymbol(pid int, name string, acceptsMapping func(processMappi
 			symbols = append(symbols, staticSymbols...)
 		}
 		for _, symbol := range symbols {
-			if symbol.Name != name || symbol.Section == elf.SHN_UNDEF {
+			if symbol.Name != name || symbol.Section == elf.SHN_UNDEF ||
+				elf.ST_TYPE(symbol.Info) != elf.STT_FUNC {
 				continue
 			}
 			base := mapping.start - mapping.offset

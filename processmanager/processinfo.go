@@ -12,12 +12,14 @@ package processmanager // import "go.opentelemetry.io/ebpf-profiler/processmanag
 // HA/tracer and tools/coredump modules only.
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -140,6 +142,69 @@ func (pm *ProcessManager) getPidInformation(pid libpf.PID, pr process.Process,
 	pm.pidToProcessInfo[pid] = info
 	pm.pidPageToMappingInfoSize++
 	return info
+}
+
+func readProcessImageIdentity(pid libpf.PID) (processImageIdentity, error) {
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+	executable, err := os.Open(exePath)
+	if err != nil {
+		return processImageIdentity{}, fmt.Errorf("open executable identity: %w", err)
+	}
+	defer executable.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(executable.Fd()), &stat); err != nil {
+		return processImageIdentity{}, fmt.Errorf("stat executable identity: %w", err)
+	}
+
+	contents, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return processImageIdentity{}, fmt.Errorf("read process stat identity: %w", err)
+	}
+	commEnd := bytes.LastIndexByte(contents, ')')
+	if commEnd < 0 {
+		return processImageIdentity{}, errors.New("process stat identity has no closing comm parenthesis")
+	}
+	fields := strings.Fields(string(contents[commEnd+1:]))
+	// fields starts at proc stat field 3. env_end is field 51, index 48 here.
+	if len(fields) <= 48 {
+		return processImageIdentity{}, fmt.Errorf(
+			"process stat identity has %d fields after comm, need 49", len(fields))
+	}
+	parseField := func(index int) (uint64, error) {
+		value, parseErr := strconv.ParseUint(fields[index], 10, 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("parse process stat field %d: %w", index+3, parseErr)
+		}
+		return value, nil
+	}
+	processStartTime, err := parseField(19)
+	if err != nil {
+		return processImageIdentity{}, err
+	}
+	indices := [...]int{23, 24, 25, 42, 43, 44, 45, 46, 47, 48}
+	values := [len(indices)]uint64{}
+	for idx, fieldIndex := range indices {
+		values[idx], err = parseField(fieldIndex)
+		if err != nil {
+			return processImageIdentity{}, err
+		}
+	}
+	return processImageIdentity{
+		executableDevice: uint64(stat.Dev),
+		executableInode:  stat.Ino,
+		processStartTime: processStartTime,
+		startCode:        values[0],
+		endCode:          values[1],
+		startStack:       values[2],
+		startData:        values[3],
+		endData:          values[4],
+		startBrk:         values[5],
+		argStart:         values[6],
+		argEnd:           values[7],
+		envStart:         values[8],
+		envEnd:           values[9],
+		valid:            true,
+	}, nil
 }
 
 // fillSelfContainerID sets the container ID on meta if the process has the same cgroup
@@ -509,16 +574,42 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 		})
 	}
 
-	// Remove live heap tracker entries for this PID and batch-delete the
-	// corresponding entries from the eBPF heap_alloc_live map.
+	// Stop new live tracking, then remove pointer entries before clearing the
+	// count. The potentially large eBPF delete loop runs outside pm.mu, while a
+	// tombstone prevents ProcessedUntil from releasing this PID generation. A
+	// deferred delete without that barrier could erase allocations belonging to
+	// a rapidly reused PID.
 	if pm.liveHeapTracker != nil {
-		pm.ebpf.SetHeapLivePID(pid, false)
-		pm.ebpf.DeleteHeapPIDAllocCount(pid)
-		ptrs := pm.liveHeapTracker.HandleProcessExit(pid)
-		if len(ptrs) > 0 {
-			pm.deferCleanup(func() {
-				pm.ebpf.DeleteHeapAllocLiveEntries(pid, ptrs)
-			})
+		liveDisableErr := pm.ebpf.SetHeapLivePID(pid, false)
+		if liveDisableErr != nil {
+			err = errors.Join(err, liveDisableErr)
+		}
+		ptrs, wasSupported := pm.liveHeapTracker.HandleProcessExit(pid)
+		if wasSupported || len(ptrs) > 0 {
+			if pm.heapCleanupPending == nil {
+				pm.heapCleanupPending = make(map[libpf.PID]struct{})
+			}
+			pm.heapCleanupPending[pid] = struct{}{}
+			cleanupSucceeded := false
+
+			func() {
+				pm.mu.Unlock()
+				// Reacquire during panic unwinding so processPIDExit's outer deferred
+				// unlock never runs against an unlocked mutex.
+				defer pm.mu.Lock()
+
+				// Always scan the eBPF map for a live-enabled PID, even when the
+				// userspace tracker had no pointers: allocation records may still be
+				// queued or may have been lost. If disabling insertion failed, retain
+				// the tombstone and count because cleanup cannot be race-free.
+				if liveDisableErr == nil {
+					cleanupSucceeded = pm.deleteHeapLiveState(pid, ptrs)
+				}
+			}()
+
+			if cleanupSucceeded {
+				delete(pm.heapCleanupPending, pid)
+			}
 		}
 	}
 }
@@ -593,11 +684,26 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 		return
 	}
 
-	// Get current executable name
+	// Get current executable name and address-space identity. The latter lets
+	// memory profiling distinguish execve from an ordinary mapping update even
+	// when the PID and executable path are reused.
 	exe, exeErr := pr.GetExe()
 	if exeErr != nil && !os.IsNotExist(exeErr) {
 		// The /proc/PID/exe returns "not exists" error also in
 		// the case of main thread exit. Ignore it.
+	}
+	currentImageIdentity, imageIdentityErr := readProcessImageIdentity(pid)
+	memoryImageStable := pm.memoryProbeManager == nil || imageIdentityErr == nil
+	memoryStateReset := false
+	if !memoryImageStable {
+		// Memory links and live allocations are address-space scoped. Without a
+		// generation identity, detach only memory state and retry later; ordinary
+		// CPU/interpreter mapping synchronization must remain available.
+		log.Debugf("defer memory probe synchronization for PID %d: read image identity: %v",
+			pid, imageIdentityErr)
+		memoryStateReset = true
+		_ = pm.resetMemoryProbeStateForExec(pid)
+		pm.ebpf.RemoveReportedPID(pid)
 	}
 
 	pm.mu.Lock()
@@ -607,8 +713,13 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 		return
 	}
 	info.lastSeenTID = pr.TID()
-	// Check if process meta needs an update
+	// Check if process meta needs an update. Process image identity includes
+	// executable inode plus mm layout fields, so same-path exec is normally
+	// detected even when metadata itself is unchanged.
 	updateProcessMeta := exe != libpf.NullString && exe != info.meta.Executable
+	executablePathChanged := info.meta.Executable != libpf.NullString && updateProcessMeta
+	processImageChanged := info.imageIdentity.valid && currentImageIdentity.valid &&
+		info.imageIdentity != currentImageIdentity
 	oldProcessContextInfo := info.meta.ProcessContextInfo
 
 	// Get existing info
@@ -760,6 +871,40 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 		}
 	}
 
+	if pm.memoryProbeManager != nil {
+		confirmedImageIdentity, confirmErr := readProcessImageIdentity(pid)
+		identityChanged := confirmErr == nil && currentImageIdentity.valid &&
+			confirmedImageIdentity != currentImageIdentity
+		if identityChanged {
+			// A /proc/PID/maps traversal that spans exec can combine mappings from
+			// two address spaces. Discard the provisional view for every profiler
+			// subsystem and retry; publishing it would corrupt generic symbolization.
+			log.Debugf("retry process synchronization for PID %d after image identity changed: "+
+				"before=%+v after=%+v", pid, currentImageIdentity, confirmedImageIdentity)
+			if !memoryStateReset {
+				_ = pm.resetMemoryProbeStateForExec(pid)
+			}
+			pm.ebpf.RemoveReportedPID(pid)
+			return
+		}
+		if confirmErr != nil || !currentImageIdentity.valid {
+			// Generic profiling historically tolerates unavailable identity data,
+			// but memory links require a verified address-space generation.
+			memoryImageStable = false
+			log.Debugf("defer memory probe synchronization for PID %d: "+
+				"before=%+v after=%+v error=%v", pid, currentImageIdentity,
+				confirmedImageIdentity, confirmErr)
+			if !memoryStateReset {
+				memoryStateReset = true
+				_ = pm.resetMemoryProbeStateForExec(pid)
+			}
+			pm.ebpf.RemoveReportedPID(pid)
+		}
+		if confirmErr == nil {
+			currentImageIdentity = confirmedImageIdentity
+		}
+	}
+
 	util.AtomicUpdateMaxUint32(&pm.mappingStats.maxProcParseUsec, uint32(elapsed.Microseconds()))
 	pm.mappingStats.totalProcParseUsec.Add(uint32(elapsed.Microseconds()))
 
@@ -801,6 +946,9 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 		if updateProcessMeta {
 			info.meta = meta
 		}
+		if currentImageIdentity.valid {
+			info.imageIdentity = currentImageIdentity
+		}
 		info.meta.ProcessContextInfo = processContextInfo
 	}
 	interpreters := pm.interpreters[pid]
@@ -841,11 +989,26 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	}
 
 	// Reconcile configured process-scoped memory hooks on every mapping sync,
-	// including hooks in libraries loaded after process startup.
+	// including hooks in libraries loaded after process startup. A scan without
+	// one stable image identity still updates generic process mappings above but
+	// must not publish memory hooks for an ambiguous address-space generation.
 	if pm.memoryProbeManager != nil {
+		if !memoryImageStable {
+			return
+		}
+		if processImageChanged || executablePathChanged {
+			log.Debugf("reset memory profiling state after exec for PID %d", pid)
+			if !pm.resetMemoryProbeStateForExec(pid) {
+				return
+			}
+		}
 		// Store one shared Instance under pm.mu before discovery. Reconcile and
 		// process-exit teardown serialize independently through Instance.mu.
 		pm.mu.Lock()
+		if _, cleanupPending := pm.heapCleanupPending[pid]; cleanupPending {
+			pm.mu.Unlock()
+			return
+		}
 		previous := pm.memoryProbeInstances[pid]
 		if previous == nil {
 			previous = memory.NewInstance(pid)
@@ -858,28 +1021,153 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 			log.Warnf("memory probe reconcile for PID %d: %v", pid, err)
 		}
 
-		// processPIDExit may have raced with discovery.
-		pm.mu.Lock()
-		_, stillTracked := pm.pidToProcessInfo[pid]
-		pm.mu.Unlock()
-
-		if !stillTracked {
-			pm.mu.Lock()
-			delete(pm.memoryProbeInstances, pid)
-			pm.mu.Unlock()
+		// processPIDExit may have raced with discovery. Publish support while
+		// holding pm.mu so an exit cannot disable then be overwritten by this
+		// stale reconciliation.
+		if !pm.publishMemoryProbeState(pid, previous) {
 			pm.deferCleanup(func() {
 				if derr := previous.Detach(); derr != nil {
 					log.Errorf("memory probe detach for exited PID %d: %v", pid, derr)
 				}
 			})
-		} else if pm.liveHeapTracker != nil {
-			// Never retain live allocations unless a deallocation hook is
-			// attached for this PID.
-			hasLive := previous.HasEvent(memory.EventDeallocation)
-			pm.liveHeapTracker.SetPIDLiveHeapSupport(pid, hasLive)
-			pm.ebpf.SetHeapLivePID(pid, hasLive)
 		}
 	}
+}
+
+func (pm *ProcessManager) deleteHeapLiveState(pid libpf.PID, ptrs []uint64) bool {
+	if err := pm.ebpf.DeleteHeapAllocLiveEntries(pid, ptrs); err != nil {
+		log.Errorf("heap live-map cleanup for PID %d failed; leaving the per-PID count intact: %v",
+			pid, err)
+		return false
+	}
+	if err := pm.ebpf.DeleteHeapPIDAllocCount(pid); err != nil {
+		log.Errorf("heap allocation-count cleanup for PID %d failed: %v", pid, err)
+		return false
+	}
+	return true
+}
+
+// resetMemoryProbeStateForExec removes links and live allocations tied to the
+// old address space before a replacement image can attach hooks or re-enable
+// live tracking. The Instance remains associated with the PID so its one-shot
+// injection guard survives exec and destructive mutation is never retried.
+func (pm *ProcessManager) resetMemoryProbeStateForExec(pid libpf.PID) bool {
+	pm.mu.Lock()
+	previous := pm.memoryProbeInstances[pid]
+
+	var ptrs []uint64
+	wasSupported := false
+	var liveDisableErr error
+	if pm.liveHeapTracker != nil {
+		liveDisableErr = pm.ebpf.SetHeapLivePID(pid, false)
+		if liveDisableErr != nil {
+			log.Errorf("disable live heap tracking after exec for PID %d: %v", pid, liveDisableErr)
+		}
+		ptrs, wasSupported = pm.liveHeapTracker.HandleProcessExit(pid)
+	}
+	if previous != nil || wasSupported || len(ptrs) > 0 || liveDisableErr != nil {
+		if pm.heapCleanupPending == nil {
+			pm.heapCleanupPending = make(map[libpf.PID]struct{})
+		}
+		pm.heapCleanupPending[pid] = struct{}{}
+	}
+	pm.mu.Unlock()
+
+	cleanupSucceeded := liveDisableErr == nil
+	if previous != nil {
+		if err := previous.Detach(); err != nil {
+			log.Errorf("memory probe detach after exec for PID %d: %v", pid, err)
+			cleanupSucceeded = false
+		}
+	}
+	if liveDisableErr == nil && (wasSupported || len(ptrs) > 0) {
+		cleanupSucceeded = pm.deleteHeapLiveState(pid, ptrs) && cleanupSucceeded
+	}
+
+	pm.mu.Lock()
+	if cleanupSucceeded {
+		delete(pm.heapCleanupPending, pid)
+	}
+	pm.mu.Unlock()
+	return cleanupSucceeded
+}
+
+// publishMemoryProbeState atomically verifies that instance still belongs to a
+// live process generation and publishes whether its free hook supports live
+// tracking. Holding pm.mu across both updates prevents an exit from disabling
+// the PID between the liveness check and the eBPF map write.
+func (pm *ProcessManager) publishMemoryProbeState(pid libpf.PID, instance *memory.Instance) bool {
+	pm.mu.Lock()
+
+	_, tracked := pm.pidToProcessInfo[pid]
+	_, exiting := pm.exitEvents[pid]
+	_, cleanupPending := pm.heapCleanupPending[pid]
+	current := pm.memoryProbeInstances[pid]
+	if !tracked || exiting || current != instance {
+		if current == instance {
+			delete(pm.memoryProbeInstances, pid)
+		}
+		pm.mu.Unlock()
+		return false
+	}
+	if cleanupPending {
+		// Exec cleanup deliberately retains the Instance so its one-shot
+		// injection guard survives the address-space replacement.
+		pm.mu.Unlock()
+		return false
+	}
+	if pm.liveHeapTracker == nil {
+		pm.mu.Unlock()
+		return true
+	}
+
+	// Never retain live allocations unless a deallocation hook is attached.
+	hasLive := instance.HasEvent(memory.EventDeallocation)
+	if hasLive {
+		// Record the userspace generation boundary before enabling the eBPF map.
+		// Delayed alloc/free events from an earlier PID generation then cannot
+		// enter or mutate the new generation's live set.
+		wasSupported := pm.liveHeapTracker.SetPIDLiveHeapSupportAt(
+			pid, true, int64(times.GetKTime()))
+		if wasSupported {
+			pm.mu.Unlock()
+			return true
+		}
+		if err := pm.ebpf.SetHeapLivePID(pid, true); err != nil {
+			pm.liveHeapTracker.SetPIDLiveHeapSupport(pid, false)
+			pm.mu.Unlock()
+			log.Errorf("enable live heap tracking for PID %d: %v", pid, err)
+			return false
+		}
+		pm.mu.Unlock()
+		return true
+	}
+
+	liveDisableErr := pm.ebpf.SetHeapLivePID(pid, false)
+	ptrs, wasSupported := pm.liveHeapTracker.HandleProcessExit(pid)
+	cleanupLiveState := wasSupported || len(ptrs) > 0 || liveDisableErr != nil
+	if cleanupLiveState {
+		if pm.heapCleanupPending == nil {
+			pm.heapCleanupPending = make(map[libpf.PID]struct{})
+		}
+		pm.heapCleanupPending[pid] = struct{}{}
+	}
+	pm.mu.Unlock()
+
+	if liveDisableErr != nil {
+		log.Errorf("disable live heap tracking for PID %d: %v", pid, liveDisableErr)
+		return false
+	}
+	if cleanupLiveState {
+		cleanupSucceeded := pm.deleteHeapLiveState(pid, ptrs)
+		pm.mu.Lock()
+		if cleanupSucceeded {
+			delete(pm.heapCleanupPending, pid)
+		}
+		pm.mu.Unlock()
+		return cleanupSucceeded
+	}
+	return true
 }
 
 // CleanupPIDs executes a periodic synchronization of pidToProcessInfo table with system processes.
@@ -924,6 +1212,9 @@ func (pm *ProcessManager) ReconcileMemoryProbes(batchSize int) {
 		if _, exiting := pm.exitEvents[pid]; exiting {
 			continue
 		}
+		if _, cleanupPending := pm.heapCleanupPending[pid]; cleanupPending {
+			continue
+		}
 		if pm.memoryProbeManager.ShouldRetry(pm.memoryProbeInstances[pid]) {
 			candidates = append(candidates, pid)
 		}
@@ -934,7 +1225,8 @@ func (pm *ProcessManager) ReconcileMemoryProbes(batchSize int) {
 	for _, pid := range candidates {
 		pm.mu.Lock()
 		info := pm.pidToProcessInfo[pid]
-		if info == nil {
+		_, cleanupPending := pm.heapCleanupPending[pid]
+		if info == nil || cleanupPending {
 			pm.mu.Unlock()
 			continue
 		}
@@ -956,22 +1248,12 @@ func (pm *ProcessManager) ReconcileMemoryProbes(batchSize int) {
 			numCompleted++
 		}
 
-		pm.mu.Lock()
-		_, stillTracked := pm.pidToProcessInfo[pid]
-		pm.mu.Unlock()
-		if !stillTracked {
-			pm.mu.Lock()
-			delete(pm.memoryProbeInstances, pid)
-			pm.mu.Unlock()
+		if !pm.publishMemoryProbeState(pid, instance) {
 			pm.deferCleanup(func() {
 				if derr := instance.Detach(); derr != nil {
 					log.Errorf("memory probe detach for exited PID %d: %v", pid, derr)
 				}
 			})
-		} else if pm.liveHeapTracker != nil {
-			hasLive := instance.HasEvent(memory.EventDeallocation)
-			pm.liveHeapTracker.SetPIDLiveHeapSupport(pid, hasLive)
-			pm.ebpf.SetHeapLivePID(pid, hasLive)
 		}
 	}
 
@@ -1049,6 +1331,9 @@ func (pm *ProcessManager) ProcessedUntil(traceCaptureKTime times.KTime) {
 
 	for pid, pidExitKTime := range pm.exitEvents {
 		if pidExitKTime > traceCaptureKTime {
+			continue
+		}
+		if _, cleanupPending := pm.heapCleanupPending[pid]; cleanupPending {
 			continue
 		}
 

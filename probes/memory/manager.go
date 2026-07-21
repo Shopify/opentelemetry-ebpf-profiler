@@ -5,11 +5,14 @@ package memory // import "go.opentelemetry.io/ebpf-profiler/probes/memory"
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	cebpf "github.com/cilium/ebpf"
 	lru "github.com/elastic/go-freelru"
 
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/util"
@@ -41,11 +44,18 @@ type Manager struct {
 	// allocator interposition. Normal memory profiling never constructs it.
 	injector allocatorInjector
 
+	// injectionMu serializes destructive mutations so a failure can halt every
+	// not-yet-started attempt. The atomic lets reconciliation reject halted work
+	// without waiting behind an in-flight ptrace operation.
+	injectionMu     sync.Mutex
+	injectionHalted atomic.Bool
+
 	// Injection counters are process-independent and periodically drained by
 	// ProcessManager. Atomics keep reconciliation independent across PIDs.
 	injectionAttempts               atomic.Uint64
 	injectionSuccesses              atomic.Uint64
 	injectionFailures               atomic.Uint64
+	injectionKilledTargets          atomic.Uint64
 	injectionAlreadyPresent         atomic.Uint64
 	injectionProbeDiscoveryFailures atomic.Uint64
 }
@@ -123,20 +133,20 @@ func NewManager(cfg Config, progs map[ProgramKind]*cebpf.Program) (*Manager, err
 	return m, nil
 }
 
-func (m *Manager) matchesProcess(pr process.Process) (bool, error) {
+func (m *Manager) matchesProcess(pr process.Process) (bool, libpf.String, error) {
 	if len(m.config.ProcessExecutablePatterns) == 0 {
-		return true, nil
+		return true, libpf.NullString, nil
 	}
 	executable, err := pr.GetExe()
 	if err != nil {
-		return false, fmt.Errorf("read process executable: %w", err)
+		return false, libpf.NullString, fmt.Errorf("read process executable: %w", err)
 	}
 	for _, pattern := range m.config.ProcessExecutablePatterns {
 		if matchesExecutablePattern(pattern, executable.String()) {
-			return true, nil
+			return true, executable, nil
 		}
 	}
-	return false, nil
+	return false, executable, nil
 }
 
 func programsForABI(abi HookABI) []ProgramKind {
@@ -185,6 +195,13 @@ func (m *Manager) GetAndResetMetrics() []metrics.Metric {
 	if m == nil || m.injector == nil {
 		return nil
 	}
+	halted := m.injectionHalted.Load()
+	haltedValue := metrics.MetricValue(0)
+	if halted {
+		haltedValue = 1
+		log.Warnf("EXPERIMENTAL allocator injection remains halted after a failure; " +
+			"restart the profiler only after disabling injection or resolving the target incident")
+	}
 	return []metrics.Metric{
 		{ID: metrics.IDHeapInjectionAttempts,
 			Value: metrics.MetricValue(m.injectionAttempts.Swap(0))},
@@ -192,9 +209,12 @@ func (m *Manager) GetAndResetMetrics() []metrics.Metric {
 			Value: metrics.MetricValue(m.injectionSuccesses.Swap(0))},
 		{ID: metrics.IDHeapInjectionFailures,
 			Value: metrics.MetricValue(m.injectionFailures.Swap(0))},
+		{ID: metrics.IDHeapInjectionKilledTargets,
+			Value: metrics.MetricValue(m.injectionKilledTargets.Swap(0))},
 		{ID: metrics.IDHeapInjectionAlreadyPresent,
 			Value: metrics.MetricValue(m.injectionAlreadyPresent.Swap(0))},
 		{ID: metrics.IDHeapInjectionProbeDiscoveryFailures,
 			Value: metrics.MetricValue(m.injectionProbeDiscoveryFailures.Swap(0))},
+		{ID: metrics.IDHeapInjectionHalted, Value: haltedValue},
 	}
 }

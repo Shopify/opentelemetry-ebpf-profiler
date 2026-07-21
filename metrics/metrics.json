@@ -2265,5 +2265,19 @@
     "name": "HeapInjectionProbeDiscoveryFailures",
     "field": "agent.heap.injection.probe_discovery_failures",
     "id": 310
+  },
+  {
+    "description": "Number of targets killed because experimental injection could not safely restore ptrace state",
+    "type": "counter",
+    "name": "HeapInjectionKilledTargets",
+    "field": "agent.heap.injection.killed_targets",
+    "id": 311
+  },
+  {
+    "description": "Whether experimental allocator injection is halted after a failure",
+    "type": "gauge",
+    "name": "HeapInjectionHalted",
+    "field": "agent.heap.injection.halted",
+    "id": 312
   }
 ]

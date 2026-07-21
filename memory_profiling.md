@@ -23,8 +23,10 @@ A sampled producer can expose all allocation data at one hook point:
 allocation(void *pointer, uint64_t size, uint64_t weight);
 ```
 
-`weight` is the unbiased estimate of represented allocation bytes. The defaults consume
-`ddheap:alloc` and `ddheap:free`, but the provider and probe names are configurable. A raw
+`weight` is the unbiased estimate of represented allocation bytes. For a nonzero sampled
+allocation it must be at least `size` (`weight = size / sampling_probability`); this lets
+object profiles use `max(1, weight / size)`. The defaults consume `ddheap:alloc` and
+`ddheap:free`, but the provider and probe names are configurable. A raw
 function-entry uprobe can explicitly select `abi: weighted_allocation` in YAML.
 
 Producer-side sampling is the preferred production path. Only sampled events trap into the
@@ -48,7 +50,8 @@ One logical hook atomically owns two PID-scoped links:
 
 For allocations smaller than `sampling_interval_bytes`, sampling probability is
 `size / interval` and sampled byte weight is `interval`. Larger allocations are always
-sampled with their actual size. `alloc_objects` is derived as `weight / size`.
+sampled with their actual size. `alloc_objects` is derived as `weight / size`, with stable
+stochastic rounding when the unbiased estimate is fractional.
 
 **Overhead warning:** sampling occurs after the entry breakpoint. Direct allocator uprobes
 therefore trap on every matching `malloc` entry and return; live mode also traps on every
@@ -115,9 +118,11 @@ Compact allocation hook defaults are event-aware:
 - `weighted-uprobe:<executable-pattern>:<symbol>` → sampled `(pointer,size,weight)` entry;
 - any deallocation hook → `free(pointer)` entry.
 
-Direct allocator hooks require at least one `process_executables` selector, preventing an
-accidental host-wide attachment to every process mapping libc. A literal `*` remains an
-explicit operator opt-in to host-wide attachment.
+Direct allocator hooks (paired `malloc` and live raw `free`) require at least one
+`process_executables` selector, preventing accidental host-wide attachment to every process
+mapping libc. Fleet-wide basename selectors `*` and `**` are rejected; use a deliberately
+scoped basename or full-path pattern. Producer-weighted hooks remain usable without a selector
+because they trap only when an application explicitly invokes the producer marker.
 
 A non-empty hook list replaces the default for that event. Patterns containing `/` match
 the full mapping path; other patterns match its basename. Linux paths containing `:` are
@@ -158,10 +163,16 @@ supported by splitting a uprobe specification at its final colon.
 Allocation events fan out as sibling OTLP profiles:
 
 - `alloc_space / bytes` uses the unbiased byte weight;
-- `alloc_objects / count` uses `weight / allocation_size`.
+- `alloc_objects / count` uses stochastically rounded `weight / allocation_size`.
 
-Live heap remains a separate opt-in and is not production-ready until object weighting,
-metadata, PID-reuse cleanup, and backend repeated-snapshot aggregation semantics are fixed.
+Live heap remains a separate opt-in. Its `inuse_space` and `inuse_objects` profiles are
+zero-duration snapshots timestamped at collection end and use byte weight plus stochastically
+rounded `max(1, weight / allocation_size)`. Allocation-time resource and sample metadata
+(including Kubernetes/cgroup attributes) survive quiet report intervals. A monotonic live-enable
+boundary prevents delayed events from crossing a reused PID's process generation. If kernel
+live-map cleanup fails, that numeric PID remains fail-closed behind a generation tombstone until
+profiler restart rather than risking reuse contamination. Backend repeated-snapshot query
+aggregation semantics remain experimental.
 
 Kernel `mmap`/`brk`/`munmap` instrumentation may later provide a distinct low-overhead
 virtual-memory-growth profile. It cannot replace allocator profiling because most small
@@ -179,30 +190,42 @@ explicitly unsafe fallback modes are available on Linux x86-64:
 --heap-experimental-shim=/opt/prophiler/libprophiler-heap-shim.so
 ```
 
-Both require `--heap-profiling` and at least one `--heap-process-executable` selector. They
-are disabled by default and attempted at most once per eligible PID, only after no producer
-allocation hook was discovered. The profiler must also have permission to ptrace the target
+Both require `--heap-profiling` and at least one exact absolute
+`--heap-process-executable` path; basenames and wildcard selectors are rejected for destructive modes.
+They are disabled by default and attempted at most once per eligible PID, only after no producer
+allocation hook was discovered. An `execve` clears links and live allocations from the replaced
+address space, but preserves that PID's one-shot injection guard; mutation is not retried after exec. The profiler must also have permission to ptrace the target
 (typically `CAP_SYS_PTRACE`, with compatible Yama and seccomp policy) and to open the
 injected mapping through `/proc/<pid>/map_files` (typically `CAP_CHECKPOINT_RESTORE` or
 `CAP_SYS_ADMIN` on current kernels). Mutation can succeed while later probe discovery fails
 if the latter access is missing; the one-attempt rule still prevents automatic reinjection.
 Injector lifecycle is exported through `agent.heap.injection.{attempts,successes,failures,
-already_present,probe_discovery_failures}` counters. A successful count means a new target
+killed_targets,already_present,probe_discovery_failures}` counters and the persistent
+`agent.heap.injection.halted` gauge. `killed_targets` is a high-severity subset of failures
+where target state could not be safely restored. A successful count means a new target
 mutation was reported; partial mutation is counted as failure, and `already_present` is a
-separate non-mutating outcome. The three outcome counters sum to attempts. Treat any
-`failures` increment as actionable: find the matching `EXPERIMENTAL allocator injection
-failed pid=...` error, disable further injection, and restart that target because it may be
-partially mutated.
+separate non-mutating outcome. Every completed attempt has exactly one terminal outcome.
+Injection and independent counter drains can straddle reporting boundaries, so per-interval
+sums may differ even though settled totals converge. Any `failures` increment automatically
+halts new injection attempts for that profiler process. Alert while `halted` is `1` and
+immediately on any `killed_targets` increment. Find the matching `EXPERIMENTAL allocator injection failed
+pid=... mode=... killed_target=...` error and restart the target because it may be partially
+mutated. Remove the injection mode before restarting the profiler to keep injection disabled
+while investigating.
 
-The injector validates and snapshots a non-writable x86-64 shim, ptrace-stops a target
+The injector validates and snapshots a root- or profiler-owned, non-group/world-writable
+x86-64 shim, ptrace-stops a target
 thread, creates a sealable memfd inside the target, copies and write-seals the snapshot, and
-remotely invokes `dlopen`. It first calls the shim's GOT/PLT rewriter. GOT mode only rewrites
+remotely invokes `dlopen`. If bounded timeout recovery cannot regain a ptrace stop or restore
+the target's saved stack/register state, the injector sends `SIGKILL` rather than detach a
+process with synthetic call state installed; the target must then be restarted. It first calls the shim's GOT/PLT rewriter. GOT mode only rewrites
 eligible relocation slots in objects loaded at injection time; direct allocator calls and
 later-loaded objects can bypass it. `got-then-inline` additionally reaches a stable
 all-thread stop and permits the shim to copy allocator prologues into trampolines and
 overwrite libc `malloc`/`free` entries with jumps. The inline decoder refuses unknown
 instruction encodings but cannot make arbitrary hot patching safe. A mapped Prophiler shim
-is treated as already present, preventing reinjection after an agent restart.
+is treated as already present only when its backing bytes match the configured shim snapshot,
+preventing reinjection after an agent restart without trusting a basename alone.
 
 Injected samples are exposed as semaphore-gated `prophiler_heap:alloc` and
 `prophiler_heap:free` USDT notes. Kernel uprobe reference counters disable userspace

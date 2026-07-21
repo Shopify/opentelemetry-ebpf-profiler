@@ -4,6 +4,7 @@
 package memory // import "go.opentelemetry.io/ebpf-profiler/probes/memory"
 
 import (
+	"errors"
 	"fmt"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -12,8 +13,12 @@ import (
 // allocatorInjector performs explicitly enabled, destructive process mutation.
 // Implementations must never be constructed for InjectionDisabled.
 type allocatorInjector interface {
-	Inject(pid libpf.PID) (InjectionResult, error)
+	Inject(pid libpf.PID, expectedExecutable libpf.String) (InjectionResult, error)
 }
+
+// errUnsafeTraceeTerminated marks the exceptional fail-closed path where the
+// injector sent SIGKILL because it could not safely restore remote-call state.
+var errUnsafeTraceeTerminated = errors.New("injector terminated unsafe tracee")
 
 // InjectionResult describes which interposition mechanism an injected shim
 // reported. It is intentionally diagnostic only: hook discovery remains the

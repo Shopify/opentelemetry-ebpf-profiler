@@ -87,9 +87,12 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 			errUnknownOrigin)
 	}
 
-	var extraMeta any
-	if b.cfg.ExtraSampleAttrProd != nil {
+	extraMeta := meta.ExtraMeta
+	if extraMeta == nil && b.cfg.ExtraSampleAttrProd != nil {
 		extraMeta = b.cfg.ExtraSampleAttrProd.CollectExtraSampleMeta(trace, meta)
+		// Keep allocation-time metadata available to stateful consumers after
+		// this synchronous reporter call returns.
+		meta.ExtraMeta = extraMeta
 	}
 
 	key := samples.ResourceKey{

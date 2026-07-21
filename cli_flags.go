@@ -93,8 +93,8 @@ var (
 		"uprobe:<executable-pattern>:<symbol> pairs allocator entry and return probes."
 	heapDeallocationHookHelper = "Deallocation hook (repeatable): usdt:<provider>:<name> or " +
 		"uprobe:<executable-pattern>:<symbol>; both consume a pointer at function entry."
-	heapProcessExecutableHelper = "Process executable basename or full-path glob eligible for " +
-		"memory hooks (repeatable and required for direct allocator uprobes)."
+	heapProcessExecutableHelper = "Process executable selector eligible for memory hooks " +
+		"(repeatable): basename/full-path globs for direct hooks, exact absolute paths for injection."
 	heapExperimentalInjectionHelper = "EXPERIMENTAL/RISKY target mutation: disabled, got, or " +
 		"got-then-inline. Injects the heap shim with ptrace; the final mode may overwrite libc text."
 	heapExperimentalShimHelper = "Absolute local path to the x86-64 heap shim used by " +

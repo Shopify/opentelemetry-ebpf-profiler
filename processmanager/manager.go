@@ -114,6 +114,7 @@ func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monit
 		eim:                      em,
 		interpreters:             interpreters,
 		exitEvents:               make(map[libpf.PID]times.KTime),
+		heapCleanupPending:       make(map[libpf.PID]struct{}),
 		pidToProcessInfo:         make(map[libpf.PID]*processInfo),
 		ebpf:                     ebpf,
 		elfInfoCache:             elfInfoCache,
@@ -383,6 +384,15 @@ func hashFrameCacheKey(fk frameCacheKey) uint32 {
 // strategy needs to be updated accordingly.
 // Returns the computed trace hash and symbolized frames.
 func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) (libpf.TraceHash, libpf.Frames) {
+	traceHash, frames, _ := pm.HandleTraceWithMetadata(bpfTrace)
+	return traceHash, frames
+}
+
+// HandleTraceWithMetadata additionally returns allocation-time sample metadata
+// produced synchronously by the reporter for stateful consumers such as live heap.
+func (pm *ProcessManager) HandleTraceWithMetadata(bpfTrace *libpf.EbpfTrace) (
+	libpf.TraceHash, libpf.Frames, any,
+) {
 	meta := &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(times.KTime(bpfTrace.KTime).UnixNano()),
 		Comm:           bpfTrace.Comm,
@@ -464,5 +474,5 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) (libpf.TraceHas
 		log.Errorf("Failed to report trace event: %v", err)
 	}
 
-	return traceHash, trace.Frames
+	return traceHash, trace.Frames, meta.ExtraMeta
 }

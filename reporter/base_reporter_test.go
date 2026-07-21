@@ -17,6 +17,18 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
+type reporterTestAttrProducer struct{}
+
+func (reporterTestAttrProducer) CollectExtraSampleMeta(
+	*libpf.Trace, *samples.TraceEventMeta,
+) any {
+	return "allocation-meta"
+}
+
+func (reporterTestAttrProducer) ExtraSampleAttrs(*samples.AttrTableManager, any) []int32 {
+	return nil
+}
+
 // createTestBaseReporter creates a minimal baseReporter for testing purposes
 func createTestBaseReporter(t *testing.T, cfg *Config) *baseReporter {
 	t.Helper()
@@ -43,7 +55,10 @@ func createTestBaseReporter(t *testing.T, cfg *Config) *baseReporter {
 }
 
 func TestBaseReporterHeapEventRouting(t *testing.T) {
-	reporter := createTestBaseReporter(t, nil)
+	reporter := createTestBaseReporter(t, &Config{
+		Name: "test-agent", Version: "v1.0.0", SamplesPerSecond: 100,
+		ExtraSampleAttrProd: reporterTestAttrProducer{},
+	})
 	trace := &libpf.Trace{Frames: testReporterFrames()}
 	meta := &samples.TraceEventMeta{
 		Timestamp:   1,
@@ -57,6 +72,7 @@ func TestBaseReporterHeapEventRouting(t *testing.T) {
 	}
 
 	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
+	assert.Equal(t, "allocation-meta", meta.ExtraMeta)
 	meta.Timestamp = 2
 	meta.Value = 8192
 	meta.AllocSize = 128

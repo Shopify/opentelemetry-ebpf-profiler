@@ -78,6 +78,8 @@ func locateHeapShimSemaphores(
 	require.NoError(t, err)
 	require.NotZero(t, addresses.allocation)
 	require.NotZero(t, addresses.free)
+	require.NotEqual(t, addresses.allocation, addresses.free,
+		"allocation and free probes must use distinct semaphore words")
 	addresses.objects = len(objects)
 	return addresses
 }

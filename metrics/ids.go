@@ -719,6 +719,12 @@ const (
 	// Number of injected PIDs whose shim probes could not be discovered through map_files
 	IDHeapInjectionProbeDiscoveryFailures = 310
 
+	// Number of targets killed because experimental injection could not safely restore ptrace state
+	IDHeapInjectionKilledTargets = 311
+
+	// Whether experimental allocator injection is halted after a failure
+	IDHeapInjectionHalted = 312
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 311
+	IDMax = 313
 )

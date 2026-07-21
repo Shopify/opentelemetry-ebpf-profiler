@@ -206,7 +206,7 @@ func (p *Pdata) Generate(tree samples.TraceEventsTree,
 	if len(inuseEntries) > 0 {
 		appendInuseProfiles(profiles, dic, attrMgr, stringSet, funcSet, locationSet, mappingSet, stackSet,
 			agentName, agentVersion, collectionStartTime, collectionEndTime,
-			inuseEntries, inuseProcessMeta)
+			inuseEntries, inuseProcessMeta, p.ExtraSampleAttrProd)
 	}
 
 	// Populate the ProfilesDictionary tables.
@@ -297,11 +297,9 @@ func (p *Pdata) setProfile(
 				//   weight = unbiased byte estimator (nsamples * interval)
 				//   size   = raw allocation size in bytes
 				//
-				// To derive an equally unbiased object-count estimator we
-				// compute weight/size: a sample representing `weight` bytes
-				// of `size`-byte objects represents weight/size objects.
-				// This is the standard convention used by tcmalloc, jemalloc,
-				// and Go's pprof runtime.
+				// To derive an equally unbiased object-count estimator we use
+				// weight/size. Fractional results are stochastically rounded to
+				// integer profile values using stable per-event entropy.
 				//
 				// We do this division here in userspace (rather than in the
 				// eBPF program) so that the raw size remains available for
@@ -311,14 +309,15 @@ func (p *Pdata) setProfile(
 				// Fall back to 1 if size is unknown/zero (malformed sampler
 				// output) rather than dividing by zero.
 				for i, weight := range traceInfo.Values {
-					objects := int64(1)
+					size := uint64(0)
 					if i < len(traceInfo.AllocSizes) && traceInfo.AllocSizes[i] > 0 {
-						objects = weight / traceInfo.AllocSizes[i]
-						if objects < 1 {
-							objects = 1
-						}
+						size = uint64(traceInfo.AllocSizes[i])
 					}
-					sample.Values().Append(objects)
+					salt := sampleKey.Hash.Lo() ^ uint64(i)
+					if i < len(traceInfo.Timestamps) {
+						salt ^= traceInfo.Timestamps[i]
+					}
+					sample.Values().Append(liveheap.EstimateObjectWeight(weight, size, salt))
 				}
 			} else {
 				sample.Values().Append(traceInfo.Values...)

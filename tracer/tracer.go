@@ -1184,6 +1184,12 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 			errRecordUnexpectedSize)
 	}
 
+	origin := libpf.Origin(ptr.Origin)
+	if origin == support.TraceOriginHeapAlloc &&
+		(ptr.Value == 0 || ptr.Value > uint64(^uint64(0)>>1)) {
+		return nil, fmt.Errorf("heap allocation has invalid byte weight %d", ptr.Value)
+	}
+
 	pid := libpf.PID(ptr.Pid)
 	procMeta := t.processManager.MetaForPID(pid)
 	trace := t.tracePool.Get().(*libpf.EbpfTrace)
@@ -1196,7 +1202,7 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 		APMTransactionID: *(*libpf.APMTransactionID)(unsafe.Pointer(&ptr.Apm_transaction_id)),
 		PID:              pid,
 		TID:              libpf.PID(ptr.Tid),
-		Origin:           libpf.Origin(ptr.Origin),
+		Origin:           origin,
 		Value:            int64(ptr.Value),
 		Ptr:              ptr.Ptr,
 		Size:             ptr.Size,
@@ -1509,26 +1515,34 @@ func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 		// Free events carry no frames; just remove the allocation from the
 		// live tracker. No symbolization or reporting needed.
 		if t.liveHeapTracker != nil {
-			t.liveHeapTracker.HandleFree(bpfTrace.PID, bpfTrace.Ptr)
+			t.liveHeapTracker.HandleFreeAt(bpfTrace.PID, bpfTrace.Ptr, bpfTrace.KTime)
 		}
 		bpfTrace.KernelFrames = bpfTrace.KernelFrames[0:0]
 		t.tracePool.Put(bpfTrace)
 		return
 	}
 
-	traceHash, frames := t.processManager.HandleTrace(bpfTrace)
+	traceHash, frames, extraMeta := t.processManager.HandleTraceWithMetadata(bpfTrace)
 
 	// After symbolization and reporting, feed heap allocs to the live tracker.
 	// Called for every alloc trace (not just ptr != 0) so the tracker can count
 	// all received alloc samples; it ignores the ones eBPF didn't live-track
 	// (ptr == 0). This mirrors the unconditional HandleFree call above.
 	if bpfTrace.Origin == support.TraceOriginHeapAlloc && t.liveHeapTracker != nil {
-		t.liveHeapTracker.HandleAlloc(
+		t.liveHeapTracker.HandleAllocWithSizeAndMeta(
 			bpfTrace.PID,
 			bpfTrace.Ptr,
 			traceHash,
 			bpfTrace.Value,
+			bpfTrace.Size,
 			frames,
+			liveheap.ProcessMeta{
+				ExecutablePath: bpfTrace.ExecutablePath,
+				ContainerID:    bpfTrace.ContainerID,
+			},
+			extraMeta,
+			bpfTrace.KTime,
+			uint64(bpfTrace.KTime)^bpfTrace.Ptr^(uint64(bpfTrace.PID)<<32)^traceHash.Lo(),
 		)
 	}
 

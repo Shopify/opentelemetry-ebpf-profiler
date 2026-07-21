@@ -19,8 +19,8 @@ import (
 
 // appendInuseProfiles appends inuse_space and inuse_objects profiles to the
 // existing Profiles object, sharing the same dictionary and ordered sets.
-// Profiles are added to existing ResourceProfiles entries (matched by PID)
-// so the backend sees them in the same upload group as alloc+cpu.
+// Profiles are added to an unambiguous existing ResourceProfiles entry matched
+// by PID plus allocation-time process metadata so PID reuse cannot cross-attribute data.
 func appendInuseProfiles(
 	profiles pprofile.Profiles,
 	dic pprofile.ProfilesDictionary,
@@ -34,44 +34,65 @@ func appendInuseProfiles(
 	collectionStartTime, collectionEndTime time.Time,
 	entries []liveheap.InuseEntry,
 	processMeta func(libpf.PID) liveheap.ProcessMeta,
+	extraSampleAttrProd samples.SampleAttrProducer,
 ) {
-	// Group entries by PID for per-process resource profiles.
-	byPID := make(map[libpf.PID][]liveheap.InuseEntry)
-	for _, e := range entries {
-		byPID[e.PID] = append(byPID[e.PID], e)
+	type processKey struct {
+		PID  libpf.PID
+		Meta liveheap.ProcessMeta
+	}
+	// Group by allocation-time process identity, not PID alone. Legacy entries
+	// without embedded metadata use one resolver result cached per PID.
+	byProcess := make(map[processKey][]liveheap.InuseEntry)
+	fallbackMeta := make(map[libpf.PID]liveheap.ProcessMeta)
+	fallbackResolved := make(map[libpf.PID]bool)
+	for _, entry := range entries {
+		meta := entry.ProcessMeta
+		if meta.ExecutablePath == libpf.NullString && meta.ContainerID == libpf.NullString &&
+			processMeta != nil {
+			if !fallbackResolved[entry.PID] {
+				fallbackMeta[entry.PID] = processMeta(entry.PID)
+				fallbackResolved[entry.PID] = true
+			}
+			meta = fallbackMeta[entry.PID]
+		}
+		key := processKey{PID: entry.PID, Meta: meta}
+		byProcess[key] = append(byProcess[key], entry)
 	}
 
-	durationNanos := uint64(collectionEndTime.Sub(collectionStartTime).Nanoseconds())
-
-	// Build an index of existing ResourceProfiles by PID so we can append
-	// inuse profiles to the same resource that holds alloc+cpu.
-	rpByPID := make(map[libpf.PID]pprofile.ResourceProfiles)
+	// Keep every resource candidate for a PID. A map to one entry would choose
+	// arbitrarily if an export interval contains samples from an exited process
+	// and its PID-reused replacement.
+	resourcesByPID := make(map[libpf.PID][]pprofile.ResourceProfiles)
 	for i := range profiles.ResourceProfiles().Len() {
 		rp := profiles.ResourceProfiles().At(i)
 		pidVal, ok := rp.Resource().Attributes().Get(string(semconv.ProcessPIDKey))
 		if ok {
-			rpByPID[libpf.PID(pidVal.Int())] = rp
+			pid := libpf.PID(pidVal.Int())
+			resourcesByPID[pid] = append(resourcesByPID[pid], rp)
 		}
 	}
 
-	for pid, pidEntries := range byPID {
-		// Try to find the existing ResourceProfiles for this PID.
-		rp, found := rpByPID[pid]
+	for key, processEntries := range byProcess {
+		pid := key.PID
+		meta := key.Meta
+		hasMeta := meta.ExecutablePath != libpf.NullString ||
+			meta.ContainerID != libpf.NullString
+
+		// Reuse only one unambiguous resource whose executable/container metadata
+		// exactly matches the current process. Otherwise create a fresh resource.
+		rp, found := matchingInuseResource(resourcesByPID[pid], meta, hasMeta)
 		if !found {
-			// No existing resource for this PID; create a new one.
 			rp = profiles.ResourceProfiles().AppendEmpty()
+			rp.SetSchemaUrl(semconv.SchemaURL)
 			attrs := rp.Resource().Attributes()
 			attrs.PutInt(string(semconv.ProcessPIDKey), int64(pid))
-			if processMeta != nil {
-				meta := processMeta(pid)
-				if meta.ExecutablePath != libpf.NullString {
-					attrs.PutStr(string(semconv.ProcessExecutablePathKey), meta.ExecutablePath.String())
-					_, exeName := filepath.Split(meta.ExecutablePath.String())
-					attrs.PutStr(string(semconv.ProcessExecutableNameKey), exeName)
-				}
-				if meta.ContainerID != libpf.NullString {
-					attrs.PutStr(string(semconv.ContainerIDKey), meta.ContainerID.String())
-				}
+			if meta.ExecutablePath != libpf.NullString {
+				attrs.PutStr(string(semconv.ProcessExecutablePathKey), meta.ExecutablePath.String())
+				_, exeName := filepath.Split(meta.ExecutablePath.String())
+				attrs.PutStr(string(semconv.ProcessExecutableNameKey), exeName)
+			}
+			if meta.ContainerID != libpf.NullString {
+				attrs.PutStr(string(semconv.ContainerIDKey), meta.ContainerID.String())
 			}
 		}
 
@@ -81,6 +102,7 @@ func appendInuseProfiles(
 			sp = rp.ScopeProfiles().At(0)
 		} else {
 			sp = rp.ScopeProfiles().AppendEmpty()
+			sp.SetSchemaUrl(semconv.SchemaURL)
 			scope := sp.Scope()
 			scope.SetName(agentName)
 			scope.SetVersion(agentVersion)
@@ -98,7 +120,7 @@ func appendInuseProfiles(
 				st.SetUnitStrindex(stringSet.Add("count"))
 			}
 
-			for _, entry := range pidEntries {
+			for _, entry := range processEntries {
 				sample := prof.Samples().AppendEmpty()
 				if kind == profileKindHeapInuseSpace {
 					sample.Values().Append(entry.Space)
@@ -110,10 +132,47 @@ func appendInuseProfiles(
 				stackIdx := appendFramesAsStack(entry.Frames, dic, attrMgr,
 					stringSet, funcSet, mappingSet, locationSet, stackSet)
 				sample.SetStackIndex(stackIdx)
+				if extraSampleAttrProd != nil && entry.ExtraMeta != nil {
+					extra := extraSampleAttrProd.ExtraSampleAttrs(attrMgr, entry.ExtraMeta)
+					sample.AttributeIndices().Append(extra...)
+				}
 			}
 
-			prof.SetDurationNano(durationNanos)
-			prof.SetTime(pcommon.Timestamp(collectionStartTime.UnixNano()))
+			// In-use profiles are instantaneous gauges, not event counts over the
+			// collection window. Timestamp the snapshot at collection end with zero
+			// duration so storage/query layers can apply snapshot aggregation.
+			prof.SetDurationNano(0)
+			prof.SetTime(pcommon.Timestamp(collectionEndTime.UnixNano()))
 		}
 	}
+}
+
+func matchingInuseResource(candidates []pprofile.ResourceProfiles,
+	meta liveheap.ProcessMeta, hasMeta bool,
+) (pprofile.ResourceProfiles, bool) {
+	var matched pprofile.ResourceProfiles
+	numMatched := 0
+	for _, candidate := range candidates {
+		if hasMeta && !resourceMatchesInuseMeta(candidate.Resource().Attributes(), meta) {
+			continue
+		}
+		matched = candidate
+		numMatched++
+	}
+	return matched, numMatched == 1
+}
+
+func resourceMatchesInuseMeta(attrs pcommon.Map, meta liveheap.ProcessMeta) bool {
+	return resourceStringAttributeMatches(attrs,
+		string(semconv.ProcessExecutablePathKey), meta.ExecutablePath) &&
+		resourceStringAttributeMatches(attrs,
+			string(semconv.ContainerIDKey), meta.ContainerID)
+}
+
+func resourceStringAttributeMatches(attrs pcommon.Map, key string, want libpf.String) bool {
+	if want == libpf.NullString {
+		return true
+	}
+	got, present := attrs.Get(key)
+	return present && got.Str() == want.String()
 }
