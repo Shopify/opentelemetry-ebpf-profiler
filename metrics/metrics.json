@@ -2244,5 +2244,33 @@
     "name": "AsyncCorrelationFilteredCompletions",
     "field": "agent.async_correlation.filtered_completions",
     "id": 307
+  },
+  {
+    "description": "Number of TCP sequence operations missing a packet or initiating stack",
+    "type": "counter",
+    "name": "TCPSequenceCorrelationOrphans",
+    "field": "agent.tcp_sequence_correlation.orphans",
+    "id": 308
+  },
+  {
+    "description": "Number of TCP sequence correlation records removed by capacity or TTL",
+    "type": "counter",
+    "name": "TCPSequenceCorrelationEvictions",
+    "field": "agent.tcp_sequence_correlation.evictions",
+    "id": 309
+  },
+  {
+    "description": "Number of TCP sequence latencies suppressed by a duration filter",
+    "type": "counter",
+    "name": "TCPSequenceCorrelationFiltered",
+    "field": "agent.tcp_sequence_correlation.filtered",
+    "id": 310
+  },
+  {
+    "description": "Number of TCP calls and sequence ranges awaiting correlation",
+    "type": "gauge",
+    "name": "TCPSequenceCorrelationPending",
+    "field": "agent.tcp_sequence_correlation.pending",
+    "id": 311
   }
 ]

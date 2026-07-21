@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/probes/generic"
 	"go.opentelemetry.io/ebpf-profiler/probes/iouring"
 	"go.opentelemetry.io/ebpf-profiler/probes/tcpconnect"
+	"go.opentelemetry.io/ebpf-profiler/probes/tcpsequence"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
@@ -211,6 +212,10 @@ func createCustomProbe(name string, cfg any) (tracer.Probe, error) {
 		return iouring.New(cfg)
 	case tcpconnect.SampleType:
 		return tcpconnect.New(cfg)
+	case tcpsequence.SendACKSampleType:
+		return tcpsequence.NewSendACK(cfg)
+	case tcpsequence.ReceiveSampleType:
+		return tcpsequence.NewReceive(cfg)
 	case "tcp_send_latency":
 		return functionlatency.New(functionlatency.Definition{
 			Symbol:     "tcp_sendmsg",

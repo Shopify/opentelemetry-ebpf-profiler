@@ -302,6 +302,7 @@ static inline EBPF_INLINE PerCPURecord *get_pristine_per_cpu_record()
   trace->tid               = 0;
   trace->correlation_id    = 0;
   trace->async_user_data   = 0;
+  trace->async_threshold   = 0;
   trace->async_result      = 0;
   trace->async_flags       = 0;
   trace->async_operation   = 0;
@@ -946,6 +947,7 @@ static inline EBPF_INLINE int collect_trace_internal(
   u64 value,
   u64 correlation_id,
   u64 async_user_data,
+  u64 async_threshold,
   u16 async_operation,
   u8 async_kind,
   u8 async_attributes)
@@ -971,6 +973,7 @@ static inline EBPF_INLINE int collect_trace_internal(
   trace->value            = value;
   trace->correlation_id   = correlation_id;
   trace->async_user_data  = async_user_data;
+  trace->async_threshold  = async_threshold;
   trace->async_operation  = async_operation;
   trace->event_kind       = correlation_id ? TRACE_EVENT_ASYNC_START : TRACE_EVENT_NORMAL;
   trace->async_kind       = async_kind;
@@ -1027,7 +1030,7 @@ exit:
 static inline EBPF_INLINE int
 collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value)
 {
-  return collect_trace_internal(ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0);
+  return collect_trace_internal(ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0);
 }
 
 static inline EBPF_INLINE int collect_async_trace(
@@ -1051,6 +1054,35 @@ static inline EBPF_INLINE int collect_async_trace(
     0,
     correlation_id,
     async_user_data,
+    0,
+    async_operation,
+    async_kind,
+    async_attributes);
+}
+
+static inline EBPF_INLINE int collect_async_trace_with_threshold(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 correlation_id,
+  u64 async_user_data,
+  u64 async_threshold,
+  u16 async_operation,
+  u8 async_kind,
+  u8 async_attributes)
+{
+  return collect_trace_internal(
+    ctx,
+    origin,
+    pid,
+    tid,
+    trace_timestamp,
+    0,
+    correlation_id,
+    async_user_data,
+    async_threshold,
     async_operation,
     async_kind,
     async_attributes);

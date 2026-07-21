@@ -134,6 +134,30 @@ func TestAsyncCorrelatorAddsBlockLabels(t *testing.T) {
 		completion.CustomLabels[libpf.Intern("io.status")])
 }
 
+func TestAddAsyncLabelsTCPSequenceProfiles(t *testing.T) {
+	tests := []struct {
+		kind      libpf.AsyncKind
+		operation string
+	}{
+		{kind: libpf.AsyncKindTCPAck, operation: "send_to_ack"},
+		{kind: libpf.AsyncKindTCPReceive, operation: "receive_consumption"},
+	}
+	for _, test := range tests {
+		t.Run(test.operation, func(t *testing.T) {
+			trace := &libpf.EbpfTrace{AsyncKind: test.kind, AsyncResult: 4096}
+			addAsyncLabels(trace)
+			require.Equal(t, libpf.Intern(test.operation),
+				trace.CustomLabels[libpf.Intern("network.operation")])
+			require.Equal(t, libpf.Intern("tcp"),
+				trace.CustomLabels[libpf.Intern("network.transport")])
+			require.Equal(t, libpf.Intern("4096"),
+				trace.CustomLabels[libpf.Intern("network.io.bytes")])
+			require.Equal(t, libpf.Intern("ok"),
+				trace.CustomLabels[libpf.Intern("network.io.status")])
+		})
+	}
+}
+
 func TestAsyncCorrelatorConsumesFilteredCompletion(t *testing.T) {
 	correlator := newAsyncTraceCorrelator(2, time.Minute)
 	correlator.add(&libpf.EbpfTrace{Origin: 1, CorrelationID: 2, KTime: 10})

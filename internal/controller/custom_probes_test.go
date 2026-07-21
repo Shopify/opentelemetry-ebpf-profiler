@@ -16,6 +16,8 @@ func TestCreateLatencyProbes(t *testing.T) {
 		"block_io_latency",
 		"io_uring_latency",
 		"tcp_connect_latency",
+		"tcp_send_ack_latency",
+		"tcp_receive_consumption_latency",
 		"tcp_send_latency",
 		"tcp_receive_latency",
 		"vfs_read_latency",

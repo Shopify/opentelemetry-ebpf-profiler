@@ -710,6 +710,18 @@ const (
 	// Number of correlated asynchronous completions suppressed by a duration filter
 	IDAsyncCorrelationFilteredCompletions = 307
 
+	// Number of TCP sequence operations missing a packet or initiating stack
+	IDTCPSequenceCorrelationOrphans = 308
+
+	// Number of TCP sequence correlation records removed by capacity or TTL
+	IDTCPSequenceCorrelationEvictions = 309
+
+	// Number of TCP sequence latencies suppressed by a duration filter
+	IDTCPSequenceCorrelationFiltered = 310
+
+	// Number of TCP calls and sequence ranges awaiting correlation
+	IDTCPSequenceCorrelationPending = 311
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 308
+	IDMax = 312
 )

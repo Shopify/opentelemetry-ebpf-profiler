@@ -39,6 +39,14 @@ receivers:
     #   tcp_connect_latency:
     #     min_duration: 100us
     #     sample_rate: 0.1
+    #   # Application send until the cumulative TCP ACK covers those bytes.
+    #   tcp_send_ack_latency:
+    #     min_duration: 100us
+    #     sample_rate: 0.1
+    #   # TCP data queueing until an application read consumes those bytes.
+    #   tcp_receive_consumption_latency:
+    #     min_duration: 100us
+    #     sample_rate: 0.1
     #   # Synchronous function profiles include both kernel and user stacks.
     #   tcp_send_latency:
     #     min_duration: 100us
