@@ -33,9 +33,12 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind/elfunwindinfo"
 	"go.opentelemetry.io/ebpf-profiler/periodiccaller"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
+	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
@@ -136,6 +139,20 @@ type Tracer struct {
 	// tracks how many were dropped due to invalid UTF-8.
 	customLabels customLabelValidator
 
+	// pidEventsDone is closed when processPIDEvents exits, allowing Close()
+	// to wait for all in-flight SynchronizeProcess / ReconcileMemoryProbes calls
+	// to complete before tearing down the ProcessManager. The mutex also lets
+	// Close handle tracers whose processor was never started (for example, a
+	// verifier-only integration test) without blocking forever.
+	pidEventsMu      sync.Mutex
+	pidEventsStarted bool
+	pidEventsClosed  bool
+	pidEventsDone    chan struct{}
+
+	// liveHeapTracker tracks live (in-use) heap allocations by correlating
+	// alloc and free events. Nil when live heap profiling is disabled.
+	liveHeapTracker *liveheap.Tracker
+
 	// done is closed when the tracer encounters an unrecoverable error.
 	// Use Done() to obtain a read-only channel for use in select statements.
 	done     chan libpf.Void
@@ -147,6 +164,11 @@ type Tracer struct {
 // when the tracer should be stopped.
 func (t *Tracer) Done() <-chan libpf.Void {
 	return t.done
+}
+
+// ProcessManager returns the process manager for accessing per-PID metadata.
+func (t *Tracer) ProcessManager() *pm.ProcessManager {
+	return t.processManager
 }
 
 // signalDone closes the done channel to indicate an unrecoverable error.
@@ -194,6 +216,13 @@ type Config struct {
 	// LoadProbe indicates whether the generic eBPF program should be loaded
 	// without being attached to something.
 	LoadProbe bool
+	// ProbesConfig holds typed custom-probe configuration. Memory is the first
+	// consumer; future network/disk probes can be added without more tracer
+	// booleans or untyped hook strings.
+	ProbesConfig probeconfig.Config
+	// LiveHeapTracker is shared with the reporter when the memory probe's live
+	// mode is enabled. It may be nil for allocation-only profiling.
+	LiveHeapTracker *liveheap.Tracker
 	// BPFFSRoot is the root path to BPF filesystem for pinned maps and programs.
 	BPFFSRoot string
 	// OBIProcessCtx enable the use of a known shared eBPF map with OBI.
@@ -237,6 +266,12 @@ func newTracePool() sync.Pool {
 
 // NewTracer loads eBPF code and map definitions from the ELF module at the configured path.
 func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
+	cfg.ProbesConfig.ApplyDefaults()
+	if err := cfg.ProbesConfig.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid custom probe configuration: %w", err)
+	}
+	memoryConfig := cfg.ProbesConfig.Memory
+
 	kernelSymbolizer, err := kallsyms.NewSymbolizer()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read kernel symbols: %v", err)
@@ -253,15 +288,50 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		return nil, fmt.Errorf("failed to load eBPF code: %v", err)
 	}
 
-	ebpfHandler, err := pmebpf.LoadMaps(ctx, cfg.InterpretersConfig, ebpfMaps, stackdeltaInnerMapSpec)
+	ebpfHandler, err := pmebpf.LoadMaps(ctx, cfg.InterpretersConfig, cfg.ProbesConfig,
+		ebpfMaps, stackdeltaInnerMapSpec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF maps: %v", err)
 	}
 
+	if memoryConfig.Live {
+		ebpfHandler.SetHeapPIDAllocLimit(uint32(memoryConfig.MaxEntriesPerPID))
+	}
+	if memoryConfig.UsesMallocAdapter() {
+		ebpfHandler.SetHeapSamplingInterval(uint32(memoryConfig.SamplingIntervalBytes))
+		log.Warnf("Direct allocator uprobes trap on every matching function entry/return; " +
+			"use producer-side sampled USDT hooks for low-overhead production profiling")
+	}
+
+	// Set up the process-scoped memory custom probe. Source-specific adapters
+	// normalize producer-weighted USDTs and paired allocator entry/return hooks
+	// into the same typed allocation/deallocation events.
+	var memoryProbeManager *memory.Manager
+	if memoryConfig.Enabled {
+		memoryProgs := map[memory.ProgramKind]*cebpf.Program{}
+		programNames := map[memory.ProgramKind]string{
+			memory.ProgramWeightedAllocation: "uprobe_heap_alloc",
+			memory.ProgramMallocEnter:        "uprobe_malloc_enter",
+			memory.ProgramMallocReturn:       "uretprobe_malloc_return",
+			memory.ProgramDeallocation:       "uprobe_heap_free",
+		}
+		for kind, name := range programNames {
+			if program, ok := ebpfProgs[name]; ok {
+				memoryProgs[kind] = program
+			}
+		}
+		memoryProbeManager, err = memory.NewManager(memoryConfig, memoryProgs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build memory probe manager: %w", err)
+		}
+	}
+
+	liveTracker := cfg.LiveHeapTracker
+
 	processManager, err := pm.New(ctx, cfg.InterpretersConfig, cfg.Intervals.MonitorInterval(),
 		cfg.Intervals.ExecutableUnloadDelay(), ebpfHandler, cfg.TraceReporter, cfg.ExecutableReporter,
 		elfunwindinfo.NewStackDeltaProvider(),
-		cfg.FilterErrorFrames, cfg.IncludeEnvVars)
+		cfg.FilterErrorFrames, cfg.IncludeEnvVars, memoryProbeManager, liveTracker)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create processManager: %v", err)
 	}
@@ -282,6 +352,8 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		samplesPerSecond:       cfg.SamplesPerSecond,
 		probabilisticInterval:  cfg.ProbabilisticInterval,
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
+		pidEventsDone:          make(chan struct{}),
+		liveHeapTracker:        liveTracker,
 		done:                   make(chan libpf.Void),
 	}
 
@@ -302,6 +374,20 @@ func (t *Tracer) Close() {
 			log.Errorf("Failed to close '%s/%s': %v", hookPoint.group, hookPoint.name, err)
 		}
 		delete(t.hooks, hookPoint)
+	}
+
+	// Wait for the PID event processing goroutine to exit before tearing
+	// down the ProcessManager. The goroutine stops when its context is
+	// cancelled (done by the controller before calling Close); waiting
+	// here guarantees no concurrent SynchronizeProcess / ReconcileMemoryProbes
+	// calls are in flight when ProcessManager.Close detaches memory-probe links.
+	t.pidEventsMu.Lock()
+	t.pidEventsClosed = true
+	pidEventsStarted := t.pidEventsStarted
+	pidEventsDone := t.pidEventsDone
+	t.pidEventsMu.Unlock()
+	if pidEventsStarted {
+		<-pidEventsDone
 	}
 
 	t.processManager.Close()
@@ -457,8 +543,10 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 		return nil, nil, nil, fmt.Errorf("failed to load perf eBPF programs: %v", err)
 	}
 
-	if cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe {
-		// Load the tail call destinations if any kind of event profiling is enabled.
+	if cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe ||
+		cfg.ProbesConfig.Memory.Enabled {
+		// Load tail-call destinations when any event probe is enabled. Memory
+		// hook entry programs reuse the same uprobe unwinder chain.
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], tailCallProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
@@ -495,6 +583,23 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], probeProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load uprobe eBPF programs: %v", err)
+		}
+	}
+
+	if cfg.ProbesConfig.Memory.Enabled {
+		memoryProgs := []progLoaderHelper{
+			{name: "uprobe_heap_alloc", noTailCallTarget: true,
+				enable: cfg.ProbesConfig.Memory.UsesWeightedAllocation()},
+			{name: "uprobe_malloc_enter", noTailCallTarget: true,
+				enable: cfg.ProbesConfig.Memory.UsesMallocAdapter()},
+			{name: "uretprobe_malloc_return", noTailCallTarget: true,
+				enable: cfg.ProbesConfig.Memory.UsesMallocAdapter()},
+			{name: "uprobe_heap_free", noTailCallTarget: true,
+				enable: cfg.ProbesConfig.Memory.Live},
+		}
+		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], memoryProgs,
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to load memory-probe eBPF programs: %v", err)
 		}
 	}
 
@@ -697,9 +802,19 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 			}
 		}
 
-		if !cfg.InterpretersConfig.IsMapEnabled(mapName) {
-			log.Debugf("Skipping eBPF map %s: tracer not enabled", mapName)
+		if !cfg.InterpretersConfig.IsMapEnabled(mapName) ||
+			!cfg.ProbesConfig.IsMapEnabled(mapName) {
+			log.Debugf("Skipping eBPF map %s: owning tracer/probe not enabled", mapName)
 			continue
+		}
+		if cfg.ProbesConfig.Memory.Enabled && !cfg.ProbesConfig.Memory.Live {
+			switch mapName {
+			case "heap_alloc_live", "heap_live_pids", "heap_pid_alloc_count":
+				// The allocation entry program references these maps, so they must
+				// exist for verifier rewriting even though allocation-only mode never
+				// populates them. Minimize them to avoid baseline preallocation.
+				mapSpec.MaxEntries = 1
+			}
 		}
 		if newSize, ok := adaption[mapName]; ok {
 			log.Debugf("Size of eBPF map %s: %v", mapName, newSize)
@@ -1069,6 +1184,12 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 			errRecordUnexpectedSize)
 	}
 
+	origin := libpf.Origin(ptr.Origin)
+	if origin == support.TraceOriginHeapAlloc &&
+		(ptr.Value == 0 || ptr.Value > uint64(^uint64(0)>>1)) {
+		return nil, fmt.Errorf("heap allocation has invalid byte weight %d", ptr.Value)
+	}
+
 	pid := libpf.PID(ptr.Pid)
 	procMeta := t.processManager.MetaForPID(pid)
 	trace := t.tracePool.Get().(*libpf.EbpfTrace)
@@ -1081,8 +1202,10 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 		APMTransactionID: *(*libpf.APMTransactionID)(unsafe.Pointer(&ptr.Apm_transaction_id)),
 		PID:              pid,
 		TID:              libpf.PID(ptr.Tid),
-		Origin:           libpf.Origin(ptr.Origin),
+		Origin:           origin,
 		Value:            int64(ptr.Value),
+		Ptr:              ptr.Ptr,
+		Size:             ptr.Size,
 		KTime:            int64(ptr.Ktime),
 		CpuID:            ptr.Cpu_id,
 		EnvVars:          procMeta.EnvVariables,
@@ -1092,6 +1215,8 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 	case support.TraceOriginSampling:
 	case support.TraceOriginOffCPU:
 	case support.TraceOriginProbe:
+	case support.TraceOriginHeapAlloc:
+	case support.TraceOriginHeapFree:
 	default:
 		return nil, fmt.Errorf("origin %d: %w", trace.Origin, errOriginUnexpected)
 	}
@@ -1386,7 +1511,40 @@ func (t *Tracer) AttachProbes(probes []string) error {
 }
 
 func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
-	t.processManager.HandleTrace(bpfTrace)
+	if bpfTrace.Origin == support.TraceOriginHeapFree {
+		// Free events carry no frames; just remove the allocation from the
+		// live tracker. No symbolization or reporting needed.
+		if t.liveHeapTracker != nil {
+			t.liveHeapTracker.HandleFreeAt(bpfTrace.PID, bpfTrace.Ptr, bpfTrace.KTime)
+		}
+		bpfTrace.KernelFrames = bpfTrace.KernelFrames[0:0]
+		t.tracePool.Put(bpfTrace)
+		return
+	}
+
+	traceHash, frames, extraMeta := t.processManager.HandleTraceWithMetadata(bpfTrace)
+
+	// After symbolization and reporting, feed heap allocs to the live tracker.
+	// Called for every alloc trace (not just ptr != 0) so the tracker can count
+	// all received alloc samples; it ignores the ones eBPF didn't live-track
+	// (ptr == 0). This mirrors the unconditional HandleFree call above.
+	if bpfTrace.Origin == support.TraceOriginHeapAlloc && t.liveHeapTracker != nil {
+		t.liveHeapTracker.HandleAllocWithSizeAndMeta(
+			bpfTrace.PID,
+			bpfTrace.Ptr,
+			traceHash,
+			bpfTrace.Value,
+			bpfTrace.Size,
+			frames,
+			liveheap.ProcessMeta{
+				ExecutablePath: bpfTrace.ExecutablePath,
+				ContainerID:    bpfTrace.ContainerID,
+			},
+			extraMeta,
+			bpfTrace.KTime,
+			uint64(bpfTrace.KTime)^bpfTrace.Ptr^(uint64(bpfTrace.PID)<<32)^traceHash.Lo(),
+		)
+	}
 
 	// Reclaim the EbpfTrace
 	bpfTrace.KernelFrames = bpfTrace.KernelFrames[0:0]

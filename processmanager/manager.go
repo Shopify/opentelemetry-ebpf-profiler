@@ -22,10 +22,12 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind"
 	"go.opentelemetry.io/ebpf-profiler/periodiccaller"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	eim "go.opentelemetry.io/ebpf-profiler/processmanager/execinfomanager"
@@ -48,6 +50,11 @@ const (
 
 	// TTL of entries in the frame cache.
 	frameCacheLifetime = 5 * time.Minute
+
+	// maxConcurrentPIDCleanups bounds the number of background per-PID cleanup
+	// operations (USDT detach, eBPF map deletes) that run concurrently, so
+	// process churn cannot spawn unbounded concurrent kernel work.
+	maxConcurrentPIDCleanups = 16
 )
 
 // dummyPrefix is the LPM prefix installed to indicate the process is known
@@ -64,7 +71,8 @@ var (
 func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monitorInterval time.Duration,
 	executableUnloadDelay time.Duration, ebpf pmebpf.EbpfHandler, traceReporter reporter.TraceReporter,
 	exeReporter reporter.ExecutableReporter, sdp nativeunwind.StackDeltaProvider,
-	filterErrorFrames bool, includeEnvVars libpf.Set[string]) (*ProcessManager, error) {
+	filterErrorFrames bool, includeEnvVars libpf.Set[string],
+	memoryProbeManager *memory.Manager, liveHeapTracker *liveheap.Tracker) (*ProcessManager, error) {
 	if exeReporter == nil {
 		exeReporter = executableReporterStub{}
 	}
@@ -106,6 +114,7 @@ func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monit
 		eim:                      em,
 		interpreters:             interpreters,
 		exitEvents:               make(map[libpf.PID]times.KTime),
+		heapCleanupPending:       make(map[libpf.PID]struct{}),
 		pidToProcessInfo:         make(map[libpf.PID]*processInfo),
 		ebpf:                     ebpf,
 		elfInfoCache:             elfInfoCache,
@@ -117,6 +126,10 @@ func New(ctx context.Context, interpretersConfig interpreterconfig.Config, monit
 		includeEnvVars:           includeEnvVars,
 		selfCgroupIno:            selfCgroupIno,
 		selfContainerID:          selfContainerID,
+		memoryProbeManager:       memoryProbeManager,
+		memoryProbeInstances:     make(map[libpf.PID]*memory.Instance),
+		cleanupSem:               make(chan struct{}, maxConcurrentPIDCleanups),
+		liveHeapTracker:          liveHeapTracker,
 	}
 
 	collectInterpreterMetrics(ctx, pm, monitorInterval)
@@ -186,12 +199,62 @@ func collectInterpreterMetrics(ctx context.Context, pm *ProcessManager,
 		summary.Add(dotnet.GetAndResetMetrics())
 		summary.Add(pm.ebpf.CollectMetrics())
 
+		if pm.memoryProbeManager != nil {
+			summary.Add(pm.memoryProbeManager.GetAndResetMetrics())
+		}
+		if pm.liveHeapTracker != nil {
+			summary.Add(pm.liveHeapTracker.GetAndResetMetrics())
+		}
+
 		pm.eim.UpdateMetricSummary(summary)
 		pm.metricsAddSlice(metricSummaryToSlice(summary))
 	})
 }
 
 func (pm *ProcessManager) Close() {
+	// Tear down any remaining per-PID memory probe links without holding
+	// pm.mu. This is synchronous during terminal shutdown so receiver
+	// start/stop cycles cannot leak kernel uprobe links.
+	pm.mu.Lock()
+	instances := make([]*memory.Instance, 0, len(pm.memoryProbeInstances))
+	for pid, inst := range pm.memoryProbeInstances {
+		instances = append(instances, inst)
+		delete(pm.memoryProbeInstances, pid)
+	}
+	pm.mu.Unlock()
+
+	for _, inst := range instances {
+		if err := inst.Detach(); err != nil {
+			log.Errorf("memory probe detach during shutdown: %v", err)
+		}
+	}
+
+	// Wait for any in-flight background cleanups (per-PID detach / eBPF map
+	// deletes spawned from the exit path) to drain before releasing manager
+	// resources. Relies on the caller having stopped feeding new exit events
+	// before Close, so no deferCleanup runs concurrently with this Wait.
+	pm.cleanupWG.Wait()
+
+	// Release manager-owned discovery resources. Nil-safe when disabled.
+	if err := pm.memoryProbeManager.Close(); err != nil {
+		log.Errorf("memory probe manager close during shutdown: %v", err)
+	}
+}
+
+// deferCleanup runs fn on a background goroutine, tracked by cleanupWG so
+// Close can wait for it, and gated by cleanupSem so at most
+// maxConcurrentPIDCleanups run at once. Used for per-PID teardown (probe
+// detach, eBPF map deletes) that must not hold pm.mu. Safe to call while
+// holding pm.mu: the semaphore is acquired inside the goroutine, so the
+// caller never blocks.
+func (pm *ProcessManager) deferCleanup(fn func()) {
+	pm.cleanupWG.Add(1)
+	go func() {
+		defer pm.cleanupWG.Done()
+		pm.cleanupSem <- struct{}{}
+		defer func() { <-pm.cleanupSem }()
+		fn()
+	}()
 }
 
 func (pm *ProcessManager) symbolizeFrame(pid libpf.PID, data []uint64, frames *libpf.Frames, mapping libpf.FrameMapping) error {
@@ -319,7 +382,17 @@ func hashFrameCacheKey(fk frameCacheKey) uint32 {
 // is not re-entrant due to frameCache not being synced. If the tracer is
 // later updated to distribute trace handling to goroutine pool, the caching
 // strategy needs to be updated accordingly.
-func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
+// Returns the computed trace hash and symbolized frames.
+func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) (libpf.TraceHash, libpf.Frames) {
+	traceHash, frames, _ := pm.HandleTraceWithMetadata(bpfTrace)
+	return traceHash, frames
+}
+
+// HandleTraceWithMetadata additionally returns allocation-time sample metadata
+// produced synchronously by the reporter for stateful consumers such as live heap.
+func (pm *ProcessManager) HandleTraceWithMetadata(bpfTrace *libpf.EbpfTrace) (
+	libpf.TraceHash, libpf.Frames, any,
+) {
 	meta := &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(times.KTime(bpfTrace.KTime).UnixNano()),
 		Comm:           bpfTrace.Comm,
@@ -332,6 +405,7 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 		ContainerID:    bpfTrace.ContainerID,
 		Origin:         bpfTrace.Origin,
 		Value:          bpfTrace.Value,
+		AllocSize:      int64(bpfTrace.Size),
 		EnvVars:        bpfTrace.EnvVars,
 		TraceID:        bpfTrace.APMTraceID,
 		SpanID:         bpfTrace.APMTransactionID,
@@ -394,8 +468,11 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	pm.mu.RUnlock()
 
 	meta.APMServiceName = pm.maybeNotifyAPMAgent(bpfTrace, trace, 1)
+	traceHash := traceutil.HashTrace(trace)
 
 	if err := pm.traceReporter.ReportTraceEvent(trace, meta); err != nil {
 		log.Errorf("Failed to report trace event: %v", err)
 	}
+
+	return traceHash, trace.Frames, meta.ExtraMeta
 }

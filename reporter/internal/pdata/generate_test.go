@@ -14,13 +14,32 @@ import (
 
 	"github.com/open-telemetry/sig-profiling/profcheck"
 
+	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/orderedset"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
+
+type inuseTestAttrProducer struct{}
+
+func (inuseTestAttrProducer) CollectExtraSampleMeta(
+	*libpf.Trace, *samples.TraceEventMeta,
+) any {
+	return nil
+}
+
+func (inuseTestAttrProducer) ExtraSampleAttrs(
+	attrMgr *samples.AttrTableManager, meta any,
+) []int32 {
+	attrs := pcommon.NewInt32Slice()
+	value, _ := meta.(string)
+	attrMgr.AppendOptionalString(attrs, attribute.Key("test.inuse.metadata"), value)
+	return attrs.AsRaw()
+}
 
 var (
 	// Test collection window: 60 second duration
@@ -33,7 +52,7 @@ var (
 
 // testGenerate is a helper that calls Generate with the standard test collection window
 func testGenerate(p *Pdata, tree samples.TraceEventsTree, name, version string) (pprofile.Profiles, error) {
-	return p.Generate(tree, name, version, testCollectionStart, testCollectionEnd)
+	return p.Generate(tree, name, version, testCollectionStart, testCollectionEnd, nil, nil)
 }
 
 func TestGetDummyMappingIndex(t *testing.T) {
@@ -851,4 +870,483 @@ func TestGenerate_Validate(t *testing.T) {
 		CheckDictionaryDuplicates: true,
 		CheckSampleTimestampShape: true}).Check(&data)
 	require.NoError(t, err)
+}
+func TestHeapAllocProducesSpaceAndObjectsProfiles(t *testing.T) {
+	d, err := New(100, nil)
+	require.NoError(t, err)
+
+	mapping := libpf.NewFrameMapping(libpf.FrameMappingData{
+		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+			FileID:   libpf.NewFileID(11, 12),
+			FileName: libpf.Intern("/bin/heap-app"),
+		}),
+	})
+	frames := singleFrameTrace(libpf.NativeFrame, mapping, 0x1234, "", libpf.NullString, 0)
+
+	timestamps := []uint64{
+		uint64(time.Unix(1010, 0).UnixNano()),
+		uint64(time.Unix(1020, 0).UnixNano()),
+	}
+	tree := samples.TraceEventsTree{
+		{ExecutablePath: libpf.Intern("/bin/heap-app")}: samples.ResourceToProfiles{
+			Events: map[libpf.Origin]samples.SampleToEvents{
+				support.TraceOriginHeapAlloc: {
+					{}: &samples.TraceEvents{
+						Frames:     frames,
+						Timestamps: timestamps,
+						Values:     []int64{128, 256},
+					},
+				},
+			},
+		},
+	}
+
+	profiles, err := testGenerate(d, tree, "agent", "v1")
+	require.NoError(t, err)
+	require.Equal(t, 1, profiles.ResourceProfiles().Len())
+	sp := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0)
+	require.Equal(t, 2, sp.Profiles().Len())
+
+	profilesByType := make(map[string]pprofile.Profile)
+	strings := profiles.Dictionary().StringTable()
+	for i := 0; i < sp.Profiles().Len(); i++ {
+		prof := sp.Profiles().At(i)
+		sampleType := prof.SampleType()
+		profilesByType[strings.At(int(sampleType.TypeStrindex()))] = prof
+	}
+
+	allocSpace, ok := profilesByType["alloc_space"]
+	require.True(t, ok)
+	assert.Equal(t, "bytes", strings.At(int(allocSpace.SampleType().UnitStrindex())))
+	require.Equal(t, 1, allocSpace.Samples().Len())
+	assert.Equal(t, []int64{128, 256}, allocSpace.Samples().At(0).Values().AsRaw())
+	assert.Equal(t, timestamps, allocSpace.Samples().At(0).TimestampsUnixNano().AsRaw())
+
+	allocObjects, ok := profilesByType["alloc_objects"]
+	require.True(t, ok)
+	assert.Equal(t, "count", strings.At(int(allocObjects.SampleType().UnitStrindex())))
+	require.Equal(t, 1, allocObjects.Samples().Len())
+	assert.Equal(t, []int64{1, 1}, allocObjects.Samples().At(0).Values().AsRaw())
+	assert.Equal(t, timestamps, allocObjects.Samples().At(0).TimestampsUnixNano().AsRaw())
+}
+
+// TestHeapAllocObjectsUsesAllocSizeWeighting verifies that alloc_objects is
+// derived from Values (byte-weight) divided by the per-event AllocSizes
+// (raw allocation size), with unbiased integer rounding rather than a flat
+// count of 1 per sample. A missing/zero size falls back to 1.
+func TestHeapAllocObjectsUsesAllocSizeWeighting(t *testing.T) {
+	d, err := New(100, nil)
+	require.NoError(t, err)
+
+	mapping := libpf.NewFrameMapping(libpf.FrameMappingData{
+		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+			FileID:   libpf.NewFileID(11, 12),
+			FileName: libpf.Intern("/bin/heap-app"),
+		}),
+	})
+	frames := singleFrameTrace(libpf.NativeFrame, mapping, 0x1234, "", libpf.NullString, 0)
+
+	timestamps := []uint64{
+		uint64(time.Unix(1010, 0).UnixNano()),
+		uint64(time.Unix(1020, 0).UnixNano()),
+		uint64(time.Unix(1030, 0).UnixNano()),
+		uint64(time.Unix(1040, 0).UnixNano()),
+	}
+	tree := samples.TraceEventsTree{
+		{ExecutablePath: libpf.Intern("/bin/heap-app")}: samples.ResourceToProfiles{
+			Events: map[libpf.Origin]samples.SampleToEvents{
+				support.TraceOriginHeapAlloc: {
+					{}: &samples.TraceEvents{
+						Frames:     frames,
+						Timestamps: timestamps,
+						// weight=1000 @ size=100 -> 10 objects.
+						// weight=64 @ size=64 -> 1 object.
+						// weight=500 @ size=0 (unknown) -> falls back to 1.
+						// weight=10 @ size=3 -> stochastically rounded 3 or 4.
+						Values:     []int64{1000, 64, 500, 10},
+						AllocSizes: []int64{100, 64, 0, 3},
+					},
+				},
+			},
+		},
+	}
+
+	profiles, err := testGenerate(d, tree, "agent", "v1")
+	require.NoError(t, err)
+
+	sp := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0)
+	strings := profiles.Dictionary().StringTable()
+	var allocObjects pprofile.Profile
+	for i := 0; i < sp.Profiles().Len(); i++ {
+		prof := sp.Profiles().At(i)
+		if strings.At(int(prof.SampleType().TypeStrindex())) == "alloc_objects" {
+			allocObjects = prof
+		}
+	}
+	require.Equal(t, 1, allocObjects.Samples().Len())
+	fractional := liveheap.EstimateObjectWeight(10, 3, timestamps[3]^3)
+	assert.Equal(t, []int64{10, 1, 1, fractional},
+		allocObjects.Samples().At(0).Values().AsRaw())
+}
+
+// TestCompareSampleKeys exercises the sample-key comparator that gives the
+// heap-alloc profiles their deterministic order: every field is a tiebreaker
+// tier, and the comparator must be antisymmetric and only equal for equal keys.
+func TestCompareSampleKeys(t *testing.T) {
+	base := samples.SampleKey{
+		Comm:    libpf.NewCommFromString("comm"),
+		Hash:    libpf.NewTraceHash(1, 1),
+		TID:     10,
+		CPU:     20,
+		SpanID:  libpf.APMSpanID{0x1},
+		TraceID: libpf.APMTraceID{0x1},
+	}
+	with := func(mut func(*samples.SampleKey)) samples.SampleKey {
+		k := base
+		mut(&k)
+		return k
+	}
+
+	// Equal keys compare equal.
+	assert.Equal(t, 0, compareSampleKeys(base, base))
+
+	// A difference in any single field yields a non-zero, antisymmetric result.
+	for _, f := range []struct {
+		name  string
+		other samples.SampleKey
+	}{
+		{"comm", with(func(k *samples.SampleKey) { k.Comm = libpf.NewCommFromString("zzz") })},
+		{"hash", with(func(k *samples.SampleKey) { k.Hash = libpf.NewTraceHash(1, 2) })},
+		{"tid", with(func(k *samples.SampleKey) { k.TID = 11 })},
+		{"cpu", with(func(k *samples.SampleKey) { k.CPU = 21 })},
+		{"spanID", with(func(k *samples.SampleKey) { k.SpanID = libpf.APMSpanID{0x2} })},
+		{"traceID", with(func(k *samples.SampleKey) { k.TraceID = libpf.APMTraceID{0x2} })},
+		{"extraMeta", with(func(k *samples.SampleKey) { k.ExtraMeta = "x" })},
+	} {
+		f := f
+		t.Run(f.name, func(t *testing.T) {
+			fwd := compareSampleKeys(base, f.other)
+			rev := compareSampleKeys(f.other, base)
+			assert.NotZero(t, fwd, "keys differing in %s must not compare equal", f.name)
+			assert.Equal(t, fwd, -rev, "comparator must be antisymmetric for %s", f.name)
+		})
+	}
+}
+
+// TestSampleKeys_SortedDeterministic verifies that sampleKeys(_, true) returns a
+// stable, fully-ordered sequence (independent of Go's randomized map iteration),
+// and that sampleKeys(_, false) still returns the full set. This guards the
+// sort that keeps the paired alloc profiles aligned; removing it would make the
+// sorted call non-deterministic and fail here.
+func TestSampleKeys_SortedDeterministic(t *testing.T) {
+	events := samples.SampleToEvents{}
+	for i := 0; i < 16; i++ {
+		events[samples.SampleKey{Hash: libpf.NewTraceHash(0, uint64(i+1)), TID: int64(i)}] =
+			&samples.TraceEvents{}
+	}
+
+	first := sampleKeys(events, true)
+	for i := 0; i < 5; i++ {
+		assert.Equal(t, first, sampleKeys(events, true),
+			"sorted sampleKeys must be deterministic across calls")
+	}
+	for i := 1; i < len(first); i++ {
+		assert.LessOrEqual(t, compareSampleKeys(first[i-1], first[i]), 0,
+			"sorted sampleKeys must be in compareSampleKeys order")
+	}
+
+	assert.Len(t, sampleKeys(events, false), len(events),
+		"unsorted sampleKeys must still return every key")
+}
+
+// TestGenerate_HeapAllocProfilesAligned verifies the invariant the heap-alloc
+// sort exists to protect: alloc_space and alloc_objects are emitted as two
+// separate Profile messages over the same events map, and their samples must
+// line up index-for-index. With many distinct-stack keys, an unsorted (random)
+// map iteration would almost certainly misalign the two profiles.
+func TestGenerate_HeapAllocProfilesAligned(t *testing.T) {
+	d, err := New(100, nil)
+	require.NoError(t, err)
+
+	mapping := libpf.NewFrameMapping(libpf.FrameMappingData{
+		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+			FileID:   libpf.NewFileID(11, 12),
+			FileName: libpf.Intern("/bin/heap-app"),
+		}),
+	})
+
+	const n = 64
+	allocEvents := samples.SampleToEvents{}
+	for i := 0; i < n; i++ {
+		key := samples.SampleKey{
+			Comm: libpf.NewCommFromString("comm"),
+			Hash: libpf.NewTraceHash(uint64(i), uint64(i+1)),
+			TID:  int64(i),
+		}
+		allocEvents[key] = &samples.TraceEvents{
+			// Distinct address per key => distinct location => distinct stack,
+			// so the stack-index sequence is a fingerprint of iteration order.
+			Frames: singleFrameTrace(libpf.NativeFrame, mapping,
+				libpf.AddressOrLineno(0x1000+i*0x10), "", libpf.NullString, 0),
+			Timestamps: []uint64{uint64(testCollectionEnd.UnixNano())},
+			Values:     []int64{int64((i + 1) * 100)},
+		}
+	}
+
+	tree := samples.TraceEventsTree{
+		{ExecutablePath: libpf.Intern("/bin/heap-app")}: samples.ResourceToProfiles{
+			Events: map[libpf.Origin]samples.SampleToEvents{
+				support.TraceOriginHeapAlloc: allocEvents,
+			},
+		},
+	}
+
+	profiles, err := testGenerate(d, tree, "agent", "v1")
+	require.NoError(t, err)
+	require.Equal(t, 1, profiles.ResourceProfiles().Len())
+	sp := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0)
+	require.Equal(t, 2, sp.Profiles().Len(), "heap alloc emits alloc_space + alloc_objects")
+
+	strings := profiles.Dictionary().StringTable()
+	stacksByType := make(map[string][]int32)
+	for i := 0; i < sp.Profiles().Len(); i++ {
+		prof := sp.Profiles().At(i)
+		name := strings.At(int(prof.SampleType().TypeStrindex()))
+		require.Equal(t, n, prof.Samples().Len(), "%s should have one sample per key", name)
+		seq := make([]int32, prof.Samples().Len())
+		for j := 0; j < prof.Samples().Len(); j++ {
+			seq[j] = prof.Samples().At(j).StackIndex()
+		}
+		stacksByType[name] = seq
+	}
+
+	require.Contains(t, stacksByType, "alloc_space")
+	require.Contains(t, stacksByType, "alloc_objects")
+	assert.Equal(t, stacksByType["alloc_space"], stacksByType["alloc_objects"],
+		"paired alloc profiles must list samples in the same order to line up index-for-index")
+
+	// Sanity: alignment is only meaningful because the stacks are distinct.
+	distinct := make(map[int32]struct{}, n)
+	for _, s := range stacksByType["alloc_space"] {
+		distinct[s] = struct{}{}
+	}
+	assert.Len(t, distinct, n, "each key should map to a distinct stack")
+}
+
+// TestGenerate_InuseProfiles covers appendInuseProfiles: a live-heap snapshot
+// produces paired inuse_space/inuse_objects profiles under a per-PID resource,
+// with the correct values, and (regression for the shared frame-walk) the
+// same frame-type and build-ID attributes as the main profile path.
+func TestGenerate_InuseProfiles(t *testing.T) {
+	d, err := New(100, inuseTestAttrProducer{})
+	require.NoError(t, err)
+
+	mappingFile := libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+		FileID:   libpf.NewFileID(7, 8),
+		FileName: libpf.Intern("/lib/libheap.so"),
+	})
+	frames := singleFrameNative(mappingFile, 0x2000, 0x2000, 0x3000, 0x200)
+
+	inuse := []liveheap.InuseEntry{
+		{PID: 42, TraceHash: libpf.NewTraceHash(0, 1), Frames: frames,
+			Space: 4096, Objects: 3, ExtraMeta: "pod-a"},
+	}
+
+	// Empty event tree: the inuse profiles stand alone and create their own
+	// per-PID ResourceProfiles.
+	tree := make(samples.TraceEventsTree)
+	profiles, err := d.Generate(tree, "agent", "v1",
+		testCollectionStart, testCollectionEnd, inuse, func(pid libpf.PID) liveheap.ProcessMeta {
+			require.Equal(t, libpf.PID(42), pid)
+			return liveheap.ProcessMeta{
+				ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+				ContainerID:    libpf.Intern("container-42"),
+			}
+		})
+	require.NoError(t, err)
+
+	require.Equal(t, 1, profiles.ResourceProfiles().Len())
+	rp := profiles.ResourceProfiles().At(0)
+	assert.Equal(t, semconv.SchemaURL, rp.SchemaUrl())
+	pidVal, ok := rp.Resource().Attributes().Get(string(semconv.ProcessPIDKey))
+	require.True(t, ok, "inuse resource must carry the process PID")
+	assert.Equal(t, int64(42), pidVal.Int())
+	pathVal, ok := rp.Resource().Attributes().Get(string(semconv.ProcessExecutablePathKey))
+	require.True(t, ok)
+	assert.Equal(t, "/usr/bin/ruby", pathVal.Str())
+	nameVal, ok := rp.Resource().Attributes().Get(string(semconv.ProcessExecutableNameKey))
+	require.True(t, ok)
+	assert.Equal(t, "ruby", nameVal.Str())
+	containerVal, ok := rp.Resource().Attributes().Get(string(semconv.ContainerIDKey))
+	require.True(t, ok)
+	assert.Equal(t, "container-42", containerVal.Str())
+
+	require.Equal(t, 1, rp.ScopeProfiles().Len())
+	sp := rp.ScopeProfiles().At(0)
+	assert.Equal(t, semconv.SchemaURL, sp.SchemaUrl())
+	require.Equal(t, 2, sp.Profiles().Len(), "inuse_space + inuse_objects")
+
+	strings := profiles.Dictionary().StringTable()
+	byType := make(map[string]pprofile.Profile)
+	for i := 0; i < sp.Profiles().Len(); i++ {
+		prof := sp.Profiles().At(i)
+		byType[strings.At(int(prof.SampleType().TypeStrindex()))] = prof
+	}
+
+	space, ok := byType["inuse_space"]
+	require.True(t, ok, "inuse_space profile present")
+	assert.Equal(t, pcommon.Timestamp(testCollectionEnd.UnixNano()), space.Time())
+	assert.Zero(t, space.DurationNano(), "inuse profiles are instantaneous snapshots")
+	assert.Equal(t, "bytes", strings.At(int(space.SampleType().UnitStrindex())))
+	require.Equal(t, 1, space.Samples().Len())
+	assert.Equal(t, []int64{4096}, space.Samples().At(0).Values().AsRaw())
+	assert.Equal(t, []uint64{uint64(testCollectionEnd.UnixNano())},
+		space.Samples().At(0).TimestampsUnixNano().AsRaw())
+
+	objects, ok := byType["inuse_objects"]
+	require.True(t, ok, "inuse_objects profile present")
+	assert.Equal(t, pcommon.Timestamp(testCollectionEnd.UnixNano()), objects.Time())
+	assert.Zero(t, objects.DurationNano(), "inuse profiles are instantaneous snapshots")
+	assert.Equal(t, "count", strings.At(int(objects.SampleType().UnitStrindex())))
+	require.Equal(t, 1, objects.Samples().Len())
+	assert.Equal(t, []int64{3}, objects.Samples().At(0).Values().AsRaw())
+	assert.Equal(t, []uint64{uint64(testCollectionEnd.UnixNano())},
+		objects.Samples().At(0).TimestampsUnixNano().AsRaw())
+
+	for _, prof := range []pprofile.Profile{space, objects} {
+		sample := prof.Samples().At(0)
+		found := false
+		for _, index := range sample.AttributeIndices().AsRaw() {
+			attr := profiles.Dictionary().AttributeTable().At(int(index))
+			key := strings.At(int(attr.KeyStrindex()))
+			if key == "test.inuse.metadata" {
+				found = true
+				assert.Equal(t, "pod-a", attr.Value().AsRaw())
+			}
+		}
+		assert.True(t, found, "inuse samples must retain allocation-time extra metadata")
+	}
+
+	// The only frames in this request are the inuse ones, so the presence of
+	// these attribute keys proves appendInuseProfiles attached them (via the
+	// shared appendFramesAsStack helper).
+	assert.True(t, attrKeyPresent(profiles.Dictionary(), string(semconv.ProfileFrameTypeKey)),
+		"inuse locations must carry the frame-type attribute")
+	assert.True(t, attrKeyPresent(profiles.Dictionary(), string(semconv.ProcessExecutableBuildIDHtlhashKey)),
+		"inuse mappings must carry the build-ID attribute")
+}
+
+func TestMatchingInuseResourceFallsBackOnlyWhenUnambiguous(t *testing.T) {
+	profiles := pprofile.NewProfiles()
+	first := profiles.ResourceProfiles().AppendEmpty()
+	first.Resource().Attributes().PutInt(string(semconv.ProcessPIDKey), 42)
+	first.Resource().Attributes().PutStr(
+		string(semconv.ProcessExecutablePathKey), "/usr/bin/ruby")
+	first.Resource().Attributes().PutStr(string(semconv.ContainerIDKey), "container-42")
+
+	matched, ok := matchingInuseResource(
+		[]pprofile.ResourceProfiles{first}, liveheap.ProcessMeta{
+			ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+		}, true)
+	require.True(t, ok, "partial current metadata may select one unambiguous resource")
+	assert.Equal(t, "container-42", matched.Resource().Attributes().AsRaw()[string(semconv.ContainerIDKey)])
+
+	matched, ok = matchingInuseResource(
+		[]pprofile.ResourceProfiles{first}, liveheap.ProcessMeta{}, false)
+	require.True(t, ok)
+	assert.Equal(t, "/usr/bin/ruby", matched.Resource().Attributes().AsRaw()[string(semconv.ProcessExecutablePathKey)])
+
+	second := profiles.ResourceProfiles().AppendEmpty()
+	second.Resource().Attributes().PutInt(string(semconv.ProcessPIDKey), 42)
+	second.Resource().Attributes().PutStr(
+		string(semconv.ProcessExecutablePathKey), "/usr/bin/ruby")
+	second.Resource().Attributes().PutStr(string(semconv.ContainerIDKey), "container-99")
+	_, ok = matchingInuseResource(
+		[]pprofile.ResourceProfiles{first, second}, liveheap.ProcessMeta{}, false)
+	assert.False(t, ok, "missing metadata must not choose arbitrarily after PID reuse")
+
+	_, ok = matchingInuseResource(
+		[]pprofile.ResourceProfiles{first, second}, liveheap.ProcessMeta{
+			ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+		}, true)
+	assert.False(t, ok,
+		"partial metadata must not choose between ambiguous PID generations")
+}
+
+func TestGenerate_InuseProfilesMatchFullProcessResource(t *testing.T) {
+	d, err := New(100, nil)
+	require.NoError(t, err)
+
+	frames := singleFrameNative(libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+		FileID: libpf.NewFileID(7, 8), FileName: libpf.Intern("/lib/libheap.so"),
+	}), 0x2000, 0x2000, 0x3000, 0x200)
+	makeEvents := func() map[libpf.Origin]samples.SampleToEvents {
+		return map[libpf.Origin]samples.SampleToEvents{
+			support.TraceOriginSampling: {
+				{}: &samples.TraceEvents{
+					Frames: frames,
+					Timestamps: []uint64{
+						uint64(testCollectionEnd.UnixNano()),
+					},
+				},
+			},
+		}
+	}
+	tree := samples.TraceEventsTree{
+		{PID: 42, ExecutablePath: libpf.Intern("/old/app"),
+			ContainerID: libpf.Intern("old-container")}: {
+			Events: makeEvents(),
+		},
+		{PID: 42, ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+			ContainerID: libpf.Intern("container-42")}: {
+			Events: makeEvents(),
+		},
+	}
+	inuse := []liveheap.InuseEntry{{
+		PID: 42, TraceHash: libpf.NewTraceHash(0, 1), Frames: frames,
+		ProcessMeta: liveheap.ProcessMeta{
+			ExecutablePath: libpf.Intern("/usr/bin/ruby"),
+			ContainerID:    libpf.Intern("container-42"),
+		},
+		Space: 4096, Objects: 8,
+	}}
+	profiles, err := d.Generate(tree, "agent", "v1",
+		testCollectionStart, testCollectionEnd, inuse, func(libpf.PID) liveheap.ProcessMeta {
+			// Simulate PID reuse between Snapshot and Generate. Embedded allocation-
+			// time metadata must win over this now-current process identity.
+			return liveheap.ProcessMeta{
+				ExecutablePath: libpf.Intern("/old/app"),
+				ContainerID:    libpf.Intern("old-container"),
+			}
+		})
+	require.NoError(t, err)
+	require.Equal(t, 2, profiles.ResourceProfiles().Len(),
+		"PID reuse must not create or merge into an unrelated resource")
+
+	for i := range profiles.ResourceProfiles().Len() {
+		rp := profiles.ResourceProfiles().At(i)
+		path, ok := rp.Resource().Attributes().Get(string(semconv.ProcessExecutablePathKey))
+		require.True(t, ok)
+		profilesLen := rp.ScopeProfiles().At(0).Profiles().Len()
+		if path.Str() == "/usr/bin/ruby" {
+			assert.Equal(t, 3, profilesLen,
+				"matching resource contains sampling plus paired inuse profiles")
+		} else {
+			assert.Equal(t, 1, profilesLen,
+				"stale PID resource must not receive current inuse profiles")
+		}
+	}
+}
+
+// attrKeyPresent reports whether any entry in the dictionary's attribute table
+// uses the given key.
+func attrKeyPresent(dic pprofile.ProfilesDictionary, key string) bool {
+	strings := dic.StringTable()
+	at := dic.AttributeTable()
+	for i := 0; i < at.Len(); i++ {
+		if strings.At(int(at.At(i).KeyStrindex())) == key {
+			return true
+		}
+	}
+	return false
 }

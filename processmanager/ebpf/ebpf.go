@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
+	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	"go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
@@ -53,6 +54,12 @@ type ebpfMapsImpl struct {
 	ApmIntProcs        *cebpf.Map `name:"apm_int_procs"`
 	GoLabelsProcs      *cebpf.Map `name:"go_labels_procs"`
 	LuajitProcs        *cebpf.Map `name:"luajit_procs"`
+	HeapAllocLive      *cebpf.Map `name:"heap_alloc_live"`
+	HeapLivePids       *cebpf.Map `name:"heap_live_pids"`
+	HeapPIDAllocCount  *cebpf.Map `name:"heap_pid_alloc_count"`
+	HeapPIDAllocLimit  *cebpf.Map `name:"heap_pid_alloc_limit"`
+	HeapPendingAllocs  *cebpf.Map `name:"heap_pending_allocs"`
+	HeapSampling       *cebpf.Map `name:"heap_sampling_interval"`
 
 	// Stackdelta and process related eBPF maps
 	ExeIDToStackDeltaMaps []*cebpf.Map
@@ -83,7 +90,8 @@ var _ ebpfapi.EbpfHandler = &ebpfMapsImpl{}
 // It further spawns background workers for deferred map updates; the given
 // context can be used to terminate them on shutdown.
 func LoadMaps(ctx context.Context, interpretersConfig interpreterconfig.Config,
-	maps map[string]*cebpf.Map, stackdeltaInnerMapSpec *cebpf.MapSpec) (ebpfapi.EbpfHandler, error) {
+	probesConfig probeconfig.Config, maps map[string]*cebpf.Map,
+	stackdeltaInnerMapSpec *cebpf.MapSpec) (ebpfapi.EbpfHandler, error) {
 	impl := &ebpfMapsImpl{
 		stackdeltaInnerMapTemplate: stackdeltaInnerMapSpec,
 	}
@@ -99,7 +107,8 @@ func LoadMaps(ctx context.Context, interpretersConfig interpreterconfig.Config,
 		}
 		mapVal, ok := maps[nameTag]
 		if !ok {
-			if !interpretersConfig.IsMapEnabled(nameTag) {
+			if !interpretersConfig.IsMapEnabled(nameTag) ||
+				!probesConfig.IsMapEnabled(nameTag) {
 				continue
 			}
 			return nil, fmt.Errorf("Map %v is not available", nameTag)
@@ -479,6 +488,119 @@ func (impl *ebpfMapsImpl) getOuterMap(mapID uint16) *cebpf.Map {
 func (impl *ebpfMapsImpl) RemoveReportedPID(pid libpf.PID) {
 	key := uint32(pid)
 	_ = impl.ReportedPIDs.Delete(unsafe.Pointer(&key))
+}
+
+// SetHeapLivePID adds or removes a PID from the heap_live_pids eBPF map.
+// When present, uprobe_heap_alloc will record allocations for this PID
+// in heap_alloc_live for free correlation.
+func (impl *ebpfMapsImpl) SetHeapLivePID(pid libpf.PID, enabled bool) error {
+	if impl.HeapLivePids == nil {
+		return nil
+	}
+	key := uint32(pid)
+	if enabled {
+		val := uint8(1)
+		if err := impl.HeapLivePids.Put(unsafe.Pointer(&key), unsafe.Pointer(&val)); err != nil {
+			return fmt.Errorf("enable live heap tracking for PID %d: %w", pid, err)
+		}
+		return nil
+	}
+	if err := impl.HeapLivePids.Delete(unsafe.Pointer(&key)); err != nil &&
+		!errors.Is(err, cebpf.ErrKeyNotExist) {
+		return fmt.Errorf("disable live heap tracking for PID %d: %w", pid, err)
+	}
+	return nil
+}
+
+// DeleteHeapAllocLiveEntries removes every entry from heap_alloc_live for pid.
+// ptrs is a fast path for allocations already observed in userspace; the full
+// scan also removes allocations whose ring-buffer records were delayed or lost.
+func (impl *ebpfMapsImpl) DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64) error {
+	if impl.HeapAllocLive == nil {
+		return nil
+	}
+	type heapAllocKey struct {
+		Pid uint32
+		Pad uint32
+		Ptr uint64
+	}
+	type heapAllocValue struct {
+		Weight uint64
+	}
+
+	for _, ptr := range ptrs {
+		key := heapAllocKey{Pid: uint32(pid), Ptr: ptr}
+		if err := impl.HeapAllocLive.Delete(unsafe.Pointer(&key)); err != nil &&
+			!errors.Is(err, cebpf.ErrKeyNotExist) {
+			return fmt.Errorf("delete known heap_alloc_live key for PID %d: %w", pid, err)
+		}
+	}
+
+	// Do not delete while iterating: BPF_MAP_GET_NEXT_KEY restarts from the
+	// beginning when its current key disappears and can otherwise skip entries.
+	// Confirmation passes also tolerate concurrent structural changes from
+	// allocations belonging to other PIDs in this global hash map.
+	for attempt := 0; attempt < 4; attempt++ {
+		var staleKeys []heapAllocKey
+		var key heapAllocKey
+		var value heapAllocValue
+		iterator := impl.HeapAllocLive.Iterate()
+		for iterator.Next(&key, &value) {
+			if key.Pid == uint32(pid) {
+				staleKeys = append(staleKeys, key)
+			}
+		}
+		if err := iterator.Err(); err != nil {
+			return fmt.Errorf("scan heap_alloc_live while cleaning PID %d: %w", pid, err)
+		}
+		if len(staleKeys) == 0 {
+			return nil
+		}
+		if attempt == 3 {
+			return fmt.Errorf("%d heap_alloc_live entries remain for PID %d after cleanup",
+				len(staleKeys), pid)
+		}
+		for idx := range staleKeys {
+			if err := impl.HeapAllocLive.Delete(unsafe.Pointer(&staleKeys[idx])); err != nil &&
+				!errors.Is(err, cebpf.ErrKeyNotExist) {
+				return fmt.Errorf("delete heap_alloc_live key for PID %d: %w", pid, err)
+			}
+		}
+	}
+	return nil
+}
+
+// DeleteHeapPIDAllocCount removes the per-PID alloc count entry for the given PID.
+// Called on process exit to reclaim the map slot.
+func (impl *ebpfMapsImpl) DeleteHeapPIDAllocCount(pid libpf.PID) error {
+	if impl.HeapPIDAllocCount == nil {
+		return nil
+	}
+	key := uint32(pid)
+	if err := impl.HeapPIDAllocCount.Delete(unsafe.Pointer(&key)); err != nil &&
+		!errors.Is(err, cebpf.ErrKeyNotExist) {
+		return fmt.Errorf("delete live heap allocation count for PID %d: %w", pid, err)
+	}
+	return nil
+}
+
+// SetHeapPIDAllocLimit writes the per-PID allocation limit to the eBPF array map.
+func (impl *ebpfMapsImpl) SetHeapPIDAllocLimit(limit uint32) {
+	if impl.HeapPIDAllocLimit == nil {
+		return
+	}
+	key := uint32(0)
+	_ = impl.HeapPIDAllocLimit.Update(unsafe.Pointer(&key), unsafe.Pointer(&limit), cebpf.UpdateAny)
+}
+
+// SetHeapSamplingInterval writes the byte-proportional sampling interval used
+// by directly instrumented malloc-like hooks.
+func (impl *ebpfMapsImpl) SetHeapSamplingInterval(interval uint32) {
+	if impl.HeapSampling == nil {
+		return
+	}
+	key := uint32(0)
+	_ = impl.HeapSampling.Update(unsafe.Pointer(&key), unsafe.Pointer(&interval), cebpf.UpdateAny)
 }
 
 // UpdateUnwindInfo writes UnwindInfo into the unwind info array at the given index

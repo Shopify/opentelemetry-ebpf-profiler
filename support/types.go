@@ -62,7 +62,7 @@ const (
 const UnwindInfoMaxEntries = 0x4000
 
 const (
-	MetricIDBeginCumulative = 0x71
+	MetricIDBeginCumulative = 0x73
 )
 
 const (
@@ -89,10 +89,12 @@ const (
 )
 
 const (
-	TraceOriginUnknown  = 0x0
-	TraceOriginSampling = 0x1
-	TraceOriginOffCPU   = 0x2
-	TraceOriginProbe    = 0x3
+	TraceOriginUnknown   = 0x0
+	TraceOriginSampling  = 0x1
+	TraceOriginOffCPU    = 0x2
+	TraceOriginProbe     = 0x3
+	TraceOriginHeapAlloc = 0x4
+	TraceOriginHeapFree  = 0x5
 )
 
 type ApmSpanID [8]byte
@@ -167,6 +169,8 @@ type Trace struct {
 	Num_kernel_frames  uint16
 	Origin             uint32
 	Value              uint64
+	Ptr                uint64
+	Size               uint64
 	Cpu_id             uint32
 	Frame_data         [3072]uint64
 }
@@ -341,7 +345,7 @@ type LuaJITProcInfo struct {
 
 const (
 	Sizeof_StackDelta = 0x4
-	Sizeof_Trace      = 0x62d8
+	Sizeof_Trace      = 0x62e8
 
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4
@@ -523,4 +527,6 @@ var MetricsTranslation = []metrics.MetricID{
 	0x6e: metrics.IDUnwindNativeErrNoVMA,
 	0x6f: metrics.IDUnwindNativeErrUnsupportedAnonymousMapping,
 	0x70: metrics.IDUnwindNativeErrNonExecutableVMA,
+	0x71: metrics.IDHeapLiveMapFull,
+	0x72: metrics.IDHeapPerPIDLimitHit,
 }

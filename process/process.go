@@ -98,6 +98,10 @@ func (sp *systemProcess) PID() libpf.PID {
 	return sp.pid
 }
 
+func (sp *systemProcess) TID() libpf.PID {
+	return sp.tid
+}
+
 func (sp *systemProcess) GetMachineData() MachineData {
 	return MachineData{Machine: pfelf.CurrentMachine}
 }
@@ -480,7 +484,9 @@ func openInProcRoot(pid libpf.PID, filePath string) (*os.File, error) {
 // getMappingFile opens the backing file for a mapping and returns an open file descriptor.
 // The caller is responsible for closing the returned file.
 func (sp *systemProcess) getMappingFile(m *RawMapping) (*os.File, error) {
-	if !m.IsFileBacked() {
+	// memfd mappings are intentionally not classified as ordinary file-backed
+	// mappings, but their exact backing object is still available via map_files.
+	if !m.IsFileBacked() && !m.IsMemFD() {
 		return nil, errors.New("no backing file for anonymous memory")
 	}
 	if sp.mainThreadExit {

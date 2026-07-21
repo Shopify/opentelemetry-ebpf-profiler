@@ -16,6 +16,8 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/internal/controller"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
+	"go.opentelemetry.io/ebpf-profiler/probes/probeconfig"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
 )
 
@@ -84,6 +86,22 @@ var (
 		"Expected format: probe_type:target[:symbol]. probe_type can be kprobe, kretprobe, uprobe, or uretprobe."
 	loadProbeHelper = "Load generic eBPF program that can be attached externally to " +
 		"various user or kernel space hooks."
+	heapProfilingHelper = "Enable allocation profiling through configured process-local " +
+		"USDT or allocator function hooks."
+	heapAllocationHookHelper = "Allocation hook (repeatable): usdt:<provider>:<name> or " +
+		"weighted-uprobe:<executable-pattern>:<symbol> consumes a weighted event; " +
+		"uprobe:<executable-pattern>:<symbol> pairs allocator entry and return probes."
+	heapDeallocationHookHelper = "Deallocation hook (repeatable): usdt:<provider>:<name> or " +
+		"uprobe:<executable-pattern>:<symbol>; both consume a pointer at function entry."
+	heapProcessExecutableHelper = "Process executable selector eligible for memory hooks " +
+		"(repeatable): basename/full-path globs for direct hooks, exact absolute paths for injection."
+	heapExperimentalInjectionHelper = "EXPERIMENTAL/RISKY target mutation: disabled, got, or " +
+		"got-then-inline. Injects the heap shim with ptrace; the final mode may overwrite libc text."
+	heapExperimentalShimHelper = "Absolute local path to the x86-64 heap shim used by " +
+		"experimental allocator injection. Required when injection is not disabled."
+	liveHeapProfilingHelper = "Additionally track deallocations to report the live " +
+		"(in-use) heap by attaching the heap-sampler free probe. " +
+		"Requires -heap-profiling."
 	bpffsHelp = fmt.Sprintf("Set the root BPF FS path for pinned maps. Only used for OBI span/trace ID communication. Default is %s",
 		defaultBPFFSRoot)
 	obiProcessCtxHelp = "Load or create a pinned eBPF map for sharing process context information with OBI."
@@ -93,8 +111,9 @@ var (
 // to the same flagset.
 
 func parseArgs() (*controller.Config, error) {
-	var args controller.Config
+	args := controller.Config{Config: config.Config{Probes: probeconfig.DefaultConfig()}}
 	var tracers string
+	var allocationHooksSet, deallocationHooksSet bool
 
 	fs := flag.NewFlagSet("ebpf-profiler", flag.ExitOnError)
 
@@ -159,6 +178,56 @@ func parseArgs() (*controller.Config, error) {
 	fs.BoolVar(&args.OBIProcessCtx, "obi-process-ctx", false, obiProcessCtxHelp)
 
 	fs.BoolVar(&args.LoadProbe, "load-probe", false, loadProbeHelper)
+
+	fs.Func("heap-allocation-hook", heapAllocationHookHelper, func(spec string) error {
+		hook, err := memory.ParseHook(spec)
+		if err != nil {
+			return err
+		}
+		if !allocationHooksSet {
+			args.Probes.Memory.AllocationHooks = nil
+			allocationHooksSet = true
+		}
+		args.Probes.Memory.AllocationHooks = append(args.Probes.Memory.AllocationHooks, hook)
+		return nil
+	})
+
+	fs.Func("heap-deallocation-hook", heapDeallocationHookHelper, func(spec string) error {
+		hook, err := memory.ParseHook(spec)
+		if err != nil {
+			return err
+		}
+		if !deallocationHooksSet {
+			args.Probes.Memory.DeallocationHooks = nil
+			deallocationHooksSet = true
+		}
+		args.Probes.Memory.DeallocationHooks = append(args.Probes.Memory.DeallocationHooks, hook)
+		return nil
+	})
+
+	fs.Var(&args.Probes.Memory.ExperimentalInjectionMode,
+		"heap-experimental-injection", heapExperimentalInjectionHelper)
+	fs.StringVar(&args.Probes.Memory.ExperimentalShimPath,
+		"heap-experimental-shim", "", heapExperimentalShimHelper)
+
+	fs.BoolVar(&args.Probes.Memory.Enabled, "heap-profiling", false, heapProfilingHelper)
+
+	fs.Func("heap-process-executable", heapProcessExecutableHelper, func(pattern string) error {
+		args.Probes.Memory.ProcessExecutablePatterns = append(
+			args.Probes.Memory.ProcessExecutablePatterns, pattern)
+		return nil
+	})
+
+	fs.Uint64Var(&args.Probes.Memory.SamplingIntervalBytes, "heap-sampling-interval-bytes",
+		memory.DefaultSamplingIntervalBytes,
+		"Average bytes represented by one sample when directly instrumenting an allocator.")
+
+	fs.BoolVar(&args.Probes.Memory.Live, "live-heap-profiling", false,
+		liveHeapProfilingHelper)
+
+	fs.IntVar(&args.Probes.Memory.MaxEntriesPerPID, "live-heap-max-entries-per-pid",
+		memory.DefaultMaxEntriesPerPID, "Maximum number of live heap entries tracked per process. "+
+			"Allocations beyond this limit are not tracked for inuse profiling.")
 
 	fs.Usage = func() {
 		fs.PrintDefaults()

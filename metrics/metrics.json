@@ -2188,5 +2188,96 @@
     "name": "UnwindLuaJITErrNoProcInfo",
     "field": "bpf.luajit.errors.no_proc_info",
     "id": 299
+  },
+  {
+    "description": "Number of heap allocs dropped in eBPF due to per-PID live-heap cap",
+    "type": "counter",
+    "name": "HeapPerPIDLimitHit",
+    "field": "bpf.heap.per_pid_limit_hit",
+    "id": 300
+  },
+  {
+    "description": "Number of heap allocs dropped in eBPF due to global live-heap map full",
+    "type": "counter",
+    "name": "HeapLiveMapFull",
+    "field": "bpf.heap.live_map_full",
+    "id": 301
+  },
+  {
+    "description": "Current number of live heap entries tracked globally",
+    "type": "gauge",
+    "name": "LiveHeapEntries",
+    "field": "agent.liveheap.entries",
+    "id": 302
+  },
+  {
+    "description": "Number of heap alloc samples dropped due to global live-set cap",
+    "type": "counter",
+    "name": "LiveHeapDroppedAllocs",
+    "field": "agent.liveheap.dropped_allocs",
+    "id": 303
+  },
+  {
+    "description": "Number of heap malloc samples received per reporting interval",
+    "type": "counter",
+    "name": "HeapAllocSamples",
+    "field": "agent.heap.alloc_samples",
+    "id": 304
+  },
+  {
+    "description": "Number of heap free samples received per reporting interval",
+    "type": "counter",
+    "name": "HeapFreeSamples",
+    "field": "agent.heap.free_samples",
+    "id": 305
+  },
+  {
+    "description": "Number of explicitly enabled experimental allocator injection attempts",
+    "type": "counter",
+    "name": "HeapInjectionAttempts",
+    "field": "agent.heap.injection.attempts",
+    "id": 306
+  },
+  {
+    "description": "Number of experimental allocator injection attempts that newly mutated a target",
+    "type": "counter",
+    "name": "HeapInjectionSuccesses",
+    "field": "agent.heap.injection.successes",
+    "id": 307
+  },
+  {
+    "description": "Number of failed experimental allocator injection attempts, including partial mutation",
+    "type": "counter",
+    "name": "HeapInjectionFailures",
+    "field": "agent.heap.injection.failures",
+    "id": 308
+  },
+  {
+    "description": "Number of experimental allocator injection attempts that found an existing shim",
+    "type": "counter",
+    "name": "HeapInjectionAlreadyPresent",
+    "field": "agent.heap.injection.already_present",
+    "id": 309
+  },
+  {
+    "description": "Number of injected PIDs whose shim probes could not be discovered through map_files",
+    "type": "counter",
+    "name": "HeapInjectionProbeDiscoveryFailures",
+    "field": "agent.heap.injection.probe_discovery_failures",
+    "id": 310
+  },
+  {
+    "description": "Number of targets killed because experimental injection could not safely restore ptrace state",
+    "type": "counter",
+    "name": "HeapInjectionKilledTargets",
+    "field": "agent.heap.injection.killed_targets",
+    "id": 311
+  },
+  {
+    "description": "Whether experimental allocator injection is halted after a failure",
+    "type": "gauge",
+    "name": "HeapInjectionHalted",
+    "field": "agent.heap.injection.halted",
+    "id": 312
   }
 ]

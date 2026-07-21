@@ -686,6 +686,45 @@ const (
 	// Number of times we didn't find an entry for this process in the LuaJIT process info array
 	IDUnwindLuaJITErrNoProcInfo = 299
 
+	// Number of heap allocs dropped in eBPF due to per-PID live-heap cap
+	IDHeapPerPIDLimitHit = 300
+
+	// Number of heap allocs dropped in eBPF due to global live-heap map full
+	IDHeapLiveMapFull = 301
+
+	// Current number of live heap entries tracked globally
+	IDLiveHeapEntries = 302
+
+	// Number of heap alloc samples dropped due to global live-set cap
+	IDLiveHeapDroppedAllocs = 303
+
+	// Number of heap malloc samples received per reporting interval
+	IDHeapAllocSamples = 304
+
+	// Number of heap free samples received per reporting interval
+	IDHeapFreeSamples = 305
+
+	// Number of explicitly enabled experimental allocator injection attempts
+	IDHeapInjectionAttempts = 306
+
+	// Number of experimental allocator injection attempts that newly mutated a target
+	IDHeapInjectionSuccesses = 307
+
+	// Number of failed experimental allocator injection attempts, including partial mutation
+	IDHeapInjectionFailures = 308
+
+	// Number of experimental allocator injection attempts that found an existing shim
+	IDHeapInjectionAlreadyPresent = 309
+
+	// Number of injected PIDs whose shim probes could not be discovered through map_files
+	IDHeapInjectionProbeDiscoveryFailures = 310
+
+	// Number of targets killed because experimental injection could not safely restore ptrace state
+	IDHeapInjectionKilledTargets = 311
+
+	// Whether experimental allocator injection is halted after a failure
+	IDHeapInjectionHalted = 312
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 300
+	IDMax = 313
 )

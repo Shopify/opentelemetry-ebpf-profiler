@@ -4,8 +4,10 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"sync/atomic"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	lru "github.com/elastic/go-freelru"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,19 +17,91 @@ import (
 	golang "go.opentelemetry.io/ebpf-profiler/interpreter/go"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
+	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
-type traceCapture struct {
-	traces []*libpf.Trace
+func TestReconcileMemoryProbesMarksIneligibleProcessComplete(t *testing.T) {
+	manager, err := memory.NewManager(memory.Config{
+		Enabled:                   true,
+		ProcessExecutablePatterns: []string{"definitely-not-this-test-process"},
+	}, map[memory.ProgramKind]*ebpf.Program{
+		memory.ProgramWeightedAllocation: {},
+	})
+	require.NoError(t, err)
+	defer manager.Close()
+
+	pid := libpf.PID(os.Getpid())
+	pm := &ProcessManager{
+		memoryProbeManager:   manager,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {lastSeenTID: pid}},
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+		cleanupSem:           make(chan struct{}, 1),
+	}
+
+	pm.ReconcileMemoryProbes(1)
+	inst := pm.memoryProbeInstances[pid]
+	require.NotNil(t, inst)
+	evaluated, eligible := inst.Applicability()
+	assert.True(t, evaluated)
+	assert.False(t, eligible)
+	assert.False(t, manager.ShouldRetry(inst))
 }
 
-func (tc *traceCapture) ReportTraceEvent(trace *libpf.Trace, _ *samples.TraceEventMeta) error {
+func TestReconcileMemoryProbesSkipsPendingHeapCleanup(t *testing.T) {
+	manager, err := memory.NewManager(memory.Config{Enabled: true},
+		map[memory.ProgramKind]*ebpf.Program{memory.ProgramWeightedAllocation: {}})
+	require.NoError(t, err)
+	defer manager.Close()
+
+	pid := libpf.PID(os.Getpid())
+	pm := &ProcessManager{
+		memoryProbeManager:   manager,
+		pidToProcessInfo:     map[libpf.PID]*processInfo{pid: {lastSeenTID: pid}},
+		memoryProbeInstances: make(map[libpf.PID]*memory.Instance),
+		heapCleanupPending:   map[libpf.PID]struct{}{pid: {}},
+		cleanupSem:           make(chan struct{}, 1),
+	}
+
+	pm.ReconcileMemoryProbes(1)
+	assert.NotContains(t, pm.memoryProbeInstances, pid,
+		"a cleanup-failed generation must not attach fresh producers")
+}
+
+func TestCloseDrainsDeferredCleanup(t *testing.T) {
+	pm := &ProcessManager{cleanupSem: make(chan struct{}, 2)}
+	var completed atomic.Uint32
+	for range 32 {
+		pm.deferCleanup(func() { completed.Add(1) })
+	}
+
+	pm.Close()
+	assert.Equal(t, uint32(32), completed.Load())
+}
+
+type traceCapture struct {
+	traces    []*libpf.Trace
+	extraMeta any
+}
+
+func (tc *traceCapture) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {
 	tc.traces = append(tc.traces, trace)
+	meta.ExtraMeta = tc.extraMeta
 	return nil
+}
+
+func TestHandleTraceWithMetadataReturnsReporterMetadata(t *testing.T) {
+	capture := &traceCapture{extraMeta: "pod-a"}
+	pm := &ProcessManager{traceReporter: capture}
+
+	_, _, extraMeta := pm.HandleTraceWithMetadata(&libpf.EbpfTrace{
+		PID: 1, TID: 1, Origin: support.TraceOriginHeapAlloc,
+	})
+	assert.Equal(t, "pod-a", extraMeta)
 }
 
 func TestFrameCacheCrossProcessPollution(t *testing.T) {

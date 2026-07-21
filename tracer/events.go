@@ -40,23 +40,49 @@ const (
 	// eventReaderDeadline is the timeout for perf event reads. It allows the
 	// reader goroutine to periodically check for context cancellation.
 	eventReaderDeadline = 100 * time.Millisecond
+
+	// memoryProbeReconcileInterval controls retries for tracked PIDs missing
+	// required process-local memory hooks, including late-loaded libraries.
+	memoryProbeReconcileInterval = 30 * time.Second
+
+	// memoryProbeReconcileBatchSize amortizes /proc mapping inspection.
+	memoryProbeReconcileBatchSize = 20
 )
 
-// StartPIDEventProcessor spawns a goroutine to process PID events.
+// StartPIDEventProcessor spawns a goroutine to process PID events. Repeated
+// starts and starts after Close are ignored.
 func (t *Tracer) StartPIDEventProcessor(ctx context.Context) {
+	t.pidEventsMu.Lock()
+	if t.pidEventsStarted || t.pidEventsClosed {
+		t.pidEventsMu.Unlock()
+		return
+	}
+	t.pidEventsStarted = true
+	t.pidEventsMu.Unlock()
 	go t.processPIDEvents(ctx)
 }
 
 // Process the PID events that are incoming in the Tracer channel.
 func (t *Tracer) processPIDEvents(ctx context.Context) {
+	defer close(t.pidEventsDone)
+
 	pidCleanupTicker := time.NewTicker(t.intervals.PIDCleanupInterval())
 	defer pidCleanupTicker.Stop()
+
+	// Periodic memory-hook discovery catches configured USDTs or uprobes in
+	// libraries loaded after initial PID discovery. It does not refresh the
+	// general executable-mapping cache.
+	memoryProbeReconcileTicker := time.NewTicker(memoryProbeReconcileInterval)
+	defer memoryProbeReconcileTicker.Stop()
+
 	for {
 		select {
 		case pidTid := <-t.pidEvents:
 			t.processManager.SynchronizeProcess(process.New(pidTid.PID(), pidTid.TID()))
 		case <-pidCleanupTicker.C:
 			t.processManager.CleanupPIDs()
+		case <-memoryProbeReconcileTicker.C:
+			t.processManager.ReconcileMemoryProbes(memoryProbeReconcileBatchSize)
 		case <-ctx.Done():
 			return
 		}
@@ -233,10 +259,13 @@ func (t *Tracer) startTraceEventMonitor(ctx context.Context,
 				case errors.Is(err, errOriginUnexpected):
 					log.Warnf("skip trace handling: %v", err)
 					continue
-				case errors.Is(err, errRecordTooSmall), errors.Is(err, errRecordUnexpectedSize):
+				case errors.Is(err, errRecordTooSmall):
 					log.Errorf("Stop receiving traces: %v", err)
 					t.signalDone()
 					return
+				case errors.Is(err, errRecordUnexpectedSize):
+					log.Warnf("skip trace with unexpected record size: %v", err)
+					continue
 				default:
 					log.Warnf("unexpected error handling trace: %v", err)
 					continue

@@ -59,6 +59,25 @@ type EbpfHandler interface {
 	// SupportsLPMTrieBatchOperations returns true if the kernel supports eBPF batch operations
 	// on LPM trie maps.
 	SupportsLPMTrieBatchOperations() bool
+
+	// SetHeapLivePID adds or removes a PID from the heap_live_pids eBPF map.
+	// Callers must not assume tracking changed unless this succeeds.
+	SetHeapLivePID(pid libpf.PID, enabled bool) error
+
+	// DeleteHeapAllocLiveEntries removes every entry from heap_alloc_live for
+	// the PID. ptrs provides a fast path; implementations must also find records
+	// not yet observed in userspace. Callers must not clear the PID count unless
+	// this succeeds, so PID reuse cannot inherit an under-counted live set.
+	DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64) error
+
+	// DeleteHeapPIDAllocCount removes the per-PID alloc count for process exit cleanup.
+	DeleteHeapPIDAllocCount(pid libpf.PID) error
+
+	// SetHeapPIDAllocLimit writes the per-PID allocation limit to the eBPF map.
+	SetHeapPIDAllocLimit(limit uint32)
+
+	// SetHeapSamplingInterval configures direct allocator byte sampling.
+	SetHeapSamplingInterval(interval uint32)
 }
 
 func InterpreterOffsetKeyValue(ebpfProgIndex uint16, fileID host.FileID,

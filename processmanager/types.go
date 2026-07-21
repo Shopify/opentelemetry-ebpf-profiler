@@ -13,7 +13,9 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libc"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
+	"go.opentelemetry.io/ebpf-profiler/probes/memory"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	eim "go.opentelemetry.io/ebpf-profiler/processmanager/execinfomanager"
@@ -63,6 +65,10 @@ type ProcessManager struct {
 
 	// exitEvents records the pid exit time and is a list of pending exit events to be handled.
 	exitEvents map[libpf.PID]times.KTime
+
+	// heapCleanupPending keeps ProcessedUntil from releasing a PID generation
+	// while its old live-allocation map keys are being deleted outside pm.mu.
+	heapCleanupPending map[libpf.PID]struct{}
 
 	// ebpf contains the interface to manipulate ebpf maps
 	ebpf pmebpf.EbpfHandler
@@ -123,6 +129,28 @@ type ProcessManager struct {
 	// Used as a fallback when /proc/<pid>/cgroup yields no container ID for processes
 	// that share the profiler's cgroup directory (e.g., private cgroup namespace).
 	selfContainerID libpf.String
+
+	// memoryProbeManager handles per-process USDT and raw uprobe attachment
+	// for memory profiling. It is nil when the memory custom probe is disabled.
+	memoryProbeManager *memory.Manager
+
+	// memoryProbeInstances tracks live attachment state per PID. Mutated under
+	// pm.mu alongside the other per-PID maps and cleaned up on process exit.
+	memoryProbeInstances map[libpf.PID]*memory.Instance
+
+	// cleanupWG tracks in-flight background probe detach work so Close can wait
+	// for it to drain on shutdown.
+	cleanupWG sync.WaitGroup
+
+	// cleanupSem bounds the number of concurrent background cleanups so that
+	// heavy process churn cannot spawn unbounded concurrent kernel work.
+	cleanupSem chan struct{}
+
+	// liveHeapTracker tracks live allocations for inuse heap profiling.
+	// May be nil if live heap profiling is disabled. On process exit, the
+	// process manager removes entries for the dead PID and deletes the
+	// corresponding eBPF map entries before releasing that PID generation.
+	liveHeapTracker *liveheap.Tracker
 }
 
 // Mapping represents an executable memory mapping of a process.
@@ -151,6 +179,27 @@ func (m *Mapping) GetOnDiskFileIdentifier() util.OnDiskFileIdentifier {
 	}
 }
 
+// processImageIdentity identifies one executable address-space generation.
+// Process start time separates PID reuse; memory-layout fields change across
+// execve (including normal same-path re-exec), while executable device/inode
+// catches image replacement.
+type processImageIdentity struct {
+	executableDevice uint64
+	executableInode  uint64
+	processStartTime uint64
+	startCode        uint64
+	endCode          uint64
+	startStack       uint64
+	startData        uint64
+	endData          uint64
+	startBrk         uint64
+	argStart         uint64
+	argEnd           uint64
+	envStart         uint64
+	envEnd           uint64
+	valid            bool
+}
+
 // processInfo contains information about the executable mappings
 // and Thread Specific Data of a process.
 type processInfo struct {
@@ -158,6 +207,13 @@ type processInfo struct {
 	meta process.ProcessMeta
 	// executable mappings sorted by FileID and mapping start address
 	mappings []Mapping
+	// imageIdentity changes when the PID execs into a new address space.
+	imageIdentity processImageIdentity
 	// C-library Thread Specific Data information
 	libcInfo *libc.LibcInfo
+	// lastSeenTID is the most recent thread ID observed for this PID via
+	// a sync event. Used by ReconcileMemoryProbes to construct a Process
+	// that can fall back to /proc/<pid>/task/<tid>/maps when the main
+	// thread has exited.
+	lastSeenTID libpf.PID
 }
