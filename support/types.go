@@ -28,6 +28,17 @@ const (
 )
 
 const (
+	TraceEventNormal        = 0x0
+	TraceEventAsyncStart    = 0x1
+	TraceEventAsyncComplete = 0x2
+
+	TraceAsyncNone       = 0x0
+	TraceAsyncIOUring    = 0x1
+	TraceAsyncAttrMore   = 0x1
+	TraceAsyncAttrSQPoll = 0x2
+)
+
+const (
 	FrameFlagError         = 0x1
 	FrameFlagReturnAddress = 0x2
 	FrameFlagPidSpecific   = 0x4
@@ -160,6 +171,15 @@ type Trace struct {
 	Num_kernel_frames  uint16
 	Origin             uint16
 	Value              uint64
+	Correlation_id     uint64
+	Async_user_data    uint64
+	Async_result       int64
+	Async_flags        uint32
+	Async_operation    uint16
+	Event_kind         uint8
+	Async_kind         uint8
+	Async_attributes   uint8
+	Async_reserved     [3]uint8
 	Cpu_id             uint32
 	Frame_data         [3072]uint64
 }
@@ -334,7 +354,7 @@ type LuaJITProcInfo struct {
 
 const (
 	Sizeof_StackDelta = 0x4
-	Sizeof_Trace      = 0x62d8
+	Sizeof_Trace      = 0x62f8
 
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4

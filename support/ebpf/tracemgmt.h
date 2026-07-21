@@ -300,6 +300,14 @@ static inline EBPF_INLINE PerCPURecord *get_pristine_per_cpu_record()
   trace->num_kernel_frames = 0;
   trace->pid               = 0;
   trace->tid               = 0;
+  trace->correlation_id    = 0;
+  trace->async_user_data   = 0;
+  trace->async_result      = 0;
+  trace->async_flags       = 0;
+  trace->async_operation   = 0;
+  trace->event_kind        = TRACE_EVENT_NORMAL;
+  trace->async_kind        = TRACE_ASYNC_NONE;
+  trace->async_attributes  = 0;
 
   trace->apm_trace_id.as_int.hi    = 0;
   trace->apm_trace_id.as_int.lo    = 0;
@@ -929,8 +937,18 @@ get_usermode_regs(struct pt_regs *ctx, UnwindState *state, bool *has_usermode_re
 
 #endif // TESTING_COREDUMP
 
-static inline EBPF_INLINE int
-collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value)
+static inline EBPF_INLINE int collect_trace_internal(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 value,
+  u64 correlation_id,
+  u64 async_user_data,
+  u16 async_operation,
+  u8 async_kind,
+  u8 async_attributes)
 {
   // Only continue processing the trace with a valid origin.
   if (origin == 0) {
@@ -945,12 +963,18 @@ collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_times
     return -1;
   }
 
-  Trace *trace  = &record->trace;
-  trace->origin = origin;
-  trace->pid    = pid;
-  trace->tid    = tid;
-  trace->ktime  = trace_timestamp;
-  trace->value  = value;
+  Trace *trace            = &record->trace;
+  trace->origin           = origin;
+  trace->pid              = pid;
+  trace->tid              = tid;
+  trace->ktime            = trace_timestamp;
+  trace->value            = value;
+  trace->correlation_id   = correlation_id;
+  trace->async_user_data  = async_user_data;
+  trace->async_operation  = async_operation;
+  trace->event_kind       = correlation_id ? TRACE_EVENT_ASYNC_START : TRACE_EVENT_NORMAL;
+  trace->async_kind       = async_kind;
+  trace->async_attributes = async_attributes;
   if (bpf_get_current_comm(&(trace->comm), sizeof(trace->comm)) < 0) {
     increment_metric(metricID_ErrBPFCurrentComm);
   }
@@ -998,6 +1022,38 @@ exit:
   tail_call(ctx, unwinder);
   DEBUG_PRINT("bpf_tail call failed for %d in native_tracer_entry", unwinder);
   return -1;
+}
+
+static inline EBPF_INLINE int
+collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value)
+{
+  return collect_trace_internal(ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0);
+}
+
+static inline EBPF_INLINE int collect_async_trace(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 correlation_id,
+  u64 async_user_data,
+  u16 async_operation,
+  u8 async_kind,
+  u8 async_attributes)
+{
+  return collect_trace_internal(
+    ctx,
+    origin,
+    pid,
+    tid,
+    trace_timestamp,
+    0,
+    correlation_id,
+    async_user_data,
+    async_operation,
+    async_kind,
+    async_attributes);
 }
 
 #endif

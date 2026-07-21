@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/probes/biostacks"
 	"go.opentelemetry.io/ebpf-profiler/probes/functionlatency"
 	"go.opentelemetry.io/ebpf-profiler/probes/generic"
+	"go.opentelemetry.io/ebpf-profiler/probes/iouring"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
@@ -90,26 +91,28 @@ func (c *Controller) Start(ctx context.Context) error {
 
 	// Load the eBPF code and map definitions
 	trc, err := tracer.NewTracer(ctx, &tracer.Config{
-		TraceReporter:          c.reporter,
-		Intervals:              intervals,
-		InterpretersConfig:     c.config.Interpreters,
-		FilterErrorFrames:      !c.config.SendErrorFrames,
-		FilterIdleFrames:       !c.config.SendIdleFrames,
-		SamplesPerSecond:       c.config.SamplesPerSecond,
-		MapScaleFactor:         int(c.config.MapScaleFactor),
-		FrameCacheSize:         uint32(c.config.FrameCacheSize),
-		KernelVersionCheck:     !c.config.NoKernelVersionCheck,
-		VerboseMode:            c.config.VerboseMode,
-		BPFVerifierLogLevel:    uint32(c.config.BPFVerifierLogLevel),
-		ProbabilisticInterval:  c.config.ProbabilisticInterval,
-		ProbabilisticThreshold: c.config.ProbabilisticThreshold,
-		OffCPUThreshold:        uint32(c.config.OffCPUThreshold * float64(math.MaxUint32)),
-		IncludeEnvVars:         envVars,
-		ProbeLinks:             c.config.ProbeLinks,
-		LoadProbe:              c.config.LoadProbe || len(c.config.CustomProbes) > 0,
-		ExecutableReporter:     c.config.ExecutableReporter,
-		BPFFSRoot:              c.config.BPFFSRoot,
-		OBIProcessCtx:          c.config.OBIProcessCtx,
+		TraceReporter:            c.reporter,
+		Intervals:                intervals,
+		InterpretersConfig:       c.config.Interpreters,
+		FilterErrorFrames:        !c.config.SendErrorFrames,
+		FilterIdleFrames:         !c.config.SendIdleFrames,
+		SamplesPerSecond:         c.config.SamplesPerSecond,
+		MapScaleFactor:           int(c.config.MapScaleFactor),
+		FrameCacheSize:           uint32(c.config.FrameCacheSize),
+		AsyncCorrelationCapacity: int(c.config.AsyncCorrelationCapacity),
+		AsyncCorrelationTTL:      c.config.AsyncCorrelationTTL,
+		KernelVersionCheck:       !c.config.NoKernelVersionCheck,
+		VerboseMode:              c.config.VerboseMode,
+		BPFVerifierLogLevel:      uint32(c.config.BPFVerifierLogLevel),
+		ProbabilisticInterval:    c.config.ProbabilisticInterval,
+		ProbabilisticThreshold:   c.config.ProbabilisticThreshold,
+		OffCPUThreshold:          uint32(c.config.OffCPUThreshold * float64(math.MaxUint32)),
+		IncludeEnvVars:           envVars,
+		ProbeLinks:               c.config.ProbeLinks,
+		LoadProbe:                c.config.LoadProbe || len(c.config.CustomProbes) > 0,
+		ExecutableReporter:       c.config.ExecutableReporter,
+		BPFFSRoot:                c.config.BPFFSRoot,
+		OBIProcessCtx:            c.config.OBIProcessCtx,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to load eBPF tracer: %w", err)
@@ -203,6 +206,8 @@ func createCustomProbe(name string, cfg any) (tracer.Probe, error) {
 		return generic.New(gcfg)
 	case biostacks.SampleType:
 		return biostacks.New(cfg)
+	case iouring.SampleType:
+		return iouring.New(cfg)
 	case "tcp_send_latency":
 		return functionlatency.New(functionlatency.Definition{
 			Symbol:     "tcp_sendmsg",

@@ -12,6 +12,7 @@ import (
 func TestCreateLatencyProbes(t *testing.T) {
 	for _, name := range []string{
 		"block_io_queue_latency",
+		"io_uring_latency",
 		"tcp_send_latency",
 		"tcp_receive_latency",
 		"vfs_read_latency",

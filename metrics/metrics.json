@@ -2188,5 +2188,54 @@
     "name": "UnwindLuaJITErrNoProcInfo",
     "field": "bpf.luajit.errors.no_proc_info",
     "id": 299
+  },
+  {
+    "description": "Number of asynchronous initiating traces buffered for completion correlation",
+    "type": "counter",
+    "name": "AsyncCorrelationStarts",
+    "field": "agent.async_correlation.starts",
+    "id": 300
+  },
+  {
+    "description": "Number of asynchronous completions joined to their initiating traces",
+    "type": "counter",
+    "name": "AsyncCorrelationCompletions",
+    "field": "agent.async_correlation.completions",
+    "id": 301
+  },
+  {
+    "description": "Number of duplicate asynchronous starts, including richer stack replacements",
+    "type": "counter",
+    "name": "AsyncCorrelationDuplicateStarts",
+    "field": "agent.async_correlation.duplicate_starts",
+    "id": 302
+  },
+  {
+    "description": "Number of asynchronous completions with no buffered initiating trace",
+    "type": "counter",
+    "name": "AsyncCorrelationOrphanCompletions",
+    "field": "agent.async_correlation.orphan_completions",
+    "id": 303
+  },
+  {
+    "description": "Number of asynchronous initiating traces evicted at correlator capacity",
+    "type": "counter",
+    "name": "AsyncCorrelationCapacityEvictions",
+    "field": "agent.async_correlation.capacity_evictions",
+    "id": 304
+  },
+  {
+    "description": "Number of asynchronous initiating traces evicted after their correlation TTL",
+    "type": "counter",
+    "name": "AsyncCorrelationExpirationEvictions",
+    "field": "agent.async_correlation.expiration_evictions",
+    "id": 305
+  },
+  {
+    "description": "Number of asynchronous initiating traces currently awaiting completion",
+    "type": "gauge",
+    "name": "AsyncCorrelationPending",
+    "field": "agent.async_correlation.pending",
+    "id": 306
   }
 ]

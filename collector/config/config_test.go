@@ -78,6 +78,16 @@ func TestValidateFrameCacheSize(t *testing.T) {
 	}
 }
 
+func TestValidateAsyncCorrelation(t *testing.T) {
+	cfg := validConfig()
+	cfg.AsyncCorrelationCapacity = maxAsyncCorrelationCapacity + 1
+	require.ErrorContains(t, xconfmap.Validate(cfg), "async correlation capacity")
+
+	cfg = validConfig()
+	cfg.AsyncCorrelationTTL = -time.Second
+	require.ErrorContains(t, xconfmap.Validate(cfg), "async correlation TTL")
+}
+
 func TestUnmarshalText(t *testing.T) {
 	for _, tt := range []struct {
 		name    string

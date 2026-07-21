@@ -638,6 +638,20 @@ typedef struct CustomLabelsArray {
 } CustomLabelsArray;
 
 // Container for a stack trace
+// Trace event lifecycle phases. Ordinary synchronous profiles use NORMAL.
+#define TRACE_EVENT_NORMAL         0
+#define TRACE_EVENT_ASYNC_START    1
+#define TRACE_EVENT_ASYNC_COMPLETE 2
+
+// Asynchronous subsystem identifiers.
+#define TRACE_ASYNC_NONE     0
+#define TRACE_ASYNC_IO_URING 1
+
+// Asynchronous event attributes.
+#define TRACE_ASYNC_ATTR_MORE    (1U << 0)
+#define TRACE_ASYNC_ATTR_SQ_POLL (1U << 1)
+
+// Profile stack and asynchronous lifecycle data emitted through trace_events.
 typedef struct Trace {
   // The process ID
   // NOTE: Confusingly, this is what Linux calls "tgid"
@@ -670,6 +684,29 @@ typedef struct Trace {
   // value stores context-specific data that was collected with the stack.
   // e.g. time in nanoseconds for off-CPU traces
   u64 value;
+
+  // correlation_id joins asynchronous start and completion events. It must be
+  // unique within an origin while the operation is in flight.
+  u64 correlation_id;
+
+  // async_user_data carries an optional subsystem-defined request identifier.
+  u64 async_user_data;
+
+  // async_result and async_flags describe the completion result.
+  s64 async_result;
+  u32 async_flags;
+
+  // async_operation identifies a subsystem operation (for example an
+  // io_uring opcode).
+  u16 async_operation;
+
+  // event_kind distinguishes ordinary traces from asynchronous lifecycle
+  // events. async_kind identifies the subsystem, and async_attributes carries
+  // subsystem-independent flags such as multishot and SQPOLL attribution.
+  u8 event_kind;
+  u8 async_kind;
+  u8 async_attributes;
+  u8 async_reserved[3];
 
   // The CPU that captured this trace.
   u32 cpu_id;

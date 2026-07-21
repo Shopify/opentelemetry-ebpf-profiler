@@ -686,6 +686,27 @@ const (
 	// Number of times we didn't find an entry for this process in the LuaJIT process info array
 	IDUnwindLuaJITErrNoProcInfo = 299
 
+	// Number of asynchronous initiating traces buffered for completion correlation
+	IDAsyncCorrelationStarts = 300
+
+	// Number of asynchronous completions joined to their initiating traces
+	IDAsyncCorrelationCompletions = 301
+
+	// Number of duplicate asynchronous starts, including richer stack replacements
+	IDAsyncCorrelationDuplicateStarts = 302
+
+	// Number of asynchronous completions with no buffered initiating trace
+	IDAsyncCorrelationOrphanCompletions = 303
+
+	// Number of asynchronous initiating traces evicted at correlator capacity
+	IDAsyncCorrelationCapacityEvictions = 304
+
+	// Number of asynchronous initiating traces evicted after their correlation TTL
+	IDAsyncCorrelationExpirationEvictions = 305
+
+	// Number of asynchronous initiating traces currently awaiting completion
+	IDAsyncCorrelationPending = 306
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 300
+	IDMax = 307
 )
