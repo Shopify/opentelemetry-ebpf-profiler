@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/times"
@@ -31,6 +33,7 @@ type asyncTraceSnapshot struct {
 	executablePath   libpf.String
 	containerID      libpf.String
 	customLabels     map[libpf.String]libpf.String
+	resource         *pcommon.Resource
 	comm             libpf.Comm
 	frameData        []uint64
 	kernelFrames     libpf.Frames
@@ -58,6 +61,7 @@ func snapshotAsyncTrace(trace *libpf.EbpfTrace) asyncTraceSnapshot {
 		executablePath:   trace.ExecutablePath,
 		containerID:      trace.ContainerID,
 		customLabels:     cloneLabels(trace.CustomLabels),
+		resource:         cloneResource(trace.Resource),
 		comm:             trace.Comm,
 		frameData:        append([]uint64(nil), trace.FrameData...),
 		kernelFrames:     append(libpf.Frames(nil), trace.KernelFrames...),
@@ -86,6 +90,7 @@ func (s *asyncTraceSnapshot) restore(trace *libpf.EbpfTrace) {
 		ExecutablePath:   s.executablePath,
 		ContainerID:      s.containerID,
 		CustomLabels:     cloneLabels(s.customLabels),
+		Resource:         cloneResource(s.resource),
 		Comm:             s.comm,
 		KernelFrames:     append(trace.KernelFrames[:0], s.kernelFrames...),
 		Value:            s.value,
@@ -117,6 +122,15 @@ func cloneLabels(labels map[libpf.String]libpf.String) map[libpf.String]libpf.St
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func cloneResource(resource *pcommon.Resource) *pcommon.Resource {
+	if resource == nil {
+		return nil
+	}
+	cloned := pcommon.NewResource()
+	resource.CopyTo(cloned)
+	return &cloned
 }
 
 type asyncPendingEntry struct {

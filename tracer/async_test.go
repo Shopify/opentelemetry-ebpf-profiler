@@ -8,11 +8,15 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 )
 
 func TestAsyncCorrelatorPreservesInitiatingTraceUntilCompletion(t *testing.T) {
 	correlator := newAsyncTraceCorrelator(4, time.Minute)
+	resource := pcommon.NewResource()
+	resource.Attributes().PutStr("service.instance.id", "initiator")
 	start := &libpf.EbpfTrace{
 		PID:             42,
 		TID:             43,
@@ -29,6 +33,7 @@ func TestAsyncCorrelatorPreservesInitiatingTraceUntilCompletion(t *testing.T) {
 		CustomLabels:    map[libpf.String]libpf.String{libpf.Intern("start"): libpf.Intern("yes")},
 		ProcessName:     libpf.Intern("submitter"),
 		ExecutablePath:  libpf.Intern("/bin/submitter"),
+		Resource:        &resource,
 		AsyncAttributes: libpf.AsyncAttrSQPoll,
 	}
 	correlator.add(start)
@@ -36,6 +41,7 @@ func TestAsyncCorrelatorPreservesInitiatingTraceUntilCompletion(t *testing.T) {
 	// The pending entry owns compact copies rather than pooled trace slices/maps.
 	start.FrameData[0] = 999
 	start.CustomLabels[libpf.Intern("start")] = libpf.Intern("mutated")
+	start.Resource.Attributes().PutStr("service.instance.id", "mutated")
 
 	completion := &libpf.EbpfTrace{
 		PID:             500,
@@ -66,6 +72,10 @@ func TestAsyncCorrelatorPreservesInitiatingTraceUntilCompletion(t *testing.T) {
 	require.Equal(t, libpf.Intern("read"), completion.CustomLabels[libpf.Intern("io.operation")])
 	require.Equal(t, libpf.Intern("64"), completion.CustomLabels[libpf.Intern("io.result")])
 	require.Equal(t, libpf.Intern("true"), completion.CustomLabels[libpf.Intern("io_uring.sq_poll")])
+	require.NotNil(t, completion.Resource)
+	serviceInstanceID, ok := completion.Resource.Attributes().Get("service.instance.id")
+	require.True(t, ok)
+	require.Equal(t, "initiator", serviceInstanceID.Str())
 	require.Empty(t, correlator.pending)
 }
 
