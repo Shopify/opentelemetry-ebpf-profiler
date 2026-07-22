@@ -7,10 +7,12 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
@@ -83,6 +85,110 @@ func sortedKeys[T any](values map[string]T) []string {
 	}
 	slices.Sort(keys)
 	return keys
+}
+
+func TestProbeMetricCollectorsAggregateAndUnregister(t *testing.T) {
+	trc := &Tracer{probeMetricCollectors: make(map[uint64]*probeMetricCollector)}
+	first, err := trc.registerProbeMetrics(func() []metrics.Metric {
+		return []metrics.Metric{
+			{ID: metrics.IDUserspaceProbeAttachFailures, Value: 2},
+			{ID: metrics.IDUserspaceProbeActiveLinks, Value: 3},
+		}
+	})
+	require.NoError(t, err)
+	second, err := trc.registerProbeMetrics(func() []metrics.Metric {
+		return []metrics.Metric{
+			{ID: metrics.IDUserspaceProbeAttachFailures, Value: 5},
+			{ID: metrics.IDUserspaceProbeActiveLinks, Value: 7},
+		}
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, []metrics.Metric{
+		{ID: metrics.IDUserspaceProbeAttachFailures, Value: 7},
+		{ID: metrics.IDUserspaceProbeActiveLinks, Value: 10},
+	}, trc.collectProbeMetrics())
+
+	require.NoError(t, first.Close())
+	require.Equal(t, []metrics.Metric{
+		{ID: metrics.IDUserspaceProbeAttachFailures, Value: 5},
+		{ID: metrics.IDUserspaceProbeActiveLinks, Value: 7},
+	}, trc.collectProbeMetrics())
+	require.NoError(t, second.Close())
+	require.Empty(t, trc.collectProbeMetrics())
+}
+
+func TestProbeMetricCollectorCloseRetainsFinalCounterDeltas(t *testing.T) {
+	trc := &Tracer{
+		probeMetricCollectors: make(map[uint64]*probeMetricCollector),
+		pendingProbeMetrics:   make(metrics.Summary),
+	}
+	subscription, err := trc.registerProbeMetrics(func() []metrics.Metric { return nil })
+	require.NoError(t, err)
+	finalizer, ok := subscription.(interface {
+		CloseWithMetrics([]metrics.Metric) error
+	})
+	require.True(t, ok)
+	require.NoError(t, finalizer.CloseWithMetrics([]metrics.Metric{
+		{ID: metrics.IDUserspaceProbeLinksDetached, Value: 3},
+		{ID: metrics.IDUserspaceProbeActiveLinks, Value: 7},
+	}))
+	require.Equal(t, []metrics.Metric{{
+		ID: metrics.IDUserspaceProbeLinksDetached, Value: 3,
+	}}, trc.collectProbeMetrics())
+	require.Empty(t, trc.collectProbeMetrics())
+}
+
+func TestProbeMetricCollectorCloseWaitsForInflightCallback(t *testing.T) {
+	trc := &Tracer{probeMetricCollectors: make(map[uint64]*probeMetricCollector)}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	subscription, err := trc.registerProbeMetrics(func() []metrics.Metric {
+		close(started)
+		<-release
+		return nil
+	})
+	require.NoError(t, err)
+	collectionDone := make(chan struct{})
+	go func() {
+		defer close(collectionDone)
+		trc.collectProbeMetrics()
+	}()
+	<-started
+
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		require.NoError(t, subscription.Close())
+	}()
+	select {
+	case <-closeDone:
+		t.Fatal("collector close returned during an in-flight callback")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	<-collectionDone
+	<-closeDone
+	require.Empty(t, trc.collectProbeMetrics())
+}
+
+func TestProbeMetricCollectorPanicIsIsolated(t *testing.T) {
+	trc := &Tracer{probeMetricCollectors: make(map[uint64]*probeMetricCollector)}
+	_, err := trc.registerProbeMetrics(func() []metrics.Metric { panic("boom") })
+	require.NoError(t, err)
+	_, err = trc.registerProbeMetrics(func() []metrics.Metric {
+		return []metrics.Metric{{ID: metrics.IDUserspaceProbeActiveLinks, Value: 7}}
+	})
+	require.NoError(t, err)
+	require.Equal(t, []metrics.Metric{{
+		ID: metrics.IDUserspaceProbeActiveLinks, Value: 7,
+	}}, trc.collectProbeMetrics())
+}
+
+func TestRegisterProbeMetricsRejectsNil(t *testing.T) {
+	trc := &Tracer{probeMetricCollectors: make(map[uint64]*probeMetricCollector)}
+	_, err := trc.registerProbeMetrics(nil)
+	require.ErrorContains(t, err, "nil")
 }
 
 func TestEnableRegistersOriginBeforeLoadingAndRollsBackOnError(t *testing.T) {

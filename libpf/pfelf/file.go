@@ -63,6 +63,8 @@ var (
 
 	// ErrNoDebugLink is returned when debug link does not exist.
 	ErrNoDebugLink = errors.New("no debug link")
+	// ErrSectionNotPresent is returned when an optional ELF section is absent.
+	ErrSectionNotPresent = errors.New("section not present")
 
 	// ErrNoBuildID is returned if build ID is not present in notes.
 	ErrNoBuildID = errors.New("no build ID")
@@ -1234,7 +1236,7 @@ func (f *File) LookupSymbolAddress(symbol libpf.SymbolName) (libpf.SymbolValue, 
 func (f *File) visitSymbolTable(name string, visitor func(libpf.Symbol) bool) error {
 	symTab := f.Section(name)
 	if symTab == nil {
-		return fmt.Errorf("failed to read %v: section not present", name)
+		return fmt.Errorf("failed to read %v: %w", name, ErrSectionNotPresent)
 	}
 	if symTab.Link >= uint32(len(f.Sections)) {
 		return fmt.Errorf("failed to read %v strtab: link %v out of range",

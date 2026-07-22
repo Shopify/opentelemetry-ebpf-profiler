@@ -686,6 +686,30 @@ const (
 	// Number of times we didn't find an entry for this process in the LuaJIT process info array
 	IDUnwindLuaJITErrNoProcInfo = 299
 
+	// Number of mapped userspace probe objects that failed symbol or build ID resolution
+	IDUserspaceProbeResolutionFailures = 320
+
+	// Number of failures attaching a PID-scoped userspace probe link
+	IDUserspaceProbeAttachFailures = 321
+
+	// Number of PID-scoped userspace probe links attached
+	IDUserspaceProbeLinksAttached = 322
+
+	// Number of PID-scoped userspace probe links detached
+	IDUserspaceProbeLinksDetached = 323
+
+	// Number of userspace probe attachments rejected at the configured link bound
+	IDUserspaceProbeLinkLimitHits = 324
+
+	// Number of userspace probe link or process-state cleanup failures
+	IDUserspaceProbeCleanupFailures = 325
+
+	// Number of processes currently owning userspace probe links
+	IDUserspaceProbeActiveProcesses = 326
+
+	// Number of PID-scoped userspace probe links currently active
+	IDUserspaceProbeActiveLinks = 327
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 300
+	IDMax = 328
 )

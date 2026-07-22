@@ -70,6 +70,7 @@ const (
 // Names of tracepoint hooks for sched_process_free. There are two hooks
 // as the tracepoint format has changed for kernel versions 6.16+.
 const (
+	schedProcessExec   = "tracepoint__sched_process_exec"
 	schedProcessFreeV1 = "tracepoint__sched_process_free_pre616"
 	schedProcessFreeV2 = "tracepoint__sched_process_free"
 )
@@ -164,6 +165,12 @@ type Tracer struct {
 	// origins is the tracer-wide registry origin IDs are assigned from and
 	// profile type metadata is looked up by.
 	origins *originRegistry
+
+	// probeMetricCollectors are registered dynamically by custom probes.
+	probeMetricsMu        sync.RWMutex
+	probeMetricCollectors map[uint64]*probeMetricCollector
+	pendingProbeMetrics   metrics.Summary
+	nextProbeMetricID     uint64
 
 	// done is closed when the tracer encounters an unrecoverable error.
 	// Use Done() to obtain a read-only channel for use in select statements.
@@ -332,6 +339,8 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
 		done:                   make(chan libpf.Void),
 		origins:                origins,
+		probeMetricCollectors:  make(map[uint64]*probeMetricCollector),
+		pendingProbeMetrics:    make(metrics.Summary),
 		sysConfigVars:          sysConfigVars,
 		kprobeChainLoaded:      kprobeChainRequired(cfg),
 	}
@@ -354,6 +363,9 @@ func (t *Tracer) Close() {
 		}
 		delete(t.hooks, hookPoint)
 	}
+	// Dynamic probes retain final counter deltas while unregistering. Flush
+	// those deltas before tracer shutdown removes the last collection source.
+	metrics.AddSlice(t.collectProbeMetrics())
 
 	t.processManager.Close()
 	t.kernelSymbolizer.Close()
@@ -843,11 +855,16 @@ func loadPerfUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.P
 		LogLevel: cebpf.LogLevel(bpfVerifierLogLevel),
 	}
 
-	progs := make([]ProgLoaderHelper, len(tailCallProgs)+2)
+	progs := make([]ProgLoaderHelper, len(tailCallProgs)+3)
 	copy(progs, tailCallProgs)
 
 	schedProcessFree := schedProcessFreeHookName(libpf.MapKeysToSet(coll.Programs))
 	progs = append(progs,
+		ProgLoaderHelper{
+			Name:             schedProcessExec,
+			NoTailCallTarget: true,
+			Enable:           true,
+		},
 		ProgLoaderHelper{
 			Name:             schedProcessFree,
 			NoTailCallTarget: true,
@@ -1089,9 +1106,15 @@ func (t *Tracer) monitorPIDEventsMap(keys *[]libpf.PIDTID) error {
 	for {
 		n, err := eventsMap.BatchLookupAndDelete(&cursor, removed, values, nil)
 
-		// There can be results even if there's an error.
+		// There can be results even if there's an error. A false map value is
+		// emitted only by sched_process_exec and invalidates process-scoped
+		// state before the replacement image is synchronized.
 		for i := range n {
-			*keys = append(*keys, libpf.PIDTID(removed[i]))
+			pidTid := libpf.PIDTID(removed[i])
+			if !values[i] {
+				t.processManager.MarkProcessExec(pidTid.PID())
+			}
+			*keys = append(*keys, pidTid)
 		}
 
 		if errors.Is(err, cebpf.ErrKeyNotExist) {
@@ -1298,6 +1321,7 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *libp
 		metrics.AddSlice(traceEventMetricCollector())
 		metrics.AddSlice(t.eBPFMetricsCollector(translateIDs, previousMetricValue))
 		metrics.AddSlice(t.customLabels.getAndResetMetrics())
+		metrics.AddSlice(t.collectProbeMetrics())
 	})
 
 	return nil

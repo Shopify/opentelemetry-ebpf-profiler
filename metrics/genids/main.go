@@ -19,6 +19,21 @@ type metricDef struct {
 	Obsolete    bool   `json:"obsolete"`
 }
 
+func maximumMetricID(metricDefs []metricDef) (uint32, error) {
+	var maxID uint32
+	seen := make(map[uint32]struct{}, len(metricDefs))
+	for _, metric := range metricDefs {
+		if _, exists := seen[metric.ID]; exists {
+			return 0, fmt.Errorf("duplicate metric ID %d", metric.ID)
+		}
+		seen[metric.ID] = struct{}{}
+		if metric.ID > maxID {
+			maxID = metric.ID
+		}
+	}
+	return maxID, nil
+}
+
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Fprintf(os.Stderr, "Usage: %s <metrics.json> <output.go>\n", os.Args[0])
@@ -34,6 +49,12 @@ func main() {
 	var metricDefs []metricDef
 	if err = json.Unmarshal(input, &metricDefs); err != nil {
 		fmt.Fprintf(os.Stderr, "Error unmarshaling: %v", err)
+		os.Exit(1)
+	}
+
+	maxID, err := maximumMetricID(metricDefs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid metric definitions: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -61,7 +82,7 @@ func main() {
 
 	output.WriteString(
 		"\n\t// max number of ID values, keep this as *last entry*\n" +
-			fmt.Sprintf("\tIDMax = %d\n)\n", len(metricDefs)))
+			fmt.Sprintf("\tIDMax = %d\n)\n", maxID+1))
 
 	if err = os.WriteFile(os.Args[2], output.Bytes(), 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v", err)
