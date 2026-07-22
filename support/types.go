@@ -76,7 +76,7 @@ const (
 const UnwindInfoMaxEntries = 0x4000
 
 const (
-	MetricIDBeginCumulative = 0x71
+	MetricIDBeginCumulative = 0x75
 )
 
 const (
@@ -102,6 +102,12 @@ const (
 	HSTSIDSegMapMask      = 0xffffffffffffff
 )
 
+const (
+	CustomLabelsTypeNone   = 0x0
+	CustomLabelsTypeNative = 0x1
+	CustomLabelsTypeGo     = 0x2
+)
+
 type ApmSpanID [8]byte
 type ApmTraceID [16]byte
 type CustomLabel struct {
@@ -111,6 +117,10 @@ type CustomLabel struct {
 type CustomLabelsArray struct {
 	Len    uint32
 	Labels [10]CustomLabel
+}
+type CustomLabelsData struct {
+	Size uint16
+	Data [642]uint8
 }
 type Event struct {
 	Type uint32
@@ -168,7 +178,9 @@ type Trace struct {
 	Comm               [16]uint8
 	Apm_transaction_id [8]byte
 	Apm_trace_id       [16]byte
-	Custom_labels      CustomLabelsArray
+	Custom_labels_type uint8
+	Pad_cgo_0          [3]byte
+	Custom_labels_data CustomLabelsData
 	Frame_data_len     uint16
 	Num_frames         uint16
 	Num_kernel_frames  uint16
@@ -323,6 +335,11 @@ type RubyProcInfo struct {
 	Size_of_value                uint8
 	Running_ec                   uint16
 	Pad_cgo_0                    [4]byte
+}
+type ThreadContextProcInfo struct {
+	Tls_offset int32
+	Module_id  uint32
+	Dtv_info   DTVInfo
 }
 type V8ProcInfo struct {
 	Version                      uint32
@@ -541,4 +558,8 @@ var MetricsTranslation = []metrics.MetricID{
 	0x6c: metrics.IDUnwindNativeErrNonExecutableVMA,
 	0x6d: metrics.IDUnwindLuaJITAttempts,
 	0x6e: metrics.IDUnwindLuaJITErrNoProcInfo,
+	0x71: metrics.IDUnwindThreadContextErrReadTsdBase,
+	0x72: metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
+	0x73: metrics.IDUnwindThreadContextErrReadThreadCtxAttrs,
+	0x74: metrics.IDUnwindThreadContextReadSuccesses,
 }

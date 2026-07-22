@@ -710,6 +710,18 @@ const (
 	// Number of correlated asynchronous completions suppressed by a duration filter
 	IDAsyncCorrelationFilteredCompletions = 307
 
+	// Number of failures to get TSD base for thread context
+	IDUnwindThreadContextErrReadTsdBase = 308
+
+	// Number of failures to read the thread context buffer
+	IDUnwindThreadContextErrReadThreadCtxBuf = 309
+
+	// Number of failures to read the thread context attributes
+	IDUnwindThreadContextErrReadThreadCtxAttrs = 310
+
+	// Number of successful reads of thread context info
+	IDUnwindThreadContextReadSuccesses = 311
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 308
+	IDMax = 312
 )
