@@ -1456,6 +1456,21 @@ func determineRubyVersion(ef *pfelf.File) (uint32, error) {
 	return rubyVersion(uint32(major), uint32(minor), uint32(release)), nil
 }
 
+const ruby405PShopifyRevision = "21a2595676"
+
+// rubyUses406Layout reports whether a Ruby 4.0 binary contains the two layout
+// changes released in 4.0.6. Shopify's transitional 4.0.5-pshopify3 build is
+// cut from ruby/ruby@21a2595676 and therefore contains both changes despite its
+// older version string. ruby_description is an exported, on-disk symbol, unlike
+// the pshopify branch suffix which is present only in DWARF.
+func rubyUses406Layout(version uint32, description string) bool {
+	if version >= rubyVersion(4, 0, 6) {
+		return true
+	}
+	return version == rubyVersion(4, 0, 5) &&
+		strings.Contains(description, " revision "+ruby405PShopifyRevision+")")
+}
+
 func GetLoader(_ Config) interpreter.Loader {
 	return interpreter.NewLoader(loader, []interpreter.InterpreterResource{
 		{MapName: BPFMapName, ProgID: uint32(support.ProgUnwindRuby), ProgName: "unwind_ruby"},
@@ -1476,6 +1491,17 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	version, err := determineRubyVersion(ef)
 	if err != nil {
 		return nil, err
+	}
+
+	var description string
+	if version == rubyVersion(4, 0, 5) {
+		if _, memory, descriptionErr := ef.SymbolData("ruby_description", 128); descriptionErr == nil {
+			description = strings.TrimRight(pfunsafe.ToString(memory), "\x00")
+		}
+	}
+	usesRuby406Layout := rubyUses406Layout(version, description)
+	if version < rubyVersion(4, 0, 6) && usesRuby406Layout {
+		log.Debugf("Ruby %s uses backported 4.0.6 VM layout", description)
 	}
 
 	// Reason for lowest supported version:
@@ -1719,7 +1745,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		} else {
 			vms.vm_struct.gc_objspace = 1272
 		}
-		if version >= rubyVersion(4, 0, 6) {
+		if usesRuby406Layout {
 			// Ruby 4.0.6 inserted rb_vm_t.master_box before root_box,
 			// shifting the gc.objspace field by one pointer.
 			// https://github.com/ruby/ruby/blob/v4.0.6/vm_core.h
@@ -1882,7 +1908,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 			} else {
 				vms.rb_ractor_struct.running_ec = 0x148
 			}
-			if version >= rubyVersion(4, 0, 6) {
+			if usesRuby406Layout {
 				// Ruby 4.0.6 added runnable_hot_th and runnable_hot_th_waiting
 				// to struct rb_thread_sched, which is embedded in
 				// rb_ractor_struct.threads before running_ec.
