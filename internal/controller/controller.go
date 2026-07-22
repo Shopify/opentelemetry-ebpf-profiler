@@ -12,6 +12,8 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/internal/linux"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/probes/biostacks"
+	"go.opentelemetry.io/ebpf-profiler/probes/functionlatency"
 	"go.opentelemetry.io/ebpf-profiler/probes/generic"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -199,6 +201,28 @@ func createCustomProbe(name string, cfg any) (tracer.Probe, error) {
 			return nil, fmt.Errorf("decoding generic probe config: %w", err)
 		}
 		return generic.New(gcfg)
+	case biostacks.SampleType:
+		return biostacks.New(cfg)
+	case "tcp_send_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "tcp_sendmsg",
+			SampleType: name,
+		}, cfg)
+	case "tcp_receive_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "tcp_recvmsg",
+			SampleType: name,
+		}, cfg)
+	case "vfs_read_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "vfs_read",
+			SampleType: name,
+		}, cfg)
+	case "vfs_write_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "vfs_write",
+			SampleType: name,
+		}, cfg)
 	default:
 		return nil, fmt.Errorf("unknown custom probe: %q", name)
 	}

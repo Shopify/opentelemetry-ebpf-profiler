@@ -12,6 +12,7 @@ import (
 	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 
+	"go.opentelemetry.io/ebpf-profiler/probes/internal/probeutil"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
 )
@@ -103,6 +104,7 @@ func (g *genericProbe) Load(originID uint16, ctx *tracer.ProbeContext) (link.Lin
 		return nil, err
 	}
 
+	resources := &probeutil.Resources{}
 	ebpfProgs := make(map[string]*cebpf.Program)
 	if err := ctx.LoadProbeUnwinders(coll, ebpfProgs, []tracer.ProgLoaderHelper{
 		{
@@ -111,14 +113,27 @@ func (g *genericProbe) Load(originID uint16, ctx *tracer.ProbeContext) (link.Lin
 			Enable:           true,
 		},
 	}, 0); err != nil {
+		for _, program := range ebpfProgs {
+			resources.Add(program)
+		}
+		_ = resources.Close()
 		return nil, err
+	}
+	for _, program := range ebpfProgs {
+		resources.Add(program)
 	}
 
 	prog, ok := ebpfProgs[progName]
 	if !ok {
+		_ = resources.Close()
 		return nil, fmt.Errorf("program %q not found after loading", progName)
 	}
-	return tracer.AttachProbe(prog, g.spec)
+	attached, err := tracer.AttachProbe(prog, g.spec)
+	if err != nil {
+		_ = resources.Close()
+		return nil, err
+	}
+	return resources.WrapLink(attached), nil
 }
 
 func (g *genericProbe) ReportMetadata() *samples.TypeMetadata {
