@@ -686,18 +686,39 @@ const (
 	// Number of times we didn't find an entry for this process in the LuaJIT process info array
 	IDUnwindLuaJITErrNoProcInfo = 299
 
+	// Number of asynchronous initiating traces buffered for completion correlation
+	IDAsyncCorrelationStarts = 300
+
+	// Number of asynchronous completions joined to their initiating traces
+	IDAsyncCorrelationCompletions = 301
+
+	// Number of duplicate asynchronous starts, including richer stack replacements
+	IDAsyncCorrelationDuplicateStarts = 302
+
+	// Number of asynchronous completions with no buffered initiating trace
+	IDAsyncCorrelationOrphanCompletions = 303
+
+	// Number of asynchronous initiating traces evicted at correlator capacity
+	IDAsyncCorrelationCapacityEvictions = 304
+
+	// Number of asynchronous initiating traces evicted after their correlation TTL
+	IDAsyncCorrelationExpirationEvictions = 305
+
+	// Number of asynchronous initiating traces currently awaiting completion
+	IDAsyncCorrelationPending = 306
+
 	// Number of failures to get TSD base for thread context
-	IDUnwindThreadContextErrReadTsdBase = 300
+	IDUnwindThreadContextErrReadTsdBase = 307
 
 	// Number of failures to read the thread context buffer
-	IDUnwindThreadContextErrReadThreadCtxBuf = 301
+	IDUnwindThreadContextErrReadThreadCtxBuf = 308
 
 	// Number of failures to read the thread context attributes
-	IDUnwindThreadContextErrReadThreadCtxAttrs = 302
+	IDUnwindThreadContextErrReadThreadCtxAttrs = 309
 
 	// Number of successful reads of thread context info
-	IDUnwindThreadContextReadSuccesses = 303
+	IDUnwindThreadContextReadSuccesses = 310
 
 	// max number of ID values, keep this as *last entry*
-	IDMax = 304
+	IDMax = 311
 )

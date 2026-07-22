@@ -131,6 +131,31 @@ type Trace struct {
 	Frames       Frames
 }
 
+// TraceEventKind identifies an ordinary trace or an asynchronous lifecycle phase.
+type TraceEventKind uint8
+
+const (
+	TraceEventNormal TraceEventKind = iota
+	TraceEventAsyncStart
+	TraceEventAsyncComplete
+)
+
+// AsyncKind identifies the subsystem that emitted an asynchronous lifecycle event.
+type AsyncKind uint8
+
+const (
+	AsyncKindNone AsyncKind = iota
+	AsyncKindIOUring
+)
+
+// AsyncAttributes are lifecycle attributes carried by asynchronous events.
+type AsyncAttributes uint8
+
+const (
+	AsyncAttrMore AsyncAttributes = 1 << iota
+	AsyncAttrSQPoll
+)
+
 // EbpfTrace represents a stack trace from Ebpf code.
 type EbpfTrace struct {
 	EnvVars          map[String]String
@@ -144,6 +169,14 @@ type EbpfTrace struct {
 	FrameDataBuf     [3072]uint64
 	Value            int64
 	KTime            int64
+	CorrelationID    uint64
+	AsyncUserData    uint64
+	AsyncResult      int64
+	AsyncFlags       uint32
+	AsyncOperation   uint16
+	EventKind        TraceEventKind
+	AsyncKind        AsyncKind
+	AsyncAttributes  AsyncAttributes
 	CpuID            uint32
 	TID              PID
 	PID              PID
