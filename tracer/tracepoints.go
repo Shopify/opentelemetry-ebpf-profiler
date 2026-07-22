@@ -28,8 +28,9 @@ func (t *Tracer) attachToTracepoint(group, name string, prog *ebpf.Program) erro
 	return nil
 }
 
-// AttachSchedMonitor attaches a kprobe to the process scheduler. This hook detects the
-// exit of a process and enables us to clean up data we associated with this process.
+// AttachSchedMonitor attaches tracepoints for process exec and exit. Exec
+// invalidates stale per-PID metadata before surviving uprobes can emit for the
+// replacement image; exit enables cleanup of process-scoped state.
 func (t *Tracer) AttachSchedMonitor() error {
 	restoreRlimit, err := rlimit.MaximizeMemlock()
 	if err != nil {
@@ -37,6 +38,19 @@ func (t *Tracer) AttachSchedMonitor() error {
 	}
 
 	defer restoreRlimit()
+
+	execHookPoint := hookPoint{group: "sched", name: "sched_process_exec"}
+	if err := t.attachToTracepoint(execHookPoint.group, execHookPoint.name,
+		t.ebpfProgs[schedProcessExec]); err != nil {
+		return err
+	}
+
 	name := schedProcessFreeHookName(libpf.MapKeysToSet(t.ebpfProgs))
-	return t.attachToTracepoint("sched", "sched_process_free", t.ebpfProgs[name])
+	if err := t.attachToTracepoint("sched", "sched_process_free", t.ebpfProgs[name]); err != nil {
+		// Keep the pair transactional when startup fails.
+		_ = t.hooks[execHookPoint].Close()
+		delete(t.hooks, execHookPoint)
+		return err
+	}
+	return nil
 }

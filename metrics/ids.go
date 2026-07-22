@@ -734,6 +734,57 @@ const (
 	// Number of successful reads of thread context info
 	IDUnwindThreadContextReadSuccesses = 315
 
+	// Number of mapped userspace probe objects that failed symbol or build ID resolution
+	IDUserspaceProbeResolutionFailures = 320
+
+	// Number of failures attaching a PID-scoped userspace probe link
+	IDUserspaceProbeAttachFailures = 321
+
+	// Number of PID-scoped userspace probe links attached
+	IDUserspaceProbeLinksAttached = 322
+
+	// Number of PID-scoped userspace probe links detached
+	IDUserspaceProbeLinksDetached = 323
+
+	// Number of userspace probe attachments rejected at the configured link bound
+	IDUserspaceProbeLinkLimitHits = 324
+
+	// Number of userspace probe link or process-state cleanup failures
+	IDUserspaceProbeCleanupFailures = 325
+
+	// Number of processes currently owning userspace probe links
+	IDUserspaceProbeActiveProcesses = 326
+
+	// Number of PID-scoped userspace probe links currently active
+	IDUserspaceProbeActiveLinks = 327
+
+	// Number of lock-wait entry probes observed
+	IDLockWaitEntries = 328
+
+	// Number of lock-wait return probes observed
+	IDLockWaitReturns = 329
+
+	// Number of lock-wait returns without acquisition state
+	IDLockWaitUnmatchedReturns = 330
+
+	// Number of lock-wait samples filtered by duration, sampling, or return policy
+	IDLockWaitFiltered = 331
+
+	// Number of lock-wait latency samples submitted for unwinding
+	IDLockWaitEmitted = 332
+
+	// Number of failures inserting lock-wait acquisition state
+	IDLockWaitStateUpdateFailures = 333
+
+	// Number of nested lock-wait entries that replaced state for one thread
+	IDLockWaitStateOverwrites = 334
+
+	// Number of lock-wait acquisition states currently active
+	IDLockWaitActiveStates = 335
+
+	// Number of failures reading lock-wait eBPF metrics
+	IDLockWaitMetricReadFailures = 336
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 316
+	IDMax = 337
 )

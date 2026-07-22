@@ -6,9 +6,16 @@ package tracer // import "go.opentelemetry.io/ebpf-profiler/tracer"
 import (
 	"errors"
 	"fmt"
+	"io"
+	"sort"
+	"sync"
 
 	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/metrics"
+	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
@@ -30,6 +37,8 @@ var dynamicProbeResources = struct {
 		"tcp_ack_track_calls",
 		"tcp_ack_active_sockets",
 		"tcp_receive_calls",
+		"lock_wait_metrics",
+		"lock_wait_starts",
 	},
 	programs: []string{
 		"block_io_submit_bio",
@@ -53,6 +62,8 @@ var dynamicProbeResources = struct {
 		"tcp_receive_entry",
 		"tcp_receive_exit",
 		"tcp_receive_close",
+		"lock_wait_entry",
+		"lock_wait_exit",
 	},
 	variables: []string{
 		"block_io_origin",
@@ -110,6 +121,15 @@ var dynamicProbeResources = struct {
 		"tcp_receive_skb_cb_offset",
 		"tcp_receive_skb_seq_offset",
 		"tcp_receive_skb_end_seq_offset",
+		"lock_wait_min_ns",
+		"lock_wait_origin",
+		"lock_wait_return_mode",
+		"lock_wait_sample_threshold",
+		"lock_wait_success_0",
+		"lock_wait_success_1",
+		"lock_wait_success_2",
+		"lock_wait_success_3",
+		"lock_wait_success_count",
 	},
 }
 
@@ -131,8 +151,189 @@ func removeDynamicProbeResources(collection *cebpf.CollectionSpec) {
 // ProbeContext bundles the tracer's shared state and provides helpers for building eBPF
 // collections inside Probe.Load() implementations.
 type ProbeContext struct {
-	maps    map[string]*cebpf.Map
-	sysVars SysConfigVars
+	maps                     map[string]*cebpf.Map
+	sysVars                  SysConfigVars
+	subscribeProcessObserver func(pm.ProcessObserver) (io.Closer, error)
+	registerMetrics          func(func() []metrics.Metric) (io.Closer, error)
+}
+
+// ProcessIdentity identifies one PID/address-space generation.
+type ProcessIdentity = pm.ProcessIdentity
+
+// ProcessEvent is an immutable process and executable-mapping snapshot.
+type ProcessEvent = pm.ProcessEvent
+
+// ReadProcessIdentity returns the identity of the process currently occupying
+// pid. Dynamic probe attachment uses it to reject stale snapshots and PID reuse.
+func ReadProcessIdentity(pid libpf.PID) (ProcessIdentity, error) {
+	return pm.ReadProcessIdentity(pid)
+}
+
+// ProcessObserver receives process synchronization and exit events.
+type ProcessObserver = pm.ProcessObserver
+
+// ObserveProcesses subscribes observer to current and future process mapping
+// updates. The returned closer unregisters it and waits for an in-flight
+// callback to finish.
+func (c *ProbeContext) ObserveProcesses(observer ProcessObserver) (io.Closer, error) {
+	if c == nil || c.subscribeProcessObserver == nil {
+		return nil, errors.New("process observation is unavailable")
+	}
+	return c.subscribeProcessObserver(observer)
+}
+
+// RegisterMetricsCollector registers a dynamic probe metrics callback. Metric
+// values with the same ID are aggregated across all probe instances. Closing
+// the registration waits for an in-flight callback; callback panics are logged
+// and isolated from the metrics loop.
+func (c *ProbeContext) RegisterMetricsCollector(
+	collector func() []metrics.Metric,
+) (io.Closer, error) {
+	if c == nil || c.registerMetrics == nil {
+		return nil, errors.New("probe metrics registration is unavailable")
+	}
+	return c.registerMetrics(collector)
+}
+
+type probeMetricCollector struct {
+	mu       sync.Mutex
+	callback func() []metrics.Metric
+	closed   bool
+}
+
+func (collector *probeMetricCollector) collect() (result []metrics.Metric) {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	if collector.closed {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Errorf("Dynamic probe metrics collector panicked: %v", recovered)
+			result = nil
+		}
+	}()
+	return collector.callback()
+}
+
+func (collector *probeMetricCollector) close() {
+	collector.mu.Lock()
+	collector.closed = true
+	collector.callback = nil
+	collector.mu.Unlock()
+}
+
+type probeMetricSubscription struct {
+	tracer    *Tracer
+	collector *probeMetricCollector
+	id        uint64
+	once      sync.Once
+}
+
+func counterMetrics(input []metrics.Metric) []metrics.Metric {
+	counterIDs := make(map[metrics.MetricID]struct{})
+	for _, definition := range metrics.GetDefinitions() {
+		if !definition.Obsolete && definition.Field != "" &&
+			definition.Type == metrics.MetricTypeCounter {
+			counterIDs[definition.ID] = struct{}{}
+		}
+	}
+	result := make([]metrics.Metric, 0, len(input))
+	for _, metric := range input {
+		if _, isCounter := counterIDs[metric.ID]; isCounter && metric.Value != 0 {
+			result = append(result, metric)
+		}
+	}
+	return result
+}
+
+func (s *probeMetricSubscription) closeWithMetrics(final []metrics.Metric) {
+	s.once.Do(func() {
+		s.tracer.probeMetricsMu.Lock()
+		delete(s.tracer.probeMetricCollectors, s.id)
+		s.tracer.probeMetricsMu.Unlock()
+		// Wait for a collection that already captured this registration. Once
+		// Close returns the callback can no longer be running or start again.
+		s.collector.close()
+
+		final = counterMetrics(final)
+		if len(final) == 0 {
+			return
+		}
+		s.tracer.probeMetricsMu.Lock()
+		if s.tracer.pendingProbeMetrics == nil {
+			s.tracer.pendingProbeMetrics = make(metrics.Summary)
+		}
+		for _, metric := range final {
+			s.tracer.pendingProbeMetrics[metric.ID] += metric.Value
+		}
+		s.tracer.probeMetricsMu.Unlock()
+	})
+}
+
+// CloseWithMetrics unregisters the collector while retaining final counter
+// deltas for the next tracer collection. Gauge values are intentionally
+// discarded because the closed source no longer contributes to current state.
+func (s *probeMetricSubscription) CloseWithMetrics(final []metrics.Metric) error {
+	if s == nil || s.tracer == nil {
+		return nil
+	}
+	s.closeWithMetrics(final)
+	return nil
+}
+
+func (s *probeMetricSubscription) Close() error {
+	return s.CloseWithMetrics(nil)
+}
+
+func (t *Tracer) registerProbeMetrics(
+	collector func() []metrics.Metric,
+) (io.Closer, error) {
+	if collector == nil {
+		return nil, errors.New("probe metrics collector is nil")
+	}
+	t.probeMetricsMu.Lock()
+	defer t.probeMetricsMu.Unlock()
+	if t.probeMetricCollectors == nil {
+		t.probeMetricCollectors = make(map[uint64]*probeMetricCollector)
+	}
+	t.nextProbeMetricID++
+	id := t.nextProbeMetricID
+	registered := &probeMetricCollector{callback: collector}
+	t.probeMetricCollectors[id] = registered
+	return &probeMetricSubscription{tracer: t, collector: registered, id: id}, nil
+}
+
+func (t *Tracer) collectProbeMetrics() []metrics.Metric {
+	t.probeMetricsMu.Lock()
+	collectors := make([]*probeMetricCollector, 0, len(t.probeMetricCollectors))
+	for _, collector := range t.probeMetricCollectors {
+		collectors = append(collectors, collector)
+	}
+	summary := make(map[metrics.MetricID]metrics.MetricValue,
+		len(t.pendingProbeMetrics))
+	for id, value := range t.pendingProbeMetrics {
+		summary[id] = value
+	}
+	clear(t.pendingProbeMetrics)
+	t.probeMetricsMu.Unlock()
+
+	for _, collector := range collectors {
+		for _, metric := range collector.collect() {
+			summary[metric.ID] += metric.Value
+		}
+	}
+	ids := make([]int, 0, len(summary))
+	for id := range summary {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	result := make([]metrics.Metric, 0, len(ids))
+	for _, id := range ids {
+		metricID := metrics.MetricID(id)
+		result = append(result, metrics.Metric{ID: metricID, Value: summary[metricID]})
+	}
+	return result
 }
 
 // CollectionSpecWith returns a filtered CollectionSpec built from the tracer's embedded
@@ -396,8 +597,10 @@ func (t *Tracer) Enable(p Probe) error {
 	}
 
 	ctx := &ProbeContext{
-		maps:    t.ebpfMaps,
-		sysVars: t.sysConfigVars,
+		maps:                     t.ebpfMaps,
+		sysVars:                  t.sysConfigVars,
+		subscribeProcessObserver: t.processManager.SubscribeProcessObserver,
+		registerMetrics:          t.registerProbeMetrics,
 	}
 
 	lnk, err := p.Load(originID, ctx)

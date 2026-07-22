@@ -215,6 +215,16 @@ func collectInterpreterMetrics(ctx context.Context, pm *ProcessManager,
 }
 
 func (pm *ProcessManager) Close() {
+	pm.observerMu.Lock()
+	observers := make([]*processObserverEntry, 0, len(pm.processObservers))
+	for id, observer := range pm.processObservers {
+		observers = append(observers, observer)
+		delete(pm.processObservers, id)
+	}
+	pm.observerMu.Unlock()
+	for _, observer := range observers {
+		observer.close()
+	}
 }
 
 func (pm *ProcessManager) symbolizeFrame(pid libpf.PID, data []uint64, frames *libpf.Frames, mapping libpf.FrameMapping) error {
