@@ -1577,6 +1577,25 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		log.Warnf("failed to visit symbols: %v", err)
 	}
 
+	// LTO can split the dispatch loop out of rb_vm_exec into vm_exec_core.lto_priv.N
+	// far outside rb_vm_exec, so no sampled PC matches the interpreter range and the
+	// Ruby unwinder never triggers. Register the hot vm_exec_core loop as a second
+	// interpreter range (OffsetRange supports two disjoint ranges).
+	if len(interpRanges) < 2 {
+		var best util.Range
+		_ = ef.VisitSymbols(func(s libpf.Symbol) bool {
+			n := string(s.Name)
+			if (n == "vm_exec_core" || strings.HasPrefix(n, "vm_exec_core.")) &&
+				!strings.Contains(n, ".cold") && s.Size > best.End-best.Start {
+				best = util.Range{Start: uint64(s.Address), End: uint64(s.Address) + s.Size}
+			}
+			return true
+		})
+		if best.End > best.Start {
+			interpRanges = append(interpRanges, best)
+		}
+	}
+
 	// NOTE for ruby 3.3.0+, if ruby is stripped, we have no way of locating
 	// ruby_current_ec TLS symbol.
 	// We could potentially add a fallback for this in the future, but for now
@@ -1717,10 +1736,14 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		vms.objspace.flags = 16
 	case version >= rubyVersion(4, 0, 0) && version < rubyVersion(4, 1, 0):
 		rid.hasObjspace = true
+		// Shopify pshopify Ruby (4.0.5-pshopify3) backports 4.0.6 rb_vm_t.master_box
+		// (ruby/ruby@99aac00), shifting gc.objspace +8. DWARF of the deployed binary
+		// confirms 1256 (amd64). The wrong offset makes gc_check read a bogus objspace
+		// and skip the Ruby stack walk on every sample.
 		if runtime.GOARCH == "amd64" {
-			vms.vm_struct.gc_objspace = 1248
+			vms.vm_struct.gc_objspace = 1256
 		} else {
-			vms.vm_struct.gc_objspace = 1272
+			vms.vm_struct.gc_objspace = 1280
 		}
 		vms.objspace.flags = 28
 	default:
