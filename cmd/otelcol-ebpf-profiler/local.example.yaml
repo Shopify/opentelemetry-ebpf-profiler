@@ -24,9 +24,19 @@ receivers:
     #   io_uring_latency:
     #     min_duration: 100us
     #     sample_rate: 0.1
-    #   # Linux 5.19+; block_io_start -> block_rq_issue, matching biostacks.bt.
-    #   # This asynchronous profile attributes latency to the initiating kernel stack.
+    #   # Request-pointer correlation preserves the submit_bio_noacct stack
+    #   # through queueing, device service, and final completion.
     #   block_io_queue_latency:
+    #     min_duration: 100us
+    #     sample_rate: 0.1
+    #   block_io_service_latency:
+    #     min_duration: 100us
+    #     sample_rate: 0.1
+    #   block_io_latency:
+    #     min_duration: 1ms
+    #     sample_rate: 0.1
+    #   # TCP handshake latency follows struct sock through ESTABLISHED or CLOSE.
+    #   tcp_connect_latency:
     #     min_duration: 100us
     #     sample_rate: 0.1
     #   # Synchronous function profiles include both kernel and user stacks.

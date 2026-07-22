@@ -3,13 +3,11 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-package biostacks
+package tcpconnect
 
 import (
 	"context"
-	"crypto/rand"
-	"os"
-	"path/filepath"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -42,16 +40,16 @@ type captureReporter struct {
 func (r *captureReporter) ReportTraceEvent(
 	trace *libpf.Trace, meta *samples.TraceEventMeta,
 ) error {
-	copiedTrace := &libpf.Trace{
+	copied := &libpf.Trace{
 		CustomLabels: make(map[libpf.String]libpf.String, len(trace.CustomLabels)),
 		Frames:       append(libpf.Frames(nil), trace.Frames...),
 	}
 	for key, value := range trace.CustomLabels {
-		copiedTrace.CustomLabels[key] = value
+		copied.CustomLabels[key] = value
 	}
 	copiedMeta := *meta
 	select {
-	case r.traces <- reportedTrace{trace: copiedTrace, meta: &copiedMeta}:
+	case r.traces <- reportedTrace{trace: copied, meta: &copiedMeta}:
 	default:
 	}
 	return nil
@@ -59,19 +57,29 @@ func (r *captureReporter) ReportTraceEvent(
 
 var startMetricsOnce sync.Once
 
-func TestBlockIOLifecycleProbes(t *testing.T) {
-	for _, event := range []string{
-		insertTracepointName, issueTracepointName, completeTracepointName,
-	} {
-		if !tracepointAvailable("block", event) {
-			t.Skipf("tracepoint block/%s is unavailable", event)
-		}
-	}
-	layout, err := discoverBlockLayout()
+func TestTCPConnectHandshakeLatency(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
-	startMetricsOnce.Do(func() { metrics.Start(noop.Meter{}) })
+	defer listener.Close()
+	acceptCtx, stopAccept := context.WithCancel(t.Context())
+	defer stopAccept()
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = connection.Close()
+			select {
+			case <-acceptCtx.Done():
+				return
+			default:
+			}
+		}
+	}()
 
-	reporter := &captureReporter{traces: make(chan reportedTrace, 1024)}
+	startMetricsOnce.Do(func() { metrics.Start(noop.Meter{}) })
+	reporter := &captureReporter{traces: make(chan reportedTrace, 128)}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	trc, err := tracer.NewTracer(ctx, &tracer.Config{
@@ -106,76 +114,46 @@ func TestBlockIOLifecycleProbes(t *testing.T) {
 		}
 	}()
 
-	for _, sampleType := range []string{SampleType, ServiceSampleType, FullSampleType} {
-		created, createErr := NewForSampleType(sampleType, map[string]any{})
-		require.NoError(t, createErr)
-		require.NoError(t, trc.Enable(created))
-	}
-
-	file, err := os.CreateTemp("", "otel-block-lifecycle-*")
+	created, err := New(map[string]any{})
 	require.NoError(t, err)
-	defer os.Remove(file.Name())
-	defer file.Close()
-	payload := make([]byte, 4*1024*1024)
-	_, err = rand.Read(payload)
-	require.NoError(t, err)
+	require.NoError(t, trc.Enable(created))
 
-	wanted := map[string]bool{
-		SampleType: false, ServiceSampleType: false, FullSampleType: false,
-	}
-	deadline := time.NewTimer(15 * time.Second)
+	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
 	for {
-		_, err = file.Write(payload)
-		require.NoError(t, err)
-		require.NoError(t, file.Sync())
-		require.NoError(t, file.Truncate(0))
-		_, err = file.Seek(0, 0)
-		require.NoError(t, err)
+		connection, dialErr := net.Dial("tcp4", listener.Addr().String())
+		require.NoError(t, dialErr)
+		require.NoError(t, connection.Close())
 
 		select {
 		case reported := <-reporter.traces:
-			sampleType := reported.meta.ProfileType.SampleType
-			if _, ok := wanted[sampleType]; !ok {
+			if reported.meta.ProfileType.SampleType != SampleType {
 				continue
 			}
 			require.Positive(t, reported.meta.Value)
 			require.NotEmpty(t, reported.trace.Frames)
-			require.NotEmpty(t,
-				reported.trace.CustomLabels[libpf.Intern("io.operation")].String())
-			if layout.hasBTF {
-				require.NotEmpty(t,
-					reported.trace.CustomLabels[libpf.Intern("io.device")].String())
-			}
-			if sampleType == FullSampleType && layout.hasBTF {
-				hasUserFrame := false
-				for _, frame := range reported.trace.Frames {
-					if frame.Value().Type != libpf.KernelFrame {
-						hasUserFrame = true
-						break
-					}
-				}
-				if !hasUserFrame {
-					continue
+			hasUserFrame := false
+			for _, frame := range reported.trace.Frames {
+				if frame.Value().Type != libpf.KernelFrame {
+					hasUserFrame = true
+					break
 				}
 			}
-			wanted[sampleType] = true
-			if wanted[SampleType] && wanted[ServiceSampleType] && wanted[FullSampleType] {
-				return
+			if !hasUserFrame {
+				continue
 			}
+			require.Equal(t, libpf.Intern("connect"),
+				reported.trace.CustomLabels[libpf.Intern("network.operation")])
+			require.Equal(t, libpf.Intern("tcp"),
+				reported.trace.CustomLabels[libpf.Intern("network.transport")])
+			require.Equal(t, libpf.Intern("ipv4"),
+				reported.trace.CustomLabels[libpf.Intern("network.type")])
+			require.Equal(t, libpf.Intern("ok"),
+				reported.trace.CustomLabels[libpf.Intern("network.connect.status")])
+			return
 		case <-deadline.C:
-			t.Fatalf("timed out waiting for block lifecycle profiles: %+v", wanted)
+			t.Fatal("timed out waiting for a TCP connect latency profile")
 		default:
 		}
 	}
-}
-
-func tracepointAvailable(group, event string) bool {
-	for _, root := range []string{"/sys/kernel/tracing", "/sys/kernel/debug/tracing"} {
-		path := filepath.Join(root, "events", group, event, "id")
-		if _, err := os.Stat(path); err == nil {
-			return true
-		}
-	}
-	return false
 }

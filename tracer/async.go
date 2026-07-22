@@ -128,6 +128,7 @@ type asyncCorrelatorStats struct {
 	orphanCompletions   uint64
 	capacityEvictions   uint64
 	expirationEvictions uint64
+	filteredCompletions uint64
 }
 
 // asyncTraceCorrelator joins bounded asynchronous completion events to compact
@@ -227,6 +228,9 @@ func (c *asyncTraceCorrelator) complete(completion *libpf.EbpfTrace) bool {
 	addAsyncLabels(completion)
 
 	c.stats.completions++
+	if completionAttributes&libpf.AsyncAttrFiltered != 0 {
+		c.stats.filteredCompletions++
+	}
 	if completionAttributes&libpf.AsyncAttrMore == 0 {
 		delete(c.pending, key)
 		c.order.Remove(element)
@@ -263,6 +267,7 @@ func (c *asyncTraceCorrelator) getAndResetMetrics() []metrics.Metric {
 		{ID: metrics.IDAsyncCorrelationCapacityEvictions, Value: metrics.MetricValue(c.stats.capacityEvictions)},
 		{ID: metrics.IDAsyncCorrelationExpirationEvictions, Value: metrics.MetricValue(c.stats.expirationEvictions)},
 		{ID: metrics.IDAsyncCorrelationPending, Value: metrics.MetricValue(len(c.pending))},
+		{ID: metrics.IDAsyncCorrelationFilteredCompletions, Value: metrics.MetricValue(c.stats.filteredCompletions)},
 	}
 	c.stats = asyncCorrelatorStats{}
 	return updates
@@ -284,27 +289,92 @@ func (c *asyncTraceCorrelator) removeOldest(expired bool) {
 }
 
 func addAsyncLabels(trace *libpf.EbpfTrace) {
-	if trace.AsyncKind != libpf.AsyncKindIOUring {
+	if trace.CustomLabels == nil {
+		trace.CustomLabels = make(map[libpf.String]libpf.String, 6)
+	}
+
+	switch trace.AsyncKind {
+	case libpf.AsyncKindIOUring:
+		trace.CustomLabels[libpf.Intern("io.operation")] =
+			libpf.Intern(ioUringOperationName(trace.AsyncOperation))
+		trace.CustomLabels[libpf.Intern("io.completion_flags")] =
+			libpf.Intern(fmt.Sprintf("0x%x", trace.AsyncFlags))
+		if trace.AsyncAttributes&libpf.AsyncAttrSQPoll != 0 {
+			trace.CustomLabels[libpf.Intern("io_uring.sq_poll")] = libpf.Intern("true")
+		}
+	case libpf.AsyncKindBlock:
+		trace.CustomLabels[libpf.Intern("io.operation")] =
+			libpf.Intern(blockOperationName(trace.AsyncOperation))
+		if trace.AsyncUserData != 0 {
+			major := trace.AsyncUserData >> 32
+			minor := uint32(trace.AsyncUserData)
+			trace.CustomLabels[libpf.Intern("io.device")] =
+				libpf.Intern(fmt.Sprintf("%d:%d", major, minor))
+		}
+	case libpf.AsyncKindTCPConnect:
+		trace.CustomLabels[libpf.Intern("network.operation")] = libpf.Intern("connect")
+		trace.CustomLabels[libpf.Intern("network.transport")] = libpf.Intern("tcp")
+		if trace.AsyncOperation == 6 {
+			trace.CustomLabels[libpf.Intern("network.type")] = libpf.Intern("ipv6")
+		} else {
+			trace.CustomLabels[libpf.Intern("network.type")] = libpf.Intern("ipv4")
+		}
+	default:
 		return
 	}
-	if trace.CustomLabels == nil {
-		trace.CustomLabels = make(map[libpf.String]libpf.String, 5)
+
+	resultLabel := libpf.Intern("io.result")
+	statusLabel := libpf.Intern("io.status")
+	if trace.AsyncKind == libpf.AsyncKindTCPConnect {
+		resultLabel = libpf.Intern("network.connect.error_code")
+		statusLabel = libpf.Intern("network.connect.status")
 	}
-	trace.CustomLabels[libpf.Intern("io.operation")] =
-		libpf.Intern(ioUringOperationName(trace.AsyncOperation))
-	trace.CustomLabels[libpf.Intern("io.result")] =
-		libpf.Intern(strconv.FormatInt(trace.AsyncResult, 10))
-	trace.CustomLabels[libpf.Intern("io.completion_flags")] =
-		libpf.Intern(fmt.Sprintf("0x%x", trace.AsyncFlags))
-	if trace.AsyncAttributes&libpf.AsyncAttrSQPoll != 0 {
-		trace.CustomLabels[libpf.Intern("io_uring.sq_poll")] = libpf.Intern("true")
-	}
-	if trace.AsyncResult == -125 {
-		trace.CustomLabels[libpf.Intern("io.status")] = libpf.Intern("cancelled")
-	} else if trace.AsyncResult < 0 {
-		trace.CustomLabels[libpf.Intern("io.status")] = libpf.Intern("error")
+	trace.CustomLabels[resultLabel] = libpf.Intern(strconv.FormatInt(trace.AsyncResult, 10))
+	if trace.AsyncKind == libpf.AsyncKindIOUring && trace.AsyncResult == -125 {
+		trace.CustomLabels[statusLabel] = libpf.Intern("cancelled")
+	} else if (trace.AsyncKind == libpf.AsyncKindIOUring && trace.AsyncResult < 0) ||
+		(trace.AsyncKind == libpf.AsyncKindBlock && trace.AsyncResult != 0) ||
+		(trace.AsyncKind == libpf.AsyncKindTCPConnect && trace.AsyncResult != 0) {
+		trace.CustomLabels[statusLabel] = libpf.Intern("error")
 	} else {
-		trace.CustomLabels[libpf.Intern("io.status")] = libpf.Intern("ok")
+		trace.CustomLabels[statusLabel] = libpf.Intern("ok")
+	}
+}
+
+func blockOperationName(operation uint16) string {
+	switch operation {
+	case 0:
+		return "read"
+	case 1:
+		return "write"
+	case 2:
+		return "flush"
+	case 3:
+		return "discard"
+	case 5:
+		return "secure_erase"
+	case 6:
+		return "zone_reset"
+	case 7:
+		return "write_same"
+	case 9:
+		return "write_zeroes"
+	case 10:
+		return "zone_open"
+	case 11:
+		return "zone_close"
+	case 12:
+		return "zone_finish"
+	case 13:
+		return "zone_append"
+	case 15:
+		return "zone_reset_all"
+	case 17:
+		return "drv_in"
+	case 18:
+		return "drv_out"
+	default:
+		return strconv.FormatUint(uint64(operation), 10)
 	}
 }
 

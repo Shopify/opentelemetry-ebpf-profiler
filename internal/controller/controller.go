@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/probes/functionlatency"
 	"go.opentelemetry.io/ebpf-profiler/probes/generic"
 	"go.opentelemetry.io/ebpf-profiler/probes/iouring"
+	"go.opentelemetry.io/ebpf-profiler/probes/tcpconnect"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
@@ -204,10 +205,12 @@ func createCustomProbe(name string, cfg any) (tracer.Probe, error) {
 			return nil, fmt.Errorf("decoding generic probe config: %w", err)
 		}
 		return generic.New(gcfg)
-	case biostacks.SampleType:
-		return biostacks.New(cfg)
+	case biostacks.SampleType, biostacks.ServiceSampleType, biostacks.FullSampleType:
+		return biostacks.NewForSampleType(name, cfg)
 	case iouring.SampleType:
 		return iouring.New(cfg)
+	case tcpconnect.SampleType:
+		return tcpconnect.New(cfg)
 	case "tcp_send_latency":
 		return functionlatency.New(functionlatency.Definition{
 			Symbol:     "tcp_sendmsg",

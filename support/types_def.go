@@ -39,10 +39,13 @@ const (
 	TraceEventAsyncStart    = C.TRACE_EVENT_ASYNC_START
 	TraceEventAsyncComplete = C.TRACE_EVENT_ASYNC_COMPLETE
 
-	TraceAsyncNone       = C.TRACE_ASYNC_NONE
-	TraceAsyncIOUring    = C.TRACE_ASYNC_IO_URING
-	TraceAsyncAttrMore   = C.TRACE_ASYNC_ATTR_MORE
-	TraceAsyncAttrSQPoll = C.TRACE_ASYNC_ATTR_SQ_POLL
+	TraceAsyncNone         = C.TRACE_ASYNC_NONE
+	TraceAsyncIOUring      = C.TRACE_ASYNC_IO_URING
+	TraceAsyncBlock        = C.TRACE_ASYNC_BLOCK
+	TraceAsyncTCPConnect   = C.TRACE_ASYNC_TCP_CONNECT
+	TraceAsyncAttrMore     = C.TRACE_ASYNC_ATTR_MORE
+	TraceAsyncAttrSQPoll   = C.TRACE_ASYNC_ATTR_SQ_POLL
+	TraceAsyncAttrFiltered = C.TRACE_ASYNC_ATTR_FILTERED
 )
 
 const (

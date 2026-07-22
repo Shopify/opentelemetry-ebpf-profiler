@@ -32,10 +32,13 @@ const (
 	TraceEventAsyncStart    = 0x1
 	TraceEventAsyncComplete = 0x2
 
-	TraceAsyncNone       = 0x0
-	TraceAsyncIOUring    = 0x1
-	TraceAsyncAttrMore   = 0x1
-	TraceAsyncAttrSQPoll = 0x2
+	TraceAsyncNone         = 0x0
+	TraceAsyncIOUring      = 0x1
+	TraceAsyncBlock        = 0x2
+	TraceAsyncTCPConnect   = 0x3
+	TraceAsyncAttrMore     = 0x1
+	TraceAsyncAttrSQPoll   = 0x2
+	TraceAsyncAttrFiltered = 0x4
 )
 
 const (

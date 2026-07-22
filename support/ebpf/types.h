@@ -675,12 +675,15 @@ enum CustomLabelsType {
 #define TRACE_EVENT_ASYNC_COMPLETE 2
 
 // Asynchronous subsystem identifiers.
-#define TRACE_ASYNC_NONE     0
-#define TRACE_ASYNC_IO_URING 1
+#define TRACE_ASYNC_NONE        0
+#define TRACE_ASYNC_IO_URING    1
+#define TRACE_ASYNC_BLOCK       2
+#define TRACE_ASYNC_TCP_CONNECT 3
 
 // Asynchronous event attributes.
-#define TRACE_ASYNC_ATTR_MORE    (1U << 0)
-#define TRACE_ASYNC_ATTR_SQ_POLL (1U << 1)
+#define TRACE_ASYNC_ATTR_MORE     (1U << 0)
+#define TRACE_ASYNC_ATTR_SQ_POLL  (1U << 1)
+#define TRACE_ASYNC_ATTR_FILTERED (1U << 2)
 
 // Profile stack and asynchronous lifecycle data emitted through trace_events.
 typedef struct Trace {

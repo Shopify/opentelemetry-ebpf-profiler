@@ -15,7 +15,7 @@ func TestNewDefaults(t *testing.T) {
 	created, err := New(map[string]any{})
 	require.NoError(t, err)
 
-	probe := created.(*blockIOStacksProbe)
+	probe := created.(*blockIOProbe)
 	require.Zero(t, probe.minDuration)
 	require.Equal(t, uint32(math.MaxUint32), probe.sampleThreshold)
 	require.Equal(t, defaultMaxEntries, probe.maxEntries)
@@ -34,10 +34,22 @@ func TestNewConfigured(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	probe := created.(*blockIOStacksProbe)
+	probe := created.(*blockIOProbe)
 	require.Equal(t, 250*time.Microsecond, probe.minDuration)
 	require.Equal(t, uint32(math.MaxUint32/2), probe.sampleThreshold)
 	require.Equal(t, uint32(4096), probe.maxEntries)
+}
+
+func TestNewLifecycleModes(t *testing.T) {
+	for sampleType, expectedMode := range map[string]mode{
+		SampleType: queueMode, ServiceSampleType: serviceMode, FullSampleType: fullMode,
+	} {
+		created, err := NewForSampleType(sampleType, map[string]any{})
+		require.NoError(t, err)
+		probe := created.(*blockIOProbe)
+		require.Equal(t, expectedMode, probe.mode)
+		require.Equal(t, sampleType, probe.ReportMetadata().SampleType)
+	}
 }
 
 func TestNewRejectsInvalidConfiguration(t *testing.T) {
@@ -47,11 +59,11 @@ func TestNewRejectsInvalidConfiguration(t *testing.T) {
 	}{
 		"not a map": {
 			config:    "bad",
-			errorText: "block I/O stacks configuration must be a map, got string",
+			errorText: "block I/O configuration must be a map, got string",
 		},
 		"unknown field": {
 			config:    map[string]any{"unknown": true},
-			errorText: "unknown block I/O stacks configuration field \"unknown\"",
+			errorText: "unknown block I/O configuration field \"unknown\"",
 		},
 		"negative duration": {
 			config:    map[string]any{"min_duration": -time.Second},
