@@ -127,6 +127,8 @@ type Tracer struct {
 
 	// asyncCorrelator retains compact initiating traces until their completion.
 	asyncCorrelator *asyncTraceCorrelator
+	// tcpSequenceCorrelator joins byte ranges to cumulative ACK/read progress.
+	tcpSequenceCorrelator *tcpSequenceCorrelator
 
 	// triggerPIDProcessing is used as manual trigger channel to request immediate
 	// processing of pending PIDs. This is requested on notifications from eBPF code
@@ -344,6 +346,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		triggerPIDProcessing:   make(chan bool, 1),
 		tracePool:              newTracePool(),
 		asyncCorrelator:        newAsyncTraceCorrelator(asyncCapacity, asyncTTL),
+		tcpSequenceCorrelator:  newTCPSequenceCorrelator(asyncCapacity, asyncTTL),
 		pidEvents:              make(chan libpf.PIDTID, pidEventBufferSize),
 		ebpfMaps:               ebpfMaps,
 		ebpfProgs:              ebpfProgs,
@@ -1226,6 +1229,7 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 		KTime:            int64(ptr.Ktime),
 		CorrelationID:    ptr.Correlation_id,
 		AsyncUserData:    ptr.Async_user_data,
+		AsyncThreshold:   ptr.Async_threshold,
 		AsyncResult:      ptr.Async_result,
 		AsyncFlags:       ptr.Async_flags,
 		AsyncOperation:   ptr.Async_operation,
@@ -1338,6 +1342,9 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *libp
 		metrics.AddSlice(t.customLabels.getAndResetMetrics())
 		if t.asyncCorrelator != nil {
 			metrics.AddSlice(t.asyncCorrelator.getAndResetMetrics())
+		}
+		if t.tcpSequenceCorrelator != nil {
+			metrics.AddSlice(t.tcpSequenceCorrelator.getAndResetMetrics())
 		}
 	})
 
@@ -1543,6 +1550,31 @@ func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	if t.asyncCorrelator == nil {
 		t.asyncCorrelator = newAsyncTraceCorrelator(
 			defaultAsyncCorrelationCapacity, defaultAsyncCorrelationTTL)
+	}
+	if t.tcpSequenceCorrelator == nil {
+		t.tcpSequenceCorrelator = newTCPSequenceCorrelator(
+			defaultAsyncCorrelationCapacity, defaultAsyncCorrelationTTL)
+	}
+	if (bpfTrace.AsyncKind == libpf.AsyncKindTCPAck ||
+		bpfTrace.AsyncKind == libpf.AsyncKindTCPReceive) &&
+		bpfTrace.EventKind != libpf.TraceEventNormal {
+		completions := t.tcpSequenceCorrelator.handle(bpfTrace)
+		t.releaseTrace(bpfTrace)
+		for i := range completions {
+			completion := &completions[i]
+			trace := t.tracePool.Get().(*libpf.EbpfTrace)
+			completion.snapshot.restore(trace)
+			trace.KTime = completion.ktime
+			trace.CpuID = completion.cpu
+			trace.Value = completion.value
+			trace.AsyncResult = completion.result
+			trace.AsyncKind = completion.kind
+			trace.EventKind = libpf.TraceEventNormal
+			addAsyncLabels(trace)
+			t.processManager.HandleTrace(trace, t.origins.lookup(trace.Origin))
+			t.releaseTrace(trace)
+		}
+		return
 	}
 
 	switch bpfTrace.EventKind {

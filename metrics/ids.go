@@ -710,18 +710,30 @@ const (
 	// Number of correlated asynchronous completions suppressed by a duration filter
 	IDAsyncCorrelationFilteredCompletions = 307
 
+	// Number of TCP sequence operations missing a packet or initiating stack
+	IDTCPSequenceCorrelationOrphans = 308
+
+	// Number of TCP sequence correlation records removed by capacity or TTL
+	IDTCPSequenceCorrelationEvictions = 309
+
+	// Number of TCP sequence latencies suppressed by a duration filter
+	IDTCPSequenceCorrelationFiltered = 310
+
+	// Number of TCP calls and sequence ranges awaiting correlation
+	IDTCPSequenceCorrelationPending = 311
+
 	// Number of failures to get TSD base for thread context
-	IDUnwindThreadContextErrReadTsdBase = 308
+	IDUnwindThreadContextErrReadTsdBase = 312
 
 	// Number of failures to read the thread context buffer
-	IDUnwindThreadContextErrReadThreadCtxBuf = 309
+	IDUnwindThreadContextErrReadThreadCtxBuf = 313
 
 	// Number of failures to read the thread context attributes
-	IDUnwindThreadContextErrReadThreadCtxAttrs = 310
+	IDUnwindThreadContextErrReadThreadCtxAttrs = 314
 
 	// Number of successful reads of thread context info
-	IDUnwindThreadContextReadSuccesses = 311
+	IDUnwindThreadContextReadSuccesses = 315
 
 	// max number of ID values, keep this as *last entry*
-	IDMax = 312
+	IDMax = 316
 )

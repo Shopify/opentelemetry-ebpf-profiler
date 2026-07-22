@@ -2246,31 +2246,59 @@
     "id": 307
   },
   {
+    "description": "Number of TCP sequence operations missing a packet or initiating stack",
+    "type": "counter",
+    "name": "TCPSequenceCorrelationOrphans",
+    "field": "agent.tcp_sequence_correlation.orphans",
+    "id": 308
+  },
+  {
+    "description": "Number of TCP sequence correlation records removed by capacity or TTL",
+    "type": "counter",
+    "name": "TCPSequenceCorrelationEvictions",
+    "field": "agent.tcp_sequence_correlation.evictions",
+    "id": 309
+  },
+  {
+    "description": "Number of TCP sequence latencies suppressed by a duration filter",
+    "type": "counter",
+    "name": "TCPSequenceCorrelationFiltered",
+    "field": "agent.tcp_sequence_correlation.filtered",
+    "id": 310
+  },
+  {
+    "description": "Number of TCP calls and sequence ranges awaiting correlation",
+    "type": "gauge",
+    "name": "TCPSequenceCorrelationPending",
+    "field": "agent.tcp_sequence_correlation.pending",
+    "id": 311
+  },
+  {
     "description": "Number of failures to get TSD base for thread context",
     "type": "counter",
     "name": "UnwindThreadContextErrReadTsdBase",
     "field": "bpf.threadctx.errors.read_tsd_base",
-    "id": 308
+    "id": 312
   },
   {
     "description": "Number of failures to read the thread context buffer",
     "type": "counter",
     "name": "UnwindThreadContextErrReadThreadCtxBuf",
     "field": "bpf.threadctx.errors.read_thread_ctx_buf",
-    "id": 309
+    "id": 313
   },
   {
     "description": "Number of failures to read the thread context attributes",
     "type": "counter",
     "name": "UnwindThreadContextErrReadThreadCtxAttrs",
     "field": "bpf.threadctx.errors.read_thread_ctx_attrs",
-    "id": 310
+    "id": 314
   },
   {
     "description": "Number of successful reads of thread context info",
     "type": "counter",
     "name": "UnwindThreadContextReadSuccesses",
     "field": "bpf.threadctx.read_successes",
-    "id": 311
+    "id": 315
   }
 ]

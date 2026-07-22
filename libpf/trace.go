@@ -138,6 +138,8 @@ const (
 	TraceEventNormal TraceEventKind = iota
 	TraceEventAsyncStart
 	TraceEventAsyncComplete
+	TraceEventAsyncRegister
+	TraceEventAsyncProgress
 )
 
 // AsyncKind identifies the subsystem that emitted an asynchronous lifecycle event.
@@ -148,6 +150,8 @@ const (
 	AsyncKindIOUring
 	AsyncKindBlock
 	AsyncKindTCPConnect
+	AsyncKindTCPAck
+	AsyncKindTCPReceive
 )
 
 // AsyncAttributes are lifecycle attributes carried by asynchronous events.
@@ -174,6 +178,7 @@ type EbpfTrace struct {
 	KTime            int64
 	CorrelationID    uint64
 	AsyncUserData    uint64
+	AsyncThreshold   uint64
 	AsyncResult      int64
 	AsyncFlags       uint32
 	AsyncOperation   uint16

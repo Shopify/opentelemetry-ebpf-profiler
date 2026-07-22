@@ -31,11 +31,15 @@ const (
 	TraceEventNormal        = 0x0
 	TraceEventAsyncStart    = 0x1
 	TraceEventAsyncComplete = 0x2
+	TraceEventAsyncRegister = 0x3
+	TraceEventAsyncProgress = 0x4
 
 	TraceAsyncNone         = 0x0
 	TraceAsyncIOUring      = 0x1
 	TraceAsyncBlock        = 0x2
 	TraceAsyncTCPConnect   = 0x3
+	TraceAsyncTCPAck       = 0x4
+	TraceAsyncTCPReceive   = 0x5
 	TraceAsyncAttrMore     = 0x1
 	TraceAsyncAttrSQPoll   = 0x2
 	TraceAsyncAttrFiltered = 0x4
@@ -188,6 +192,7 @@ type Trace struct {
 	Value              uint64
 	Correlation_id     uint64
 	Async_user_data    uint64
+	Async_threshold    uint64
 	Async_result       int64
 	Async_flags        uint32
 	Async_operation    uint16
@@ -374,7 +379,7 @@ type LuaJITProcInfo struct {
 
 const (
 	Sizeof_StackDelta = 0x4
-	Sizeof_Trace      = 0x62f8
+	Sizeof_Trace      = 0x6300
 
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4

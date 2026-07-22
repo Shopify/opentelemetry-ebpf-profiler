@@ -45,6 +45,7 @@ type asyncTraceSnapshot struct {
 	apmTransactionID libpf.APMTransactionID
 	correlationID    uint64
 	asyncUserData    uint64
+	asyncThreshold   uint64
 	asyncOperation   uint16
 	asyncKind        libpf.AsyncKind
 	asyncAttributes  libpf.AsyncAttributes
@@ -71,6 +72,7 @@ func snapshotAsyncTrace(trace *libpf.EbpfTrace) asyncTraceSnapshot {
 		apmTransactionID: trace.APMTransactionID,
 		correlationID:    trace.CorrelationID,
 		asyncUserData:    trace.AsyncUserData,
+		asyncThreshold:   trace.AsyncThreshold,
 		asyncOperation:   trace.AsyncOperation,
 		asyncKind:        trace.AsyncKind,
 		asyncAttributes:  trace.AsyncAttributes,
@@ -97,6 +99,7 @@ func (s *asyncTraceSnapshot) restore(trace *libpf.EbpfTrace) {
 		APMTransactionID: s.apmTransactionID,
 		CorrelationID:    s.correlationID,
 		AsyncUserData:    s.asyncUserData,
+		AsyncThreshold:   s.asyncThreshold,
 		AsyncOperation:   s.asyncOperation,
 		AsyncKind:        s.asyncKind,
 		AsyncAttributes:  s.asyncAttributes,
@@ -319,6 +322,13 @@ func addAsyncLabels(trace *libpf.EbpfTrace) {
 		} else {
 			trace.CustomLabels[libpf.Intern("network.type")] = libpf.Intern("ipv4")
 		}
+	case libpf.AsyncKindTCPAck:
+		trace.CustomLabels[libpf.Intern("network.operation")] = libpf.Intern("send_to_ack")
+		trace.CustomLabels[libpf.Intern("network.transport")] = libpf.Intern("tcp")
+	case libpf.AsyncKindTCPReceive:
+		trace.CustomLabels[libpf.Intern("network.operation")] =
+			libpf.Intern("receive_consumption")
+		trace.CustomLabels[libpf.Intern("network.transport")] = libpf.Intern("tcp")
 	default:
 		return
 	}
@@ -328,6 +338,10 @@ func addAsyncLabels(trace *libpf.EbpfTrace) {
 	if trace.AsyncKind == libpf.AsyncKindTCPConnect {
 		resultLabel = libpf.Intern("network.connect.error_code")
 		statusLabel = libpf.Intern("network.connect.status")
+	} else if trace.AsyncKind == libpf.AsyncKindTCPAck ||
+		trace.AsyncKind == libpf.AsyncKindTCPReceive {
+		resultLabel = libpf.Intern("network.io.bytes")
+		statusLabel = libpf.Intern("network.io.status")
 	}
 	trace.CustomLabels[resultLabel] = libpf.Intern(strconv.FormatInt(trace.AsyncResult, 10))
 	if trace.AsyncKind == libpf.AsyncKindIOUring && trace.AsyncResult == -125 {

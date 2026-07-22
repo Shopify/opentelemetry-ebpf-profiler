@@ -673,12 +673,16 @@ enum CustomLabelsType {
 #define TRACE_EVENT_NORMAL         0
 #define TRACE_EVENT_ASYNC_START    1
 #define TRACE_EVENT_ASYNC_COMPLETE 2
+#define TRACE_EVENT_ASYNC_REGISTER 3
+#define TRACE_EVENT_ASYNC_PROGRESS 4
 
 // Asynchronous subsystem identifiers.
 #define TRACE_ASYNC_NONE        0
 #define TRACE_ASYNC_IO_URING    1
 #define TRACE_ASYNC_BLOCK       2
 #define TRACE_ASYNC_TCP_CONNECT 3
+#define TRACE_ASYNC_TCP_ACK     4
+#define TRACE_ASYNC_TCP_RECEIVE 5
 
 // Asynchronous event attributes.
 #define TRACE_ASYNC_ATTR_MORE     (1U << 0)
@@ -730,6 +734,10 @@ typedef struct Trace {
 
   // async_user_data carries an optional subsystem-defined request identifier.
   u64 async_user_data;
+
+  // async_threshold carries a userspace completion filter where the kernel
+  // cannot join ordered ranges by itself.
+  u64 async_threshold;
 
   // async_result and async_flags describe the completion result.
   s64 async_result;

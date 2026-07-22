@@ -38,11 +38,15 @@ const (
 	TraceEventNormal        = C.TRACE_EVENT_NORMAL
 	TraceEventAsyncStart    = C.TRACE_EVENT_ASYNC_START
 	TraceEventAsyncComplete = C.TRACE_EVENT_ASYNC_COMPLETE
+	TraceEventAsyncRegister = C.TRACE_EVENT_ASYNC_REGISTER
+	TraceEventAsyncProgress = C.TRACE_EVENT_ASYNC_PROGRESS
 
 	TraceAsyncNone         = C.TRACE_ASYNC_NONE
 	TraceAsyncIOUring      = C.TRACE_ASYNC_IO_URING
 	TraceAsyncBlock        = C.TRACE_ASYNC_BLOCK
 	TraceAsyncTCPConnect   = C.TRACE_ASYNC_TCP_CONNECT
+	TraceAsyncTCPAck       = C.TRACE_ASYNC_TCP_ACK
+	TraceAsyncTCPReceive   = C.TRACE_ASYNC_TCP_RECEIVE
 	TraceAsyncAttrMore     = C.TRACE_ASYNC_ATTR_MORE
 	TraceAsyncAttrSQPoll   = C.TRACE_ASYNC_ATTR_SQ_POLL
 	TraceAsyncAttrFiltered = C.TRACE_ASYNC_ATTR_FILTERED
