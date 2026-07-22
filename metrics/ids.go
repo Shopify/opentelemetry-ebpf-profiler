@@ -722,6 +722,18 @@ const (
 	// Number of TCP calls and sequence ranges awaiting correlation
 	IDTCPSequenceCorrelationPending = 311
 
+	// Number of failures to get TSD base for thread context
+	IDUnwindThreadContextErrReadTsdBase = 312
+
+	// Number of failures to read the thread context buffer
+	IDUnwindThreadContextErrReadThreadCtxBuf = 313
+
+	// Number of failures to read the thread context attributes
+	IDUnwindThreadContextErrReadThreadCtxAttrs = 314
+
+	// Number of successful reads of thread context info
+	IDUnwindThreadContextReadSuccesses = 315
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 312
+	IDMax = 316
 )

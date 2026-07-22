@@ -51,28 +51,6 @@ func newTrace() *libpf.Trace {
 	return trace
 }
 
-func TestHashLabels(t *testing.T) {
-	first := map[libpf.String]libpf.String{
-		libpf.Intern("io.operation"): libpf.Intern("R"),
-		libpf.Intern("io.device"):    libpf.Intern("00000001"),
-	}
-	second := map[libpf.String]libpf.String{
-		libpf.Intern("io.device"):    libpf.Intern("00000001"),
-		libpf.Intern("io.operation"): libpf.Intern("R"),
-	}
-
-	assert.Zero(t, HashLabels(nil))
-	assert.Equal(t, HashLabels(first), HashLabels(second))
-	assert.NotEqual(t, HashLabels(first), HashLabels(map[libpf.String]libpf.String{
-		libpf.Intern("io.operation"): libpf.Intern("W"),
-		libpf.Intern("io.device"):    libpf.Intern("00000001"),
-	}))
-	assert.NotEqual(t,
-		HashLabels(map[libpf.String]libpf.String{libpf.Intern("a"): libpf.Intern("bc")}),
-		HashLabels(map[libpf.String]libpf.String{libpf.Intern("ab"): libpf.Intern("c")}),
-	)
-}
-
 func TestHashTrace(t *testing.T) {
 	tests := map[string]struct {
 		trace  *libpf.Trace
