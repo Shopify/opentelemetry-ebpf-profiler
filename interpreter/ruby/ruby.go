@@ -1461,6 +1461,41 @@ func determineRubyVersion(ef *pfelf.File) (uint32, error) {
 	return rubyVersion(uint32(major), uint32(minor), uint32(release)), nil
 }
 
+// rubyVMExecCoreSymbolMatches reports whether name is the Ruby bytecode dispatch
+// loop vm_exec_core, including LTO-mangled variants such as
+// "vm_exec_core.lto_priv.0". The hot/cold-split ".cold" partition is excluded so
+// that only the hot loop (where samples land) is registered.
+func rubyVMExecCoreSymbolMatches(name string) bool {
+	if name != "vm_exec_core" && !strings.HasPrefix(name, "vm_exec_core.") {
+		return false
+	}
+	return !strings.Contains(name, ".cold")
+}
+
+// findRubyVMExecCoreRange locates the hot Ruby bytecode dispatch loop
+// (vm_exec_core) in ef, tolerating LTO-mangled names, and returns the largest
+// matching symbol's range. It is used to register a second interpreter range on
+// LTO builds, where vm_exec_core is split out of rb_vm_exec instead of inlined
+// into it. ok is false when no vm_exec_core symbol is present (e.g. a build that
+// inlined it into rb_vm_exec, so rb_vm_exec's range already covers the loop).
+func findRubyVMExecCoreRange(ef *pfelf.File) (r util.Range, ok bool) {
+	var bestSize uint64
+	if visitErr := ef.VisitSymbols(func(s libpf.Symbol) bool {
+		if !rubyVMExecCoreSymbolMatches(string(s.Name)) {
+			return true
+		}
+		if s.Size > bestSize {
+			bestSize = s.Size
+			r = util.Range{Start: uint64(s.Address), End: uint64(s.Address) + s.Size}
+		}
+		return true
+	}); visitErr != nil {
+		log.Warnf("failed to visit symbols for vm_exec_core: %v", visitErr)
+		return util.Range{}, false
+	}
+	return r, bestSize > 0
+}
+
 func GetLoader(_ Config) interpreter.Loader {
 	return loader
 }
@@ -1575,6 +1610,24 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		return true
 	}); err != nil {
 		log.Warnf("failed to visit symbols: %v", err)
+	}
+
+	// The Ruby bytecode dispatch loop is normally inlined into rb_vm_exec, so its
+	// range (above) is enough for get_next_interpreter to detect "executing
+	// bytecode" and trigger the Ruby unwinder. But LTO can keep the hot dispatch
+	// loop as a separate vm_exec_core.lto_priv.N function far outside rb_vm_exec,
+	// leaving rb_vm_exec a cold stub that never appears on the sampled stack. When
+	// that happens no sampled PC matches the interpreter range, the Ruby unwinder
+	// never runs, and only native VM frames are produced. Register the hot dispatch
+	// loop as a second interpreter range so LTO builds unwind too; the eBPF
+	// OffsetRange supports exactly two disjoint ranges (InterpreterOffsetKeyValue),
+	// which is exactly this hot/cold-split case.
+	if len(interpRanges) < 2 {
+		if coreRange, found := findRubyVMExecCoreRange(ef); found {
+			interpRanges = append(interpRanges, coreRange)
+			log.Debugf("Ruby: registered vm_exec_core interp range %#x-%#x",
+				coreRange.Start, coreRange.End)
+		}
 	}
 
 	// NOTE for ruby 3.3.0+, if ruby is stripped, we have no way of locating
