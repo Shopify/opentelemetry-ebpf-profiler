@@ -54,6 +54,9 @@ type Target struct {
 	SymbolCandidates []string        `mapstructure:"symbol_candidates" yaml:"symbol_candidates"`
 	Offsets          []BuildIDOffset `mapstructure:"offsets" yaml:"offsets"`
 	MaxLinks         uint32          `mapstructure:"max_links" yaml:"max_links"`
+	// MaxResolvedPoints rejects a mapped object when its descriptor resolves
+	// to more distinct executable offsets. Zero permits every configured point.
+	MaxResolvedPoints uint32 `mapstructure:"max_resolved_points" yaml:"max_resolved_points"`
 }
 
 func normalizeBuildID(value string) (string, error) {
@@ -73,7 +76,8 @@ func normalizeBuildID(value string) (string, error) {
 	return value, nil
 }
 
-func (target Target) validated() (Target, error) {
+// Validate normalizes and validates a runtime target descriptor.
+func (target Target) Validate() (Target, error) {
 	if target.Name == "" {
 		return Target{}, errors.New("userspace target name is empty")
 	}
@@ -145,5 +149,12 @@ func (target Target) validated() (Target, error) {
 	if target.MaxLinks > MaximumMaxLinks {
 		return Target{}, fmt.Errorf("max_links must be in the range [1, %d]", MaximumMaxLinks)
 	}
+	if target.MaxResolvedPoints > maxSymbolPoints {
+		return Target{}, fmt.Errorf("max_resolved_points must be in the range [0, %d]", maxSymbolPoints)
+	}
 	return target, nil
+}
+
+func (target Target) validated() (Target, error) {
+	return target.Validate()
 }

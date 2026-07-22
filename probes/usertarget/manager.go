@@ -134,7 +134,7 @@ type Manager struct {
 
 // New validates a runtime target descriptor and creates an unattached manager.
 func New(target Target, programs Programs, options Options) (*Manager, error) {
-	validated, err := target.validated()
+	validated, err := target.Validate()
 	if err != nil {
 		return nil, err
 	}

@@ -8,6 +8,7 @@ A descriptor selects:
 - an exact process name and/or executable path;
 - an exact mapped-object basename, path, and/or GNU build ID;
 - bounded symbol candidates and/or build-ID-scoped executable file offsets;
+- optional maximum distinct resolved points per mapped object;
 - a maximum number of live kernel links.
 
 Example shape:
@@ -25,6 +26,7 @@ offsets:
   - build_id: 0123456789abcdef
     file_offset: 0x1234
 max_links: 1024
+max_resolved_points: 1 # zero permits all configured points
 ```
 
 `executable_name` is `/proc/<pid>/comm` and can be changed by the process.
@@ -38,7 +40,9 @@ identity is rechecked while attaching. Attachments use the verified open file
 through `/proc/self/fd/<fd>` and `link.UprobeOptions.PID`.
 
 Return links are attached before entry links. Symbol aliases resolving to the
-same executable file offset are deduplicated. Process exit, exec, PID reuse,
+same executable file offset are deduplicated. If `max_resolved_points` is
+nonzero, an object exceeding it is rejected before any point is attached.
+Process exit, exec, PID reuse,
 unmap, and manager shutdown remove links in entry-before-return order. Mapping
 changes are reconciled when ProcessManager observes a new process, unknown PC,
 exec, or exit; this is not a dynamic-loader hook. Exec/exit invalidation can

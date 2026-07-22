@@ -147,6 +147,10 @@ func resolvePoints(file *pfelf.File, target Target) ([]resolvedPoint, string, er
 		}
 		return nil, buildID, errors.New("no configured symbol or offset resolved")
 	}
+	if target.MaxResolvedPoints != 0 && uint32(len(byOffset)) > target.MaxResolvedPoints {
+		return nil, buildID, fmt.Errorf("resolved %d points, exceeding configured maximum %d",
+			len(byOffset), target.MaxResolvedPoints)
+	}
 
 	points := make([]resolvedPoint, 0, len(byOffset))
 	for _, point := range byOffset {

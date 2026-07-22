@@ -91,6 +91,50 @@ func TestReportTraceEventSeparatesCustomLabels(t *testing.T) {
 	}
 }
 
+func TestProfileLabelsDoesNotAliasStaticLabels(t *testing.T) {
+	key := libpf.Intern("lock.kind")
+	static := map[libpf.String]libpf.String{key: libpf.Intern("spinlock")}
+	merged := profileLabels(nil, static)
+	merged[key] = libpf.Intern("mutated")
+	require.Equal(t, "spinlock", static[key].String())
+}
+
+func TestReportTraceEventMergesStaticLabels(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	profileType := &samples.TypeMetadata{
+		SampleType: "lock_wait_latency",
+		SampleUnit: "nanoseconds",
+		StaticLabels: map[libpf.String]libpf.String{
+			libpf.Intern("lock.kind"): libpf.Intern("spinlock"),
+			libpf.Intern("lock.mode"): libpf.Intern("exclusive"),
+		},
+	}
+	meta := &samples.TraceEventMeta{
+		Timestamp:   libpf.UnixTime64(time.Now().UnixNano()),
+		ProfileType: profileType,
+	}
+	dynamic := map[libpf.String]libpf.String{
+		libpf.Intern("lock.kind"):  libpf.Intern("spoofed"),
+		libpf.Intern("request.id"): libpf.Intern("bounded"),
+	}
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: dynamic}, meta))
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: dynamic}, meta))
+
+	eventsTree := reporter.traceEvents.RLock()
+	defer reporter.traceEvents.RUnlock(&eventsTree)
+	require.Len(t, *eventsTree, 1)
+	for _, profiles := range *eventsTree {
+		events := profiles.Events[profileType]
+		require.Len(t, events, 1)
+		for _, event := range events {
+			require.Len(t, event.Timestamps, 2)
+			require.Equal(t, "spinlock", event.Labels[libpf.Intern("lock.kind")].String())
+			require.Equal(t, "exclusive", event.Labels[libpf.Intern("lock.mode")].String())
+			require.Equal(t, "bounded", event.Labels[libpf.Intern("request.id")].String())
+		}
+	}
+}
+
 // TestBaseReporterGenerate tests the Generate method and validates the output
 func TestBaseReporterGenerate(t *testing.T) {
 	reporter := createTestBaseReporter(t, nil)

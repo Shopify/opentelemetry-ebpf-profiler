@@ -46,6 +46,20 @@ func (b *baseReporter) Stop() {
 	b.runLoop.Stop()
 }
 
+func profileLabels(traceLabels, staticLabels map[libpf.String]libpf.String) map[libpf.String]libpf.String {
+	if len(staticLabels) == 0 {
+		return traceLabels
+	}
+	labels := make(map[libpf.String]libpf.String, len(traceLabels)+len(staticLabels))
+	for key, value := range traceLabels {
+		labels[key] = value
+	}
+	for key, value := range staticLabels {
+		labels[key] = value
+	}
+	return labels
+}
+
 func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {
 	if meta.ProfileType == nil {
 		return fmt.Errorf("skip reporting trace: %w", errUnknownProfileType)
@@ -63,6 +77,7 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 		ExecutablePath: meta.ExecutablePath,
 	}
 	traceHash := traceutil.HashTrace(trace)
+	labels := profileLabels(trace.CustomLabels, meta.ProfileType.StaticLabels)
 
 	eventsTree := b.traceEvents.WLock()
 	defer b.traceEvents.WUnlock(&eventsTree)
@@ -81,7 +96,7 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 
 	sampleKey := samples.SampleKey{
 		Hash:       traceHash,
-		LabelsHash: traceutil.HashLabels(trace.CustomLabels),
+		LabelsHash: traceutil.HashLabels(labels),
 		Comm:       meta.Comm,
 		TID:        int64(meta.TID),
 		CPU:        int64(meta.CPU),
@@ -99,7 +114,7 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 		Frames:     trace.Frames,
 		Timestamps: []uint64{uint64(meta.Timestamp)},
 		Values:     []int64{meta.Value},
-		Labels:     trace.CustomLabels,
+		Labels:     labels,
 	}
 	return nil
 }

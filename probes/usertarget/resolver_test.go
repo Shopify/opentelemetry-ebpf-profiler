@@ -45,6 +45,7 @@ func TestResolvePointsDeduplicatesSymbolAndVerifiedOffset(t *testing.T) {
 	target := validTarget()
 	target.SymbolCandidates = []string{symbolName}
 	target.Offsets = []BuildIDOffset{{BuildID: buildID, FileOffset: fileOffset}}
+	target.MaxResolvedPoints = 1
 	target, err = target.validated()
 	require.NoError(t, err)
 
@@ -52,6 +53,35 @@ func TestResolvePointsDeduplicatesSymbolAndVerifiedOffset(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, target.Offsets[0].BuildID, gotBuildID)
 	require.Equal(t, []resolvedPoint{{fileOffset: fileOffset, source: symbolName}}, points)
+}
+
+func TestResolvePointsEnforcesMaximumDistinctPoints(t *testing.T) {
+	fixture, symbolName := resolverFixture(t)
+	file, err := pfelf.Open(fixture)
+	require.NoError(t, err)
+	defer file.Close()
+
+	symbols, err := findSymbols(file, []string{symbolName})
+	require.NoError(t, err)
+	symbol, found := symbols[symbolName]
+	require.True(t, found)
+	fileOffset, ok := executableFileOffset(file, uint64(symbol.Address))
+	require.True(t, ok)
+	require.True(t, executableOffset(file, fileOffset+1))
+	buildID, err := file.GetBuildID()
+	require.NoError(t, err)
+
+	target := validTarget()
+	target.SymbolCandidates = nil
+	target.Offsets = []BuildIDOffset{
+		{BuildID: buildID, FileOffset: fileOffset},
+		{BuildID: buildID, FileOffset: fileOffset + 1},
+	}
+	target.MaxResolvedPoints = 1
+	target, err = target.Validate()
+	require.NoError(t, err)
+	_, _, err = resolvePoints(file, target)
+	require.ErrorContains(t, err, "resolved 2 points, exceeding configured maximum 1")
 }
 
 func TestResolvePointsRejectsCrossArchitecture(t *testing.T) {

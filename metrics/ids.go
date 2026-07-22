@@ -710,6 +710,33 @@ const (
 	// Number of PID-scoped userspace probe links currently active
 	IDUserspaceProbeActiveLinks = 327
 
+	// Number of lock-wait entry probes observed
+	IDLockWaitEntries = 328
+
+	// Number of lock-wait return probes observed
+	IDLockWaitReturns = 329
+
+	// Number of lock-wait returns without acquisition state
+	IDLockWaitUnmatchedReturns = 330
+
+	// Number of lock-wait samples filtered by duration, sampling, or return policy
+	IDLockWaitFiltered = 331
+
+	// Number of lock-wait latency samples submitted for unwinding
+	IDLockWaitEmitted = 332
+
+	// Number of failures inserting lock-wait acquisition state
+	IDLockWaitStateUpdateFailures = 333
+
+	// Number of nested lock-wait entries that replaced state for one thread
+	IDLockWaitStateOverwrites = 334
+
+	// Number of lock-wait acquisition states currently active
+	IDLockWaitActiveStates = 335
+
+	// Number of failures reading lock-wait eBPF metrics
+	IDLockWaitMetricReadFailures = 336
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 328
+	IDMax = 337
 )

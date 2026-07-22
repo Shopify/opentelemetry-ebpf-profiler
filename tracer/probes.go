@@ -29,12 +29,16 @@ var dynamicProbeResources = struct {
 		"block_io_stacks_inflight",
 		"block_io_stacks_scratch",
 		"function_latency_starts",
+		"lock_wait_metrics",
+		"lock_wait_starts",
 	},
 	programs: []string{
 		"block_io_stacks_issue",
 		"block_io_stacks_start",
 		"function_latency_entry",
 		"function_latency_exit",
+		"lock_wait_entry",
+		"lock_wait_exit",
 	},
 	variables: []string{
 		"block_io_stacks_min_ns",
@@ -43,6 +47,15 @@ var dynamicProbeResources = struct {
 		"function_latency_min_ns",
 		"function_latency_origin",
 		"function_latency_sample_threshold",
+		"lock_wait_min_ns",
+		"lock_wait_origin",
+		"lock_wait_return_mode",
+		"lock_wait_sample_threshold",
+		"lock_wait_success_0",
+		"lock_wait_success_1",
+		"lock_wait_success_2",
+		"lock_wait_success_3",
+		"lock_wait_success_count",
 	},
 }
 

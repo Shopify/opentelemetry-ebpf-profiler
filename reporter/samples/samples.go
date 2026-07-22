@@ -90,6 +90,10 @@ type SampleKey struct {
 // TypeMetadata describes how profiling events of a particular kind
 // should be interpreted and exported as an OTel profile.
 type TypeMetadata struct {
+	// StaticLabels are low-cardinality labels supplied by the profile-type
+	// descriptor. They override same-named labels collected from the trace.
+	StaticLabels map[libpf.String]libpf.String
+
 	// PeriodType describes what is measured per period (e.g. "cpu").
 	// Empty means this profile type has no period (e.g. event-driven kinds).
 	PeriodType string
