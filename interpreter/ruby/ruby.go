@@ -128,6 +128,11 @@ type rubyData struct {
 	// eBPF program to build ruby backtraces.
 	currentCtxPtr libpf.Address
 
+	// currentVMPtr is the address of the ruby_current_vm_ptr global. It is used
+	// at Attach time to distinguish Ruby 4.0 VM layouts whose version strings
+	// are identical but whose gc.objspace offsets differ.
+	currentVMPtr libpf.Address
+
 	// Address to the ruby_current_ec variable in TLS, as an offset from tpbase
 	currentEcTpBaseTlsOffset libpf.Address
 
@@ -332,6 +337,14 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		log.Debugf("Ruby TLS module ID: %d", modID)
 	}
 
+	// Ruby 4.0.0-4.0.5 has two independently ambiguous offsets. Downstream
+	// builds can backport the 4.0.6 rb_thread_sched and rb_vm_t changes while
+	// still reporting an older version. Probe the live process rather than
+	// trusting the version string. These probes are independent because the EC
+	// may come from TLS while gc.objspace is still read through rb_vm_t.
+	runningEc := r.chooseRubyRunningEcOffset(rm, bias)
+	vmObjspace := r.chooseRubyVMObjspaceOffset(rm, bias)
+
 	cdata := support.RubyProcInfo{
 		Version: r.version,
 
@@ -352,7 +365,7 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 
 		Thread_vm:    r.vmStructs.thread_struct.vm,
 		Has_objspace: r.hasObjspace,
-		Vm_objspace:  r.vmStructs.vm_struct.gc_objspace,
+		Vm_objspace:  vmObjspace,
 
 		Objspace_flags:         r.vmStructs.objspace.flags,
 		Objspace_size_of_flags: r.vmStructs.objspace.size_of_flags,
@@ -362,7 +375,7 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 
 		Size_of_value: r.vmStructs.size_of_value,
 
-		Running_ec: r.vmStructs.rb_ractor_struct.running_ec,
+		Running_ec: runningEc,
 	}
 
 	if err := ebpf.UpdateProcData(libpf.Ruby, pid, unsafe.Pointer(&cdata)); err != nil {
@@ -392,6 +405,118 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 }
 
 func (r *rubyData) Unload(_ interpreter.EbpfHandler) {
+}
+
+// maxRubyVMStackSlots is a generous upper bound on the number of VALUE slots in
+// a Ruby VM stack, used to reject a bogus vm_stack_size when validating a
+// candidate execution context. 16Mi slots (~128 MiB) is far above any real
+// Ruby stack while still ruling out garbage reads.
+const maxRubyVMStackSlots = 1 << 24
+
+const ruby40PointerLayoutShift = 8
+
+func (r *rubyData) hasAmbiguousRuby40Layout() bool {
+	return r.version >= rubyVersion(4, 0, 0) && r.version < rubyVersion(4, 0, 6)
+}
+
+// chooseRubyRunningEcOffset chooses the rb_ractor_struct.running_ec offset sent
+// to eBPF. Ruby 4.0.0-4.0.5 version strings cannot identify downstream builds
+// that backport Ruby 4.0.6's rb_thread_sched growth, so validate both layouts
+// against the live main ractor. This offset is not used when eBPF finds the EC
+// through TLS, but selecting it keeps the non-TLS fallback correct too.
+func (r *rubyData) chooseRubyRunningEcOffset(rm remotememory.RemoteMemory,
+	bias libpf.Address) uint16 {
+	base := r.vmStructs.rb_ractor_struct.running_ec
+	if r.currentCtxPtr == 0 || !r.hasAmbiguousRuby40Layout() {
+		return base
+	}
+
+	shifted := base + ruby40PointerLayoutShift
+	switch {
+	case r.ractorEcLooksValid(rm, bias, libpf.Address(shifted)):
+		log.Debugf("%s: selected running_ec=%#x (backported Ruby 4.0.6 layout)",
+			r.String(), shifted)
+		return shifted
+	case r.ractorEcLooksValid(rm, bias, libpf.Address(base)):
+		log.Debugf("%s: selected running_ec=%#x (stock layout)", r.String(), base)
+	default:
+		log.Debugf("%s: running_ec probe inconclusive, using base offset %#x",
+			r.String(), base)
+	}
+	return base
+}
+
+// chooseRubyVMObjspaceOffset chooses rb_vm_struct.gc.objspace independently of
+// EC discovery. Shopify's Ruby 4.0.5-pshopify3 uses TLS for the current EC, but
+// also backports Ruby 4.0.6's master_box field, which moves gc.objspace by one
+// pointer. Reading ruby_current_vm_ptr lets Attach validate the stock offset
+// first and use the shifted offset only when the stock candidate is unreadable.
+func (r *rubyData) chooseRubyVMObjspaceOffset(rm remotememory.RemoteMemory,
+	bias libpf.Address) uint16 {
+	base := r.vmStructs.vm_struct.gc_objspace
+	if r.currentVMPtr == 0 || !r.hasAmbiguousRuby40Layout() {
+		return base
+	}
+
+	vm := rm.Ptr(r.currentVMPtr + bias)
+	if vm == 0 {
+		log.Debugf("%s: gc.objspace probe could not read ruby_current_vm_ptr; using %#x",
+			r.String(), base)
+		return base
+	}
+	if r.objspaceLooksValid(rm, vm, base) {
+		log.Debugf("%s: selected gc.objspace=%#x (stock layout)", r.String(), base)
+		return base
+	}
+
+	shifted := base + ruby40PointerLayoutShift
+	if r.objspaceLooksValid(rm, vm, shifted) {
+		log.Debugf("%s: selected gc.objspace=%#x (backported Ruby 4.0.6 layout)",
+			r.String(), shifted)
+		return shifted
+	}
+
+	log.Debugf("%s: gc.objspace probe inconclusive, using base offset %#x",
+		r.String(), base)
+	return base
+}
+
+func (r *rubyData) objspaceLooksValid(rm remotememory.RemoteMemory, vm libpf.Address,
+	vmObjspace uint16) bool {
+	objspace := rm.Ptr(vm + libpf.Address(vmObjspace))
+	if objspace == 0 {
+		return false
+	}
+	flags := make([]byte, r.vmStructs.objspace.size_of_flags)
+	return len(flags) > 0 && rm.Read(objspace+
+		libpf.Address(r.vmStructs.objspace.flags), flags) == nil
+}
+
+// ractorEcLooksValid reads the current execution context through the main-ractor
+// path (single_main_ractor + running_ec) with the candidate running_ec offset,
+// mirroring the eBPF unwinder, and sanity-checks it: the current control-frame
+// pointer must lie within the VM stack region. A wrong offset yields a bogus EC
+// whose cfp fails this check, which is what lets Attach pick the struct layout
+// the Ruby version string cannot disambiguate.
+func (r *rubyData) ractorEcLooksValid(rm remotememory.RemoteMemory, bias, runningEc libpf.Address,
+) bool {
+	vms := &r.vmStructs
+	mainRactor := rm.Ptr(r.currentCtxPtr + bias)
+	if mainRactor == 0 {
+		return false
+	}
+	ec := rm.Ptr(mainRactor + runningEc)
+	if ec == 0 {
+		return false
+	}
+	vmStack := rm.Ptr(ec + libpf.Address(vms.execution_context_struct.vm_stack))
+	stackSlots := rm.Uint64(ec + libpf.Address(vms.execution_context_struct.vm_stack_size))
+	cfp := rm.Ptr(ec + libpf.Address(vms.execution_context_struct.cfp))
+	if vmStack == 0 || cfp == 0 || stackSlots == 0 || stackSlots > maxRubyVMStackSlots {
+		return false
+	}
+	stackEnd := vmStack + libpf.Address(stackSlots)*libpf.Address(vms.size_of_value)
+	return cfp >= vmStack && cfp < stackEnd
 }
 
 // rubyIseq stores information extracted from a iseq_constant_body struct.
@@ -1578,6 +1703,14 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		log.Debugf("Direct lookup of %v failed: %v, will try fallback", currentCtxSymbol, err)
 	}
 
+	// This global is optional and only used by the Attach-time Ruby 4.0 layout
+	// probe. The unwinder still works with version-derived offsets when absent.
+	currentVMPtr, currentVMErr := ef.LookupSymbolAddress("ruby_current_vm_ptr")
+	if currentVMErr != nil {
+		currentVMPtr = 0
+		log.Debugf("Direct lookup of ruby_current_vm_ptr failed: %v", currentVMErr)
+	}
+
 	interpRanges, err = info.GetSymbolAsRanges(interpSymbolName)
 	if err != nil {
 		log.Debugf("Direct lookup of %v failed: %v, will try fallback", interpSymbolName, err)
@@ -1669,8 +1802,9 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		log.Warnf("failed to find DTPMOD64 relocation: %v", err)
 	}
 
-	log.Debugf("Discovered EC tls tpbase offset %x, static tls offset %d, dtpmod offset %x, fallback ctx %x, interp ranges: %v, global symbols: %x",
-		currentEcTpBaseTlsOffset, staticTLSOffset, tlsModuleIdOffset, currentCtxPtr, interpRanges, globalSymbols)
+	log.Debugf("Discovered EC tls tpbase offset %x, static tls offset %d, dtpmod offset %x, fallback ctx %x, current VM ptr %x, interp ranges: %v, global symbols: %x",
+		currentEcTpBaseTlsOffset, staticTLSOffset, tlsModuleIdOffset, currentCtxPtr,
+		currentVMPtr, interpRanges, globalSymbols)
 
 	rid := &rubyData{
 		version:                  version,
@@ -1679,6 +1813,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		currentEcTlsOffset:       libpf.Address(currentEcSymbolAddress),
 		tlsModuleIdOffset:        tlsModuleIdOffset,
 		currentCtxPtr:            libpf.Address(currentCtxPtr),
+		currentVMPtr:             libpf.Address(currentVMPtr),
 		hasGlobalSymbols:         globalSymbols != 0,
 		globalSymbolsAddr:        libpf.Address(globalSymbols),
 	}
@@ -1774,6 +1909,13 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 			vms.vm_struct.gc_objspace = 1248
 		} else {
 			vms.vm_struct.gc_objspace = 1272
+		}
+		if version >= rubyVersion(4, 0, 6) {
+			// Ruby 4.0.6 inserted rb_vm_t.master_box before root_box, shifting
+			// gc.objspace by one pointer (upstream open-telemetry#1634,
+			// ruby/ruby@99aac00). For 4.0.0-4.0.5 the shift is selected from
+			// live process memory by chooseRubyVMObjspaceOffset.
+			vms.vm_struct.gc_objspace += ruby40PointerLayoutShift
 		}
 		vms.objspace.flags = 28
 	default:
@@ -1930,6 +2072,14 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 				vms.rb_ractor_struct.running_ec = 0x138
 			} else {
 				vms.rb_ractor_struct.running_ec = 0x148
+			}
+			if version >= rubyVersion(4, 0, 6) {
+				// Ruby 4.0.6 added runnable_hot_th + runnable_hot_th_waiting to
+				// struct rb_thread_sched (embedded in rb_ractor_struct before
+				// running_ec), shifting running_ec by one pointer (upstream
+				// open-telemetry#1634, ruby/ruby@21a2595). For 4.0.0-4.0.5 the shift
+				// is selected from live process memory by chooseRubyRunningEcOffset.
+				vms.rb_ractor_struct.running_ec += ruby40PointerLayoutShift
 			}
 		} else if version >= rubyVersion(3, 3, 0) {
 			if runtime.GOARCH == "amd64" {
