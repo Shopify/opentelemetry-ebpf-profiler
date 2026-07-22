@@ -707,6 +707,18 @@ const (
 	// Number of asynchronous initiating traces currently awaiting completion
 	IDAsyncCorrelationPending = 306
 
+	// Number of failures to get TSD base for thread context
+	IDUnwindThreadContextErrReadTsdBase = 307
+
+	// Number of failures to read the thread context buffer
+	IDUnwindThreadContextErrReadThreadCtxBuf = 308
+
+	// Number of failures to read the thread context attributes
+	IDUnwindThreadContextErrReadThreadCtxAttrs = 309
+
+	// Number of successful reads of thread context info
+	IDUnwindThreadContextReadSuccesses = 310
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 307
+	IDMax = 311
 )
