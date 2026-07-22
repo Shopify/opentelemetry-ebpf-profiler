@@ -61,7 +61,7 @@ const (
 	svcNameKey = "OTEL_SERVICE_NAME"
 
 	threadCtxSchemaVersionKey       = "threadlocal.schema_version"
-	supportedThreadCtxSchemaVersion = "tlsdesc_v1_dev"
+	supportedThreadCtxSchemaVersion = "tls_v1"
 	threadCtxKeyMapKey              = "threadlocal.attribute_key_map"
 )
 
