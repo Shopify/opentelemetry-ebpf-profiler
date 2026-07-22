@@ -155,6 +155,7 @@ int block_io_stacks_issue(BlockIOCtx *ctx)
     device->val[i] = hex_digit((ctx->dev >> shift) & 0xf);
   }
   device->val[sizeof(ctx->dev) * 2] = 0;
+  trace->custom_labels_type         = CUSTOM_LABELS_TYPE_GO;
   trace->custom_labels.len          = 2;
 
   send_trace(ctx, trace);
