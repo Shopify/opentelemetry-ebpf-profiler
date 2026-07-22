@@ -1577,6 +1577,32 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		log.Warnf("failed to visit symbols: %v", err)
 	}
 
+	// LTO can split the bytecode dispatch loop out of rb_vm_exec into a privatized
+	// vm_exec_core.lto_priv.N symbol and leave rb_vm_exec an orphaned cold stub that
+	// the sampled stack never traverses -- so no PC matches the rb_vm_exec interp
+	// range and the Ruby unwinder never triggers. Register the hot vm_exec_core loop
+	// as a second interpreter range in that case only.
+	//
+	// Restrict this to the LTO-privatized symbol: on normal builds vm_exec_core is a
+	// plain symbol reached *through* rb_vm_exec (a small wrapper that IS on the
+	// sampled stack), so rb_vm_exec already anchors the interpreter range. Adding a
+	// second range there would make the leaf vm_exec_core PC trigger a redundant Ruby
+	// unwind, eliding the native leaf frame and corrupting the interleaving.
+	if len(interpRanges) < 2 {
+		var best util.Range
+		_ = ef.VisitSymbols(func(s libpf.Symbol) bool {
+			n := string(s.Name)
+			if strings.HasPrefix(n, "vm_exec_core.lto_priv") &&
+				!strings.Contains(n, ".cold") && s.Size > best.End-best.Start {
+				best = util.Range{Start: uint64(s.Address), End: uint64(s.Address) + s.Size}
+			}
+			return true
+		})
+		if best.End > best.Start {
+			interpRanges = append(interpRanges, best)
+		}
+	}
+
 	// NOTE for ruby 3.3.0+, if ruby is stripped, we have no way of locating
 	// ruby_current_ec TLS symbol.
 	// We could potentially add a fallback for this in the future, but for now
