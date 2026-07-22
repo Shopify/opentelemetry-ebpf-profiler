@@ -1736,14 +1736,16 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		vms.objspace.flags = 16
 	case version >= rubyVersion(4, 0, 0) && version < rubyVersion(4, 1, 0):
 		rid.hasObjspace = true
-		// Shopify pshopify Ruby (4.0.5-pshopify3) backports 4.0.6 rb_vm_t.master_box
-		// (ruby/ruby@99aac00), shifting gc.objspace +8. DWARF of the deployed binary
-		// confirms 1256 (amd64). The wrong offset makes gc_check read a bogus objspace
-		// and skip the Ruby stack walk on every sample.
 		if runtime.GOARCH == "amd64" {
-			vms.vm_struct.gc_objspace = 1256
+			vms.vm_struct.gc_objspace = 1248
 		} else {
-			vms.vm_struct.gc_objspace = 1280
+			vms.vm_struct.gc_objspace = 1272
+		}
+		if version >= rubyVersion(4, 0, 6) {
+			// Ruby 4.0.6 inserted rb_vm_t.master_box before root_box,
+			// shifting gc.objspace by one pointer.
+			// https://github.com/ruby/ruby/commit/99aac00fa13c03f71d3a4d89686e447f2950df68
+			vms.vm_struct.gc_objspace += 8
 		}
 		vms.objspace.flags = 28
 	default:
@@ -1900,6 +1902,11 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 				vms.rb_ractor_struct.running_ec = 0x138
 			} else {
 				vms.rb_ractor_struct.running_ec = 0x148
+			}
+			if version >= rubyVersion(4, 0, 6) {
+				// Ruby 4.0.6 grew rb_thread_sched before running_ec.
+				// https://github.com/ruby/ruby/commit/21a2595676d2d3df0eccd3af74065e2ba2a876b5
+				vms.rb_ractor_struct.running_ec += 8
 			}
 		} else if version >= rubyVersion(3, 3, 0) {
 			if runtime.GOARCH == "amd64" {
