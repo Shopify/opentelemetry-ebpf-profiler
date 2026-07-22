@@ -1461,6 +1461,21 @@ func determineRubyVersion(ef *pfelf.File) (uint32, error) {
 	return rubyVersion(uint32(major), uint32(minor), uint32(release)), nil
 }
 
+const ruby405PShopifyRevision = "21a2595676"
+
+// rubyUses406Layout reports whether a Ruby 4.0 binary contains the two layout
+// changes released in 4.0.6. Shopify's transitional 4.0.5-pshopify3 build is
+// cut from ruby/ruby@21a2595676 and therefore contains both changes despite its
+// older version string. ruby_description is an exported, on-disk symbol, unlike
+// the pshopify branch suffix which is present only in DWARF.
+func rubyUses406Layout(version uint32, description string) bool {
+	if version >= rubyVersion(4, 0, 6) {
+		return true
+	}
+	return version == rubyVersion(4, 0, 5) &&
+		strings.Contains(description, " revision "+ruby405PShopifyRevision+")")
+}
+
 func GetLoader(_ Config) interpreter.Loader {
 	return loader
 }
@@ -1479,6 +1494,17 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	version, err := determineRubyVersion(ef)
 	if err != nil {
 		return nil, err
+	}
+
+	var description string
+	if version == rubyVersion(4, 0, 5) {
+		if _, memory, descriptionErr := ef.SymbolData("ruby_description", 128); descriptionErr == nil {
+			description = strings.TrimRight(pfunsafe.ToString(memory), "\x00")
+		}
+	}
+	usesRuby406Layout := rubyUses406Layout(version, description)
+	if version < rubyVersion(4, 0, 6) && usesRuby406Layout {
+		log.Debugf("Ruby %s uses backported 4.0.6 VM layout", description)
 	}
 
 	// Reason for lowest supported version:
@@ -1722,6 +1748,13 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		} else {
 			vms.vm_struct.gc_objspace = 1272
 		}
+		if usesRuby406Layout {
+			// Ruby 4.0.6 inserted rb_vm_t.master_box before root_box,
+			// shifting the gc.objspace field by one pointer.
+			// https://github.com/ruby/ruby/blob/v4.0.6/vm_core.h
+			// https://github.com/ruby/ruby/commit/99aac00fa13c03f71d3a4d89686e447f2950df68
+			vms.vm_struct.gc_objspace += 8
+		}
 		vms.objspace.flags = 28
 	default:
 		rid.hasObjspace = true
@@ -1877,6 +1910,14 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 				vms.rb_ractor_struct.running_ec = 0x138
 			} else {
 				vms.rb_ractor_struct.running_ec = 0x148
+			}
+			if usesRuby406Layout {
+				// Ruby 4.0.6 added runnable_hot_th and runnable_hot_th_waiting
+				// to struct rb_thread_sched, which is embedded in
+				// rb_ractor_struct.threads before running_ec.
+				// https://github.com/ruby/ruby/blob/v4.0.6/thread_pthread.h
+				// https://github.com/ruby/ruby/commit/21a2595676d2d3df0eccd3af74065e2ba2a876b5
+				vms.rb_ractor_struct.running_ec += 8
 			}
 		} else if version >= rubyVersion(3, 3, 0) {
 			if runtime.GOARCH == "amd64" {
