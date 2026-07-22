@@ -454,7 +454,12 @@ func (r *rubyData) chooseRubyRunningEcOffset(rm remotememory.RemoteMemory,
 func (r *rubyData) chooseRubyVMObjspaceOffset(rm remotememory.RemoteMemory,
 	bias libpf.Address) uint16 {
 	base := r.vmStructs.vm_struct.gc_objspace
-	if r.currentVMPtr == 0 || !r.hasAmbiguousRuby40Layout() {
+	if !r.hasAmbiguousRuby40Layout() {
+		return base
+	}
+	if r.currentVMPtr == 0 {
+		log.Debugf("%s: ruby_current_vm_ptr unavailable; using gc.objspace=%#x",
+			r.String(), base)
 		return base
 	}
 
@@ -1704,11 +1709,15 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	}
 
 	// This global is optional and only used by the Attach-time Ruby 4.0 layout
-	// probe. The unwinder still works with version-derived offsets when absent.
-	currentVMPtr, currentVMErr := ef.LookupSymbolAddress("ruby_current_vm_ptr")
+	// probe. It is local in some statically linked builds (including Core), so
+	// VisitSymbols must provide the same fallback used for the other local Ruby
+	// symbols when direct lookup fails.
+	currentVMSymbolName := libpf.SymbolName("ruby_current_vm_ptr")
+	currentVMPtr, currentVMErr := ef.LookupSymbolAddress(currentVMSymbolName)
 	if currentVMErr != nil {
 		currentVMPtr = 0
-		log.Debugf("Direct lookup of ruby_current_vm_ptr failed: %v", currentVMErr)
+		log.Debugf("Direct lookup of %v failed: %v, will try fallback",
+			currentVMSymbolName, currentVMErr)
 	}
 
 	interpRanges, err = info.GetSymbolAsRanges(interpSymbolName)
@@ -1721,8 +1730,10 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		log.Debugf("Direct lookup of %v failed: %v, will try fallback", globalSymbolsName, err)
 	}
 
+	needCurrentVMPtr := version >= rubyVersion(4, 0, 0) && version < rubyVersion(4, 0, 6)
 	if err = ef.VisitSymbols(func(s libpf.Symbol) bool {
-		if len(interpRanges) > 0 && currentEcSymbolAddress != 0 && currentCtxPtr != 0 && globalSymbols != libpf.SymbolValueInvalid {
+		if len(interpRanges) > 0 && currentEcSymbolAddress != 0 && currentCtxPtr != 0 &&
+			globalSymbols != libpf.SymbolValueInvalid && (!needCurrentVMPtr || currentVMPtr != 0) {
 			return false
 		}
 		if s.Name == currentEcSymbolName {
@@ -1730,6 +1741,9 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		}
 		if s.Name == currentCtxSymbol {
 			currentCtxPtr = s.Address
+		}
+		if s.Name == currentVMSymbolName {
+			currentVMPtr = s.Address
 		}
 		if s.Name == globalSymbolsName {
 			globalSymbols = s.Address
