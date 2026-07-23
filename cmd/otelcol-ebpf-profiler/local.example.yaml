@@ -16,10 +16,35 @@ receivers:
   profiling:
     # Experimental I/O and network latency profiles. Each sample carries the
     # operation's elapsed nanoseconds and its attributed stack.
+    # async_correlation_capacity: 16384
+    # async_correlation_ttl: 5m
     # custom_probes:
-    #   # Linux 5.19+; block_io_start -> block_rq_issue, matching biostacks.bt.
-    #   # This asynchronous profile attributes latency to the initiating kernel stack.
+    #   # Submission-to-CQE latency. Request correlation preserves the submitter's
+    #   # stack and process attribution across workers, CPUs, and multishot CQEs.
+    #   io_uring_latency:
+    #     min_duration: 100us
+    #     sample_rate: 0.1
+    #   # Request-pointer correlation preserves the submit_bio_noacct stack
+    #   # through queueing, device service, and final completion.
     #   block_io_queue_latency:
+    #     min_duration: 100us
+    #     sample_rate: 0.1
+    #   block_io_service_latency:
+    #     min_duration: 100us
+    #     sample_rate: 0.1
+    #   block_io_latency:
+    #     min_duration: 1ms
+    #     sample_rate: 0.1
+    #   # TCP handshake latency follows struct sock through ESTABLISHED or CLOSE.
+    #   tcp_connect_latency:
+    #     min_duration: 100us
+    #     sample_rate: 0.1
+    #   # Application send until the cumulative TCP ACK covers those bytes.
+    #   tcp_send_ack_latency:
+    #     min_duration: 100us
+    #     sample_rate: 0.1
+    #   # TCP data queueing until an application read consumes those bytes.
+    #   tcp_receive_consumption_latency:
     #     min_duration: 100us
     #     sample_rate: 0.1
     #   # Synchronous function profiles include both kernel and user stacks.
