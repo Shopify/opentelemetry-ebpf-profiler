@@ -60,6 +60,8 @@ func TestOffCPUTimeProbe(t *testing.T) {
 	minDuration := 20 * time.Millisecond
 	probe, err := New(map[string]any{"min_duration": minDuration.String()})
 	require.NoError(t, err)
+	labeler, ok := probe.(tracer.TraceLabeler)
+	require.True(t, ok, "off-cpu probe must implement tracer.TraceLabeler")
 	require.NoError(t, trc.Enable(probe))
 
 	// Block a thread of this process well past min_duration in a loop. Each
@@ -97,6 +99,19 @@ func TestOffCPUTimeProbe(t *testing.T) {
 			require.NotEmpty(t, trace.KernelFrames)
 			require.NotEmpty(t, trace.FrameData)
 			require.Positive(t, trace.NumFrames)
+
+			// The sleeper blocks in nanosleep, so its switch-out state must
+			// have been captured as TASK_INTERRUPTIBLE. Wait for one such
+			// sample; other threads of this process may block differently.
+			if trace.AsyncUserData != 0x0001 {
+				continue
+			}
+			// The raw monitor channel taps traces before Tracer.HandleTrace
+			// runs the labeler, so apply it directly to prove the state
+			// reaches the sample label.
+			labeler.LabelTrace(trace)
+			require.Equal(t, libpf.Intern("interruptible"),
+				trace.CustomLabels[libpf.Intern("thread.state")])
 			return
 		case <-deadline.C:
 			t.Fatal("timed out waiting for an off-cpu time trace")

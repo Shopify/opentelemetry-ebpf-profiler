@@ -15,12 +15,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/probes/internal/probeutil"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
@@ -39,6 +42,22 @@ const (
 	originVariableName   = "off_cpu_time_origin"
 	minNSVariableName    = "off_cpu_time_min_ns"
 	sampleVariableName   = "off_cpu_time_sample_threshold"
+	stateOffsetVariable  = "off_cpu_time_state_offset"
+	stateSizeVariable    = "off_cpu_time_state_size"
+
+	// stateOffsetUnavailable disables thread-state capture in eBPF when the
+	// prev_state field cannot be resolved from the tracepoint format file.
+	stateOffsetUnavailable = uint32(0xffffffff)
+
+	// stateUnavailable is the sentinel the eBPF side reports when no thread
+	// state was captured for a sample. Must match OFF_CPU_TIME_STATE_UNAVAILABLE.
+	stateUnavailable = ^uint64(0)
+
+	// threadStateLabelKey is the per-sample label carrying the switch-out
+	// thread state. It separates voluntary blocking (interruptible,
+	// uninterruptible, ...) from runnable threads descheduled by CPU
+	// pressure (running, preempted) so profiles can be filtered on either.
+	threadStateLabelKey = "thread.state"
 
 	// switchOutTracepointGroup/Name identify the tracepoint that observes
 	// threads leaving the CPU. It fires in the outgoing thread's context.
@@ -59,6 +78,10 @@ const (
 
 // kallsymsPath is a variable to allow tests to substitute a fixture.
 var kallsymsPath = "/proc/kallsyms"
+
+// tracefsRoots lists the mount points searched for tracepoint format files.
+// A variable to allow tests to substitute fixtures.
+var tracefsRoots = []string{"/sys/kernel/tracing", "/sys/kernel/debug/tracing"}
 
 type offCPUTimeProbe struct {
 	minDuration     time.Duration
@@ -111,17 +134,32 @@ func (p *offCPUTimeProbe) Load(origin uint16, ctx *tracer.ProbeContext) (link.Li
 	collection, err := ctx.CollectionSpecWith(
 		[]string{startsMapName, metricsMapName},
 		[]string{switchOutProgramName, switchInProgramName},
-		[]string{originVariableName, minNSVariableName, sampleVariableName},
+		[]string{
+			originVariableName, minNSVariableName, sampleVariableName,
+			stateOffsetVariable, stateSizeVariable,
+		},
 	)
 	if err != nil {
 		return nil, err
 	}
 	collection.Maps[startsMapName].MaxEntries = p.maxEntries
 
+	// The tracepoint encoding of prev_state is not a stable ABI, so the field
+	// location is resolved from the tracefs format file rather than assumed.
+	// Failure only disables the thread.state label; durations are unaffected.
+	stateOffset, stateSize, stateErr := resolveSchedSwitchStateField()
+	if stateErr != nil {
+		log.Infof("Off-CPU time probe continues without thread state: %v", stateErr)
+		stateOffset = stateOffsetUnavailable
+		stateSize = 0
+	}
+
 	variables := map[string]any{
-		originVariableName: origin,
-		minNSVariableName:  uint64(p.minDuration),
-		sampleVariableName: p.sampleThreshold,
+		originVariableName:  origin,
+		minNSVariableName:   uint64(p.minDuration),
+		sampleVariableName:  p.sampleThreshold,
+		stateOffsetVariable: stateOffset,
+		stateSizeVariable:   stateSize,
 	}
 	for name, value := range variables {
 		if err := collection.Variables[name].Set(value); err != nil {
@@ -213,6 +251,117 @@ func attachSwitchIn(program *cebpf.Program, resources *probeutil.Resources) erro
 			len(symbols), switchInSymbolPrefix, errors.Join(errs...))
 	}
 	return nil
+}
+
+// LabelTrace implements tracer.TraceLabeler. It converts the switch-out
+// thread state carried in the trace's user-data slot into the low-cardinality
+// thread.state sample label, merging with any runtime labels already present.
+func (p *offCPUTimeProbe) LabelTrace(trace *libpf.EbpfTrace) {
+	if trace.AsyncUserData == stateUnavailable {
+		return
+	}
+	if trace.CustomLabels == nil {
+		trace.CustomLabels = make(map[libpf.String]libpf.String, 1)
+	}
+	trace.CustomLabels[libpf.Intern(threadStateLabelKey)] =
+		libpf.Intern(threadStateName(trace.AsyncUserData))
+}
+
+// threadStateName decodes the sched_switch tracepoint prev_state encoding
+// used since kernel 4.14: 0 for a still-runnable thread that entered the
+// scheduler voluntarily, single TASK_REPORT bits decoded from
+// task_state_index, and TASK_REPORT_MAX (0x100) for involuntary preemption.
+// Unrecognized encodings collapse to "other" to bound label cardinality.
+func threadStateName(state uint64) string {
+	switch state {
+	case 0x0000:
+		return "running"
+	case 0x0001:
+		return "interruptible"
+	case 0x0002:
+		return "uninterruptible"
+	case 0x0004:
+		return "stopped"
+	case 0x0008:
+		return "traced"
+	case 0x0010:
+		return "exit_dead"
+	case 0x0020:
+		return "zombie"
+	case 0x0040:
+		return "parked"
+	case 0x0080:
+		return "idle"
+	case 0x0100:
+		return "preempted"
+	default:
+		return "other"
+	}
+}
+
+// resolveSchedSwitchStateField locates the prev_state field in the raw
+// sched_switch tracepoint buffer by parsing the tracefs format file, e.g.:
+//
+//	field:long prev_state;	offset:32;	size:8;	signed:1;
+func resolveSchedSwitchStateField() (offset, size uint32, err error) {
+	var firstErr error
+	for _, root := range tracefsRoots {
+		path := filepath.Join(root, "events", switchOutTracepointGroup,
+			switchOutTracepointName, "format")
+		offset, size, err := parseTracepointField(path, "prev_state")
+		if err == nil {
+			return offset, size, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return 0, 0, firstErr
+}
+
+func parseTracepointField(path, field string) (offset, size uint32, err error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.Contains(line, "field:") ||
+			!strings.Contains(line, " "+field+";") {
+			continue
+		}
+		parsedOffset, offsetErr := tracepointFieldAttribute(line, "offset")
+		parsedSize, sizeErr := tracepointFieldAttribute(line, "size")
+		if offsetErr != nil || sizeErr != nil {
+			return 0, 0, fmt.Errorf("malformed format line %q in %s", line, path)
+		}
+		return parsedOffset, parsedSize, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, 0, err
+	}
+	return 0, 0, fmt.Errorf("field %q not found in %s", field, path)
+}
+
+func tracepointFieldAttribute(line, attribute string) (uint32, error) {
+	marker := attribute + ":"
+	start := strings.Index(line, marker)
+	if start < 0 {
+		return 0, fmt.Errorf("attribute %q not found", attribute)
+	}
+	rest := line[start+len(marker):]
+	end := strings.IndexByte(rest, ';')
+	if end < 0 {
+		return 0, fmt.Errorf("attribute %q not terminated", attribute)
+	}
+	value, err := strconv.ParseUint(strings.TrimSpace(rest[:end]), 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(value), nil
 }
 
 // resolveSwitchInSymbols returns the text symbols from kallsyms that are

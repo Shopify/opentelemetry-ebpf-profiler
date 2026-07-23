@@ -1113,6 +1113,17 @@ collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_times
     ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0, NULL);
 }
 
+// collect_trace_with_user_data collects a synchronous trace that carries a
+// probe-defined value in the trace's async_user_data slot. The event stays
+// TRACE_EVENT_NORMAL (no correlation id); the owning probe interprets the
+// value in userspace, e.g. to attach per-sample labels.
+static inline EBPF_INLINE int collect_trace_with_user_data(
+  struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value, u64 user_data)
+{
+  return collect_trace_internal(
+    ctx, origin, pid, tid, trace_timestamp, value, 0, user_data, 0, 0, 0, 0, NULL);
+}
+
 static inline EBPF_INLINE int collect_trace_with_entry_frame(
   struct pt_regs *ctx,
   u16 origin,

@@ -32,6 +32,19 @@ typedef struct OffCpuTimeMetrics {
   u64 state_update_failures;
 } OffCpuTimeMetrics;
 
+// OFF_CPU_TIME_STATE_UNAVAILABLE marks a start whose thread state could not
+// be read, either because the tracepoint field offset was not resolved or
+// because the read failed. Userspace attaches no state label in that case.
+#define OFF_CPU_TIME_STATE_UNAVAILABLE (~0ULL)
+
+typedef struct OffCpuTimeStart {
+  u64 timestamp;
+  // prev_state as reported by the sched_switch tracepoint at switch-out:
+  // 0 for a runnable thread that gave up the CPU, TASK_REPORT bits for
+  // voluntary blocking, TASK_REPORT_MAX for involuntary preemption.
+  u64 state;
+} OffCpuTimeStart;
+
 // off_cpu_time_starts records when each thread left the CPU. The pending set
 // is every sleeping thread in the system, and a thread that exits while off
 // CPU leaves its entry behind with no deterministic cleanup hook (the final
@@ -41,8 +54,8 @@ typedef struct OffCpuTimeMetrics {
 // profiling map this is not per-CPU, so migrated wakeups still match.
 struct off_cpu_time_starts_t {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __type(key, u64);           // pid_tgid
-  __type(value, u64);         // switch-out timestamp in nanoseconds
+  __type(key, u64); // pid_tgid
+  __type(value, OffCpuTimeStart);
   __uint(max_entries, 65536); // resized at load time from probe configuration
 } off_cpu_time_starts SEC(".maps");
 
@@ -58,6 +71,34 @@ BPF_RODATA_VAR(u16, off_cpu_time_origin, 0)
 BPF_RODATA_VAR(u64, off_cpu_time_min_ns, 0)
 BPF_RODATA_VAR(u32, off_cpu_time_sample_threshold, 0xffffffff)
 
+// Byte offset and size of the prev_state field in the raw sched_switch
+// tracepoint buffer, resolved from the tracefs format file at load time.
+// The tracepoint encoding of prev_state is not a stable ABI across kernel
+// versions, so the offset is never assumed: 0xffffffff disables state
+// capture and samples carry no state.
+BPF_RODATA_VAR(u32, off_cpu_time_state_offset, 0xffffffff)
+BPF_RODATA_VAR(u32, off_cpu_time_state_size, 0)
+
+static EBPF_INLINE u64 off_cpu_time_read_state(const void *ctx)
+{
+  if (off_cpu_time_state_offset == 0xffffffff) {
+    return OFF_CPU_TIME_STATE_UNAVAILABLE;
+  }
+  const u8 *field = (const u8 *)ctx + off_cpu_time_state_offset;
+  if (off_cpu_time_state_size == sizeof(u64)) {
+    u64 raw;
+    if (bpf_probe_read_kernel(&raw, sizeof(raw), field) == 0) {
+      return raw;
+    }
+  } else if (off_cpu_time_state_size == sizeof(u32)) {
+    u32 raw;
+    if (bpf_probe_read_kernel(&raw, sizeof(raw), field) == 0) {
+      return raw;
+    }
+  }
+  return OFF_CPU_TIME_STATE_UNAVAILABLE;
+}
+
 static EBPF_INLINE OffCpuTimeMetrics *off_cpu_time_get_metrics()
 {
   u32 zero = 0;
@@ -69,7 +110,7 @@ static EBPF_INLINE OffCpuTimeMetrics *off_cpu_time_get_metrics()
 // the system, so it must stay minimal: all filtering and the unwind happen at
 // switch-in, once the off-CPU duration is known.
 SEC("tracepoint/sched/sched_switch")
-int off_cpu_time_switch_out(UNUSED void *ctx)
+int off_cpu_time_switch_out(void *ctx)
 {
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid      = pid_tgid >> 32;
@@ -84,11 +125,18 @@ int off_cpu_time_switch_out(UNUSED void *ctx)
     metrics->switch_outs++;
   }
 
-  u64 timestamp = bpf_ktime_get_ns();
+  OffCpuTimeStart start = {
+    .timestamp = bpf_ktime_get_ns(),
+    // The tracepoint runs in the outgoing thread's context, so prev_state
+    // describes exactly the thread being recorded: it distinguishes threads
+    // that blocked voluntarily from runnable threads descheduled by CPU
+    // pressure, which would otherwise be indistinguishable in the profile.
+    .state = off_cpu_time_read_state(ctx),
+  };
   // BPF_ANY: switch-out and switch-in strictly alternate per thread, so an
   // existing entry means the matching switch-in was missed (attach race or a
   // missed kprobe). The newer timestamp is the correct base either way.
-  if (bpf_map_update_elem(&off_cpu_time_starts, &pid_tgid, &timestamp, BPF_ANY) != 0) {
+  if (bpf_map_update_elem(&off_cpu_time_starts, &pid_tgid, &start, BPF_ANY) != 0) {
     if (metrics) {
       metrics->state_update_failures++;
     }
@@ -116,20 +164,20 @@ int off_cpu_time_switch_in(struct pt_regs *ctx)
     metrics->switch_ins++;
   }
 
-  u64 *start = bpf_map_lookup_elem(&off_cpu_time_starts, &pid_tgid);
-  if (!start) {
+  OffCpuTimeStart *stored = bpf_map_lookup_elem(&off_cpu_time_starts, &pid_tgid);
+  if (!stored) {
     // First sighting of this thread, or its start was evicted.
     if (metrics) {
       metrics->unmatched_switch_ins++;
     }
     return 0;
   }
-  u64 started = *start;
+  OffCpuTimeStart start = *stored;
   bpf_map_delete_elem(&off_cpu_time_starts, &pid_tgid);
 
   u64 timestamp = bpf_ktime_get_ns();
   if (
-    timestamp < started || timestamp - started < off_cpu_time_min_ns ||
+    timestamp < start.timestamp || timestamp - start.timestamp < off_cpu_time_min_ns ||
     (off_cpu_time_sample_threshold != 0xffffffff &&
      bpf_get_prandom_u32() > off_cpu_time_sample_threshold)) {
     if (metrics) {
@@ -142,5 +190,8 @@ int off_cpu_time_switch_in(struct pt_regs *ctx)
     metrics->emitted++;
   }
   DEBUG_PRINT("off-cpu time wakeup pid %d tid %d", pid, tid);
-  return collect_trace(ctx, off_cpu_time_origin, pid, tid, timestamp, timestamp - started);
+  // The switch-out thread state rides in the trace's user-data slot; the
+  // probe's userspace labeler turns it into a thread.state sample label.
+  return collect_trace_with_user_data(
+    ctx, off_cpu_time_origin, pid, tid, timestamp, timestamp - start.timestamp, start.state);
 }
