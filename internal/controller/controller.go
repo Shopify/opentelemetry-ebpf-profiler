@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/probes/functionlatency"
 	"go.opentelemetry.io/ebpf-profiler/probes/generic"
 	"go.opentelemetry.io/ebpf-profiler/probes/iouring"
+	"go.opentelemetry.io/ebpf-profiler/probes/offcpu"
 	"go.opentelemetry.io/ebpf-profiler/probes/tcpconnect"
 	"go.opentelemetry.io/ebpf-profiler/probes/tcpsequence"
 
@@ -270,6 +271,8 @@ func createCustomProbe(name string, cfg any) (tracer.Probe, error) {
 			Symbol:     "vfs_write",
 			SampleType: name,
 		}, cfg)
+	case offcpu.SampleType:
+		return offcpu.New(cfg)
 	default:
 		return nil, fmt.Errorf("unknown custom probe: %q", name)
 	}

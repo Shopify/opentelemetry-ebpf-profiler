@@ -803,6 +803,27 @@ const (
 	// Number of heap allocs dropped in eBPF due to global live-heap map full
 	IDHeapLiveMapFull = 342
 
+	// Number of thread switch-out events observed by the off-CPU time probe
+	IDOffCPUTimeSwitchOuts = 343
+
+	// Number of thread switch-in events observed by the off-CPU time probe
+	IDOffCPUTimeSwitchIns = 344
+
+	// Number of off-CPU time switch-ins without a recorded switch-out
+	IDOffCPUTimeUnmatchedSwitchIns = 345
+
+	// Number of off-CPU time samples filtered by duration or sampling
+	IDOffCPUTimeFiltered = 346
+
+	// Number of off-CPU time samples submitted for unwinding
+	IDOffCPUTimeEmitted = 347
+
+	// Number of failures recording off-CPU time switch-out state
+	IDOffCPUTimeStateUpdateFailures = 348
+
+	// Number of failures reading off-CPU time eBPF metrics
+	IDOffCPUTimeMetricReadFailures = 349
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 343
+	IDMax = 350
 )

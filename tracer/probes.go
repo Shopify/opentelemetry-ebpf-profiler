@@ -39,6 +39,8 @@ var dynamicProbeResources = struct {
 		"tcp_receive_calls",
 		"lock_wait_metrics",
 		"lock_wait_starts",
+		"off_cpu_time_metrics",
+		"off_cpu_time_starts",
 	},
 	programs: []string{
 		"block_io_submit_bio",
@@ -64,6 +66,8 @@ var dynamicProbeResources = struct {
 		"tcp_receive_close",
 		"lock_wait_entry",
 		"lock_wait_exit",
+		"off_cpu_time_switch_in",
+		"off_cpu_time_switch_out",
 	},
 	variables: []string{
 		"block_io_origin",
@@ -130,6 +134,9 @@ var dynamicProbeResources = struct {
 		"lock_wait_success_2",
 		"lock_wait_success_3",
 		"lock_wait_success_count",
+		"off_cpu_time_min_ns",
+		"off_cpu_time_origin",
+		"off_cpu_time_sample_threshold",
 	},
 }
 
