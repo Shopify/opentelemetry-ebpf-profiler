@@ -37,6 +37,8 @@ var dynamicProbeResources = struct {
 		"tcp_ack_track_calls",
 		"tcp_ack_active_sockets",
 		"tcp_receive_calls",
+		"lock_wait_metrics",
+		"lock_wait_starts",
 	},
 	programs: []string{
 		"block_io_submit_bio",
@@ -60,6 +62,8 @@ var dynamicProbeResources = struct {
 		"tcp_receive_entry",
 		"tcp_receive_exit",
 		"tcp_receive_close",
+		"lock_wait_entry",
+		"lock_wait_exit",
 	},
 	variables: []string{
 		"block_io_origin",
@@ -117,6 +121,15 @@ var dynamicProbeResources = struct {
 		"tcp_receive_skb_cb_offset",
 		"tcp_receive_skb_seq_offset",
 		"tcp_receive_skb_end_seq_offset",
+		"lock_wait_min_ns",
+		"lock_wait_origin",
+		"lock_wait_return_mode",
+		"lock_wait_sample_threshold",
+		"lock_wait_success_0",
+		"lock_wait_success_1",
+		"lock_wait_success_2",
+		"lock_wait_success_3",
+		"lock_wait_success_count",
 	},
 }
 

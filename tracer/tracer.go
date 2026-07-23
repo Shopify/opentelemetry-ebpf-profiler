@@ -1363,13 +1363,13 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *libp
 		metrics.AddSlice(traceEventMetricCollector())
 		metrics.AddSlice(t.eBPFMetricsCollector(translateIDs, previousMetricValue))
 		metrics.AddSlice(t.customLabels.getAndResetMetrics())
-		metrics.AddSlice(t.collectProbeMetrics())
 		if t.asyncCorrelator != nil {
 			metrics.AddSlice(t.asyncCorrelator.getAndResetMetrics())
 		}
 		if t.tcpSequenceCorrelator != nil {
 			metrics.AddSlice(t.tcpSequenceCorrelator.getAndResetMetrics())
 		}
+		metrics.AddSlice(t.collectProbeMetrics())
 	})
 
 	return nil

@@ -2356,5 +2356,68 @@
     "name": "UserspaceProbeActiveLinks",
     "field": "agent.userspace_probe.links.active",
     "id": 327
+  },
+  {
+    "description": "Number of lock-wait entry probes observed",
+    "type": "counter",
+    "name": "LockWaitEntries",
+    "field": "agent.lock_wait.entries",
+    "id": 328
+  },
+  {
+    "description": "Number of lock-wait return probes observed",
+    "type": "counter",
+    "name": "LockWaitReturns",
+    "field": "agent.lock_wait.returns",
+    "id": 329
+  },
+  {
+    "description": "Number of lock-wait returns without acquisition state",
+    "type": "counter",
+    "name": "LockWaitUnmatchedReturns",
+    "field": "agent.lock_wait.returns.unmatched",
+    "id": 330
+  },
+  {
+    "description": "Number of lock-wait samples filtered by duration, sampling, or return policy",
+    "type": "counter",
+    "name": "LockWaitFiltered",
+    "field": "agent.lock_wait.filtered",
+    "id": 331
+  },
+  {
+    "description": "Number of lock-wait latency samples submitted for unwinding",
+    "type": "counter",
+    "name": "LockWaitEmitted",
+    "field": "agent.lock_wait.emitted",
+    "id": 332
+  },
+  {
+    "description": "Number of failures inserting lock-wait acquisition state",
+    "type": "counter",
+    "name": "LockWaitStateUpdateFailures",
+    "field": "agent.lock_wait.state.update_failures",
+    "id": 333
+  },
+  {
+    "description": "Number of nested lock-wait entries that replaced state for one thread",
+    "type": "counter",
+    "name": "LockWaitStateOverwrites",
+    "field": "agent.lock_wait.state.overwrites",
+    "id": 334
+  },
+  {
+    "description": "Number of lock-wait acquisition states currently active",
+    "type": "gauge",
+    "name": "LockWaitActiveStates",
+    "field": "agent.lock_wait.state.active",
+    "id": 335
+  },
+  {
+    "description": "Number of failures reading lock-wait eBPF metrics",
+    "type": "counter",
+    "name": "LockWaitMetricReadFailures",
+    "field": "agent.lock_wait.metrics.read_failures",
+    "id": 336
   }
 ]

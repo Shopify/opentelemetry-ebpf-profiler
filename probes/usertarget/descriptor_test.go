@@ -114,6 +114,10 @@ func TestTargetValidationRejectsUnsafeDescriptors(t *testing.T) {
 			mutate:    func(target *Target) { target.MaxLinks = MaximumMaxLinks + 1 },
 			errorText: "max_links must be in the range",
 		},
+		"unbounded resolved points": {
+			mutate:    func(target *Target) { target.MaxResolvedPoints = maxSymbolPoints + 1 },
+			errorText: "max_resolved_points must be in the range",
+		},
 	}
 
 	for name, test := range tests {
