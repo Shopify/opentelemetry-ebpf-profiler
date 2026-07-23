@@ -117,6 +117,13 @@ const (
 )
 
 const (
+	TraceOriginUnknown   = C.TRACE_UNKNOWN
+	TraceOriginSampling  = C.TRACE_SAMPLING
+	TraceOriginOffCPU    = C.TRACE_OFF_CPU
+	TraceOriginProbe     = C.TRACE_PROBE
+	TraceOriginHeapAlloc = C.TRACE_HEAP_ALLOC
+	TraceOriginHeapFree  = C.TRACE_HEAP_FREE
+
 	CustomLabelsTypeNone   = C.CUSTOM_LABELS_TYPE_NONE
 	CustomLabelsTypeNative = C.CUSTOM_LABELS_TYPE_NATIVE
 	CustomLabelsTypeGo     = C.CUSTOM_LABELS_TYPE_GO
@@ -349,4 +356,6 @@ var MetricsTranslation = []metrics.MetricID{
 	C.metricID_UnwindThreadContextErrReadThreadCtxBuf:     metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
 	C.metricID_UnwindThreadContextErrReadThreadCtxAttrs:   metrics.IDUnwindThreadContextErrReadThreadCtxAttrs,
 	C.metricID_UnwindThreadContextReadSuccesses:           metrics.IDUnwindThreadContextReadSuccesses,
+	C.metricID_HeapLiveMapFull:                            metrics.IDHeapLiveMapFull,
+	C.metricID_HeapPerPIDLimitHit:                         metrics.IDHeapPerPIDLimitHit,
 }

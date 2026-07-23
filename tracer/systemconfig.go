@@ -640,5 +640,24 @@ func setOriginIDs(coll *cebpf.CollectionSpec, cfg *Config, origins *originRegist
 		}
 	}
 
+	if cfg.HeapProfiling {
+		if err := origins.registerFixed(support.TraceOriginHeapAlloc, &samples.TypeMetadata{
+			SampleType:   "alloc_space",
+			SampleUnit:   "bytes",
+			ReportValues: true,
+		}); err != nil {
+			return err
+		}
+	}
+	if cfg.LiveHeapProfiling {
+		if err := origins.registerFixed(support.TraceOriginHeapFree, &samples.TypeMetadata{
+			SampleType:   "heap_free",
+			SampleUnit:   "bytes",
+			ReportValues: true,
+		}); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }

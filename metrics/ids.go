@@ -785,6 +785,24 @@ const (
 	// Number of failures reading lock-wait eBPF metrics
 	IDLockWaitMetricReadFailures = 336
 
+	// Current number of live heap entries tracked globally
+	IDLiveHeapEntries = 337
+
+	// Number of heap alloc samples dropped due to global live-set cap
+	IDLiveHeapDroppedAllocs = 338
+
+	// Number of heap malloc samples received per reporting interval
+	IDHeapAllocSamples = 339
+
+	// Number of heap free samples received per reporting interval
+	IDHeapFreeSamples = 340
+
+	// Number of heap allocs dropped in eBPF due to per-PID live-heap cap
+	IDHeapPerPIDLimitHit = 341
+
+	// Number of heap allocs dropped in eBPF due to global live-heap map full
+	IDHeapLiveMapFull = 342
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 337
+	IDMax = 343
 )

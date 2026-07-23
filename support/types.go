@@ -80,7 +80,7 @@ const (
 const UnwindInfoMaxEntries = 0x4000
 
 const (
-	MetricIDBeginCumulative = 0x75
+	MetricIDBeginCumulative = 0x77
 )
 
 const (
@@ -107,6 +107,13 @@ const (
 )
 
 const (
+	TraceOriginUnknown   = 0x0
+	TraceOriginSampling  = 0x1
+	TraceOriginOffCPU    = 0x2
+	TraceOriginProbe     = 0x3
+	TraceOriginHeapAlloc = 0x4
+	TraceOriginHeapFree  = 0x5
+
 	CustomLabelsTypeNone   = 0x0
 	CustomLabelsTypeNative = 0x1
 	CustomLabelsTypeGo     = 0x2
@@ -200,6 +207,8 @@ type Trace struct {
 	Async_kind         uint8
 	Async_attributes   uint8
 	Async_reserved     [3]uint8
+	Ptr                uint64
+	Size               uint64
 	Cpu_id             uint32
 	Frame_data         [3072]uint64
 }
@@ -379,7 +388,7 @@ type LuaJITProcInfo struct {
 
 const (
 	Sizeof_StackDelta = 0x4
-	Sizeof_Trace      = 0x6300
+	Sizeof_Trace      = 0x6318
 
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4
@@ -567,4 +576,6 @@ var MetricsTranslation = []metrics.MetricID{
 	0x72: metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
 	0x73: metrics.IDUnwindThreadContextErrReadThreadCtxAttrs,
 	0x74: metrics.IDUnwindThreadContextReadSuccesses,
+	0x75: metrics.IDHeapLiveMapFull,
+	0x76: metrics.IDHeapPerPIDLimitHit,
 }

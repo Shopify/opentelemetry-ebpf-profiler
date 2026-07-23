@@ -175,6 +175,8 @@ type EbpfTrace struct {
 	KernelFrames     Frames
 	FrameDataBuf     [3072]uint64
 	Value            int64
+	Ptr              uint64
+	Size             uint64
 	KTime            int64
 	CorrelationID    uint64
 	AsyncUserData    uint64

@@ -10,6 +10,7 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/processcontext"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/pdata"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
@@ -42,6 +43,23 @@ type baseReporter struct {
 }
 
 var errUnknownProfileType = errors.New("unknown trace profile type")
+
+func isHeapAllocProfileType(profileType *samples.TypeMetadata) bool {
+	return profileType != nil &&
+		profileType.SampleType == "alloc_space" &&
+		profileType.SampleUnit == "bytes"
+}
+
+// SetLiveHeapTracker sets the live heap tracker for inuse profile reporting.
+// Must be called before Start().
+func (b *baseReporter) SetLiveHeapTracker(t *liveheap.Tracker) {
+	b.cfg.LiveHeapTracker = t
+}
+
+// SetProcessMetaForInuse sets the process metadata resolver for inuse profiles.
+func (b *baseReporter) SetProcessMetaForInuse(fn func(libpf.PID) liveheap.ProcessMeta) {
+	b.cfg.ProcessMetaForInuse = fn
+}
 
 func (b *baseReporter) Stop() {
 	b.runLoop.Stop()
@@ -107,17 +125,25 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 		TraceID:    meta.TraceID,
 		ExtraMeta:  extraMeta,
 	}
+	isHeapAlloc := isHeapAllocProfileType(meta.ProfileType)
 	if events, exists := rtp.Events[meta.ProfileType][sampleKey]; exists {
 		events.Timestamps = append(events.Timestamps, uint64(meta.Timestamp))
 		events.Values = append(events.Values, meta.Value)
+		if isHeapAlloc {
+			events.AllocSizes = append(events.AllocSizes, meta.AllocSize)
+		}
 		return nil
 	}
 
-	rtp.Events[meta.ProfileType][sampleKey] = &samples.TraceEvents{
+	newEvents := &samples.TraceEvents{
 		Frames:     trace.Frames,
 		Timestamps: []uint64{uint64(meta.Timestamp)},
 		Values:     []int64{meta.Value},
 		Labels:     labels,
 	}
+	if isHeapAlloc {
+		newEvents.AllocSizes = []int64{meta.AllocSize}
+	}
+	rtp.Events[meta.ProfileType][sampleKey] = newEvents
 	return nil
 }

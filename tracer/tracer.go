@@ -37,6 +37,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind/elfunwindinfo"
 	"go.opentelemetry.io/ebpf-profiler/periodiccaller"
@@ -46,6 +47,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/times"
+	"go.opentelemetry.io/ebpf-profiler/usdt"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -158,6 +160,18 @@ type Tracer struct {
 	// tracks how many were dropped due to invalid UTF-8.
 	customLabels customLabelValidator
 
+	// PID event processor lifecycle is owned by Tracer so Close can stop and
+	// drain it even when the caller has not yet cancelled the parent context.
+	pidEventsMu      sync.Mutex
+	pidEventsCancel  context.CancelFunc
+	pidEventsDone    chan struct{}
+	pidEventsStarted bool
+	pidEventsClosed  bool
+
+	// liveHeapTracker tracks live (in-use) heap allocations by correlating
+	// alloc and free events. Nil when live heap profiling is disabled.
+	liveHeapTracker *liveheap.Tracker
+
 	// sysConfigVars holds kernel struct offsets determined at startup, passed
 	// to custom probes via Enable so they can reference the same layout.
 	sysConfigVars SysConfigVars
@@ -188,6 +202,11 @@ type Tracer struct {
 // when the tracer should be stopped.
 func (t *Tracer) Done() <-chan libpf.Void {
 	return t.done
+}
+
+// ProcessManager returns the process manager for accessing per-PID metadata.
+func (t *Tracer) ProcessManager() *pm.ProcessManager {
+	return t.processManager
 }
 
 // signalDone closes the done channel to indicate an unrecoverable error.
@@ -243,6 +262,19 @@ type Config struct {
 	// LoadProbe indicates whether the generic eBPF program should be loaded
 	// without being attached to something.
 	LoadProbe bool
+	// HeapProfiling enables loading of the heap USDT uprobe entry programs
+	// and per-process attach via the usdt package.
+	HeapProfiling bool
+	// LiveHeapProfiling additionally tracks deallocations so the live
+	// (in-use) heap can be reported, by loading and attaching the heap free
+	// USDT probe alongside the alloc probe. Requires HeapProfiling.
+	LiveHeapProfiling bool
+	// LiveHeapTracker is the shared tracker instance for live heap profiling.
+	// Created externally and shared with the reporter. May be nil.
+	LiveHeapTracker *liveheap.Tracker
+	// LiveHeapMaxEntriesPerPID is the per-process cap on live heap entries
+	// enforced in the eBPF map. 0 means no per-PID limit.
+	LiveHeapMaxEntriesPerPID int
 	// BPFFSRoot is the root path to BPF filesystem for pinned maps and programs.
 	BPFFSRoot string
 	// OBIProcessCtx enable the use of a known shared eBPF map with OBI.
@@ -286,6 +318,9 @@ func newTracePool() sync.Pool {
 
 // NewTracer loads eBPF code and map definitions from the ELF module at the configured path.
 func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
+	if cfg.LiveHeapProfiling && !cfg.HeapProfiling {
+		return nil, errors.New("live heap profiling requires heap profiling to be enabled")
+	}
 	asyncCapacity := cfg.AsyncCorrelationCapacity
 	if asyncCapacity == 0 {
 		asyncCapacity = defaultAsyncCorrelationCapacity
@@ -322,6 +357,30 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		return nil, fmt.Errorf("failed to load eBPF maps: %v", err)
 	}
 
+	if cfg.LiveHeapMaxEntriesPerPID > 0 {
+		ebpfHandler.SetHeapPIDAllocLimit(uint32(cfg.LiveHeapMaxEntriesPerPID))
+	}
+
+	// Set up memory profiling.
+	var usdtMgr *usdt.Manager
+	if cfg.HeapProfiling {
+		usdtProgs := map[usdt.ProbeKind]*cebpf.Program{}
+		if p, ok := ebpfProgs["uprobe_heap_alloc"]; ok {
+			usdtProgs[usdt.ProbeHeapAlloc] = p
+		}
+		// Only register the free probe when live heap profiling is opted
+		// into; without it the program is not loaded and frees are never
+		// instrumented.
+		if p, ok := ebpfProgs["uprobe_heap_free"]; ok && cfg.LiveHeapProfiling {
+			usdtProgs[usdt.ProbeHeapFree] = p
+		}
+		if usdtMgr, err = usdt.NewManager(usdtProgs); err != nil {
+			return nil, fmt.Errorf("failed to build USDT manager: %w", err)
+		}
+	}
+
+	liveTracker := cfg.LiveHeapTracker
+
 	processManager, err := pm.New(ctx, pm.Config{
 		InterpretersConfig:    cfg.InterpretersConfig,
 		MonitorInterval:       cfg.Intervals.MonitorInterval(),
@@ -333,6 +392,8 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		FrameCacheSize:        cfg.FrameCacheSize,
 		FilterErrorFrames:     cfg.FilterErrorFrames,
 		IncludeEnvVars:        cfg.IncludeEnvVars,
+		USDTManager:           usdtMgr,
+		LiveHeapTracker:       liveTracker,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create processManager: %v", err)
@@ -363,6 +424,8 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		samplesPerSecond:       cfg.SamplesPerSecond,
 		probabilisticInterval:  cfg.ProbabilisticInterval,
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
+		pidEventsDone:          make(chan struct{}),
+		liveHeapTracker:        liveTracker,
 		done:                   make(chan libpf.Void),
 		origins:                origins,
 		probeMetricCollectors:  make(map[uint64]*probeMetricCollector),
@@ -393,6 +456,10 @@ func (t *Tracer) Close() {
 	// those deltas before tracer shutdown removes the last collection source.
 	metrics.AddSlice(t.collectProbeMetrics())
 
+	// Stop and drain PID processing before ProcessManager tears down USDT links.
+	// This is safe even when the processor was never started.
+	t.stopPIDEventProcessor()
+
 	t.processManager.Close()
 	t.kernelSymbolizer.Close()
 	t.signalDone()
@@ -402,7 +469,7 @@ func (t *Tracer) Close() {
 // It is the single source of truth consulted both during initialization and when recording
 // kprobeChainLoaded on the Tracer.
 func kprobeChainRequired(cfg *Config) bool {
-	return cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe
+	return cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe || cfg.HeapProfiling
 }
 
 // initializeMapsAndPrograms loads the definitions for the eBPF maps and programs provided
@@ -558,6 +625,8 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *orig
 
 	if kprobeChainRequired(cfg) {
 		// Load the tail call destinations if any kind of event profiling is enabled.
+		// Heap profiling needs the uprobe unwinder chain (kprobe_progs) so its
+		// USDT entry programs can tail-call into PROG_UNWIND_NATIVE.
 		// loadProbeUnwinders repoints the probe unwinder's per_cpu_records references
 		// to per_cpu_records_kp so a perf sampler can't clobber an in-flight uprobe unwind;
 		// the perf unwinder keeps per_cpu_records.
@@ -603,6 +672,24 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *orig
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(),
 			ebpfMaps["per_cpu_records"].FD(), ebpfMaps["per_cpu_records_kp"]); err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load uprobe eBPF programs: %v", err)
+		}
+	}
+
+	if cfg.HeapProfiling {
+		// USDT entry points for heap profiling. Attached PID-scoped from
+		// userspace by the usdt package; they themselves tail-call into
+		// the shared uprobe unwinder chain loaded above.
+		// The free probe is only needed to track deallocations for live
+		// (in-use) heap reporting; plain allocation profiling never
+		// consumes free events, so don't load it unless opted in.
+		heapProgs := []ProgLoaderHelper{
+			{Name: "uprobe_heap_alloc", NoTailCallTarget: true, Enable: true},
+			{Name: "uprobe_heap_free", NoTailCallTarget: true, Enable: cfg.LiveHeapProfiling},
+		}
+		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], heapProgs,
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(),
+			ebpfMaps["per_cpu_records"].FD(), ebpfMaps["per_cpu_records_kp"]); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to load heap USDT eBPF programs: %v", err)
 		}
 	}
 
@@ -1249,6 +1336,8 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 		TID:              libpf.PID(ptr.Tid),
 		Origin:           ptr.Origin,
 		Value:            int64(ptr.Value),
+		Ptr:              ptr.Ptr,
+		Size:             ptr.Size,
 		KTime:            int64(ptr.Ktime),
 		CorrelationID:    ptr.Correlation_id,
 		AsyncUserData:    ptr.Async_user_data,
@@ -1571,6 +1660,16 @@ func (t *Tracer) AttachProbes(probes []string) error {
 }
 
 func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
+	if bpfTrace.Origin == support.TraceOriginHeapFree {
+		// Free events carry no frames; just remove the allocation from the
+		// live tracker. No symbolization or reporting needed.
+		if t.liveHeapTracker != nil {
+			t.liveHeapTracker.HandleFree(bpfTrace.PID, bpfTrace.Ptr)
+		}
+		t.releaseTrace(bpfTrace)
+		return
+	}
+
 	if t.asyncCorrelator == nil {
 		t.asyncCorrelator = newAsyncTraceCorrelator(
 			defaultAsyncCorrelationCapacity, defaultAsyncCorrelationTTL)
@@ -1614,7 +1713,19 @@ func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 		}
 	}
 
-	t.processManager.HandleTrace(bpfTrace, t.origins.lookup(bpfTrace.Origin))
+	traceHash, frames := t.processManager.HandleTrace(bpfTrace, t.origins.lookup(bpfTrace.Origin))
+	// After symbolization and reporting, feed heap allocs to the live tracker.
+	// Called for every alloc trace (not just ptr != 0) so the tracker can count
+	// all received alloc samples; it ignores entries eBPF did not live-track.
+	if bpfTrace.Origin == support.TraceOriginHeapAlloc && t.liveHeapTracker != nil {
+		t.liveHeapTracker.HandleAlloc(
+			bpfTrace.PID,
+			bpfTrace.Ptr,
+			traceHash,
+			bpfTrace.Value,
+			frames,
+		)
+	}
 	t.releaseTrace(bpfTrace)
 }
 
@@ -1646,6 +1757,25 @@ func (r *originRegistry) register(metadata *samples.TypeMetadata) (uint16, error
 	id := uint16(r.lastID.Add(1))
 	r.types.Store(id, metadata)
 	return id, nil
+}
+
+// registerFixed stores metadata for an origin ID emitted directly by eBPF.
+func (r *originRegistry) registerFixed(id uint16, metadata *samples.TypeMetadata) error {
+	if id == 0 {
+		return fmt.Errorf("origin ID 0 is reserved")
+	}
+	if _, loaded := r.types.LoadOrStore(id, metadata); loaded {
+		return fmt.Errorf("origin ID %d is already registered", id)
+	}
+	for {
+		last := r.lastID.Load()
+		if uint32(id) <= last {
+			return nil
+		}
+		if r.lastID.CompareAndSwap(last, uint32(id)) {
+			return nil
+		}
+	}
 }
 
 // lookup returns the profile type metadata registered for origin, or nil if
