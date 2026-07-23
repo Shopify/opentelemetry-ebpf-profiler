@@ -686,6 +686,54 @@ const (
 	// Number of times we didn't find an entry for this process in the LuaJIT process info array
 	IDUnwindLuaJITErrNoProcInfo = 299
 
+	// Number of asynchronous initiating traces buffered for completion correlation
+	IDAsyncCorrelationStarts = 300
+
+	// Number of asynchronous completions joined to their initiating traces
+	IDAsyncCorrelationCompletions = 301
+
+	// Number of duplicate asynchronous starts, including richer stack replacements
+	IDAsyncCorrelationDuplicateStarts = 302
+
+	// Number of asynchronous completions with no buffered initiating trace
+	IDAsyncCorrelationOrphanCompletions = 303
+
+	// Number of asynchronous initiating traces evicted at correlator capacity
+	IDAsyncCorrelationCapacityEvictions = 304
+
+	// Number of asynchronous initiating traces evicted after their correlation TTL
+	IDAsyncCorrelationExpirationEvictions = 305
+
+	// Number of asynchronous initiating traces currently awaiting completion
+	IDAsyncCorrelationPending = 306
+
+	// Number of correlated asynchronous completions suppressed by a duration filter
+	IDAsyncCorrelationFilteredCompletions = 307
+
+	// Number of TCP sequence operations missing a packet or initiating stack
+	IDTCPSequenceCorrelationOrphans = 308
+
+	// Number of TCP sequence correlation records removed by capacity or TTL
+	IDTCPSequenceCorrelationEvictions = 309
+
+	// Number of TCP sequence latencies suppressed by a duration filter
+	IDTCPSequenceCorrelationFiltered = 310
+
+	// Number of TCP calls and sequence ranges awaiting correlation
+	IDTCPSequenceCorrelationPending = 311
+
+	// Number of failures to get TSD base for thread context
+	IDUnwindThreadContextErrReadTsdBase = 312
+
+	// Number of failures to read the thread context buffer
+	IDUnwindThreadContextErrReadThreadCtxBuf = 313
+
+	// Number of failures to read the thread context attributes
+	IDUnwindThreadContextErrReadThreadCtxAttrs = 314
+
+	// Number of successful reads of thread context info
+	IDUnwindThreadContextReadSuccesses = 315
+
 	// Number of mapped userspace probe objects that failed symbol or build ID resolution
 	IDUserspaceProbeResolutionFailures = 320
 

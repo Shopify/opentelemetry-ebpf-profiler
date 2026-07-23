@@ -123,8 +123,13 @@ type Tracer struct {
 	// associated eBPF maps.
 	processManager *pm.ProcessManager
 
-	// tracePool is cache of libpf.EbpfTrace to avoid GC pressure
+	// tracePool is cache of libpf.EbpfTrace to avoid GC pressure.
 	tracePool sync.Pool
+
+	// asyncCorrelator retains compact initiating traces until their completion.
+	asyncCorrelator *asyncTraceCorrelator
+	// tcpSequenceCorrelator joins byte ranges to cumulative ACK/read progress.
+	tcpSequenceCorrelator *tcpSequenceCorrelator
 
 	// triggerPIDProcessing is used as manual trigger channel to request immediate
 	// processing of pending PIDs. This is requested on notifications from eBPF code
@@ -207,6 +212,12 @@ type Config struct {
 	MapScaleFactor int
 	// FrameCacheSize is the maximum size of the user-mode frame cache.
 	FrameCacheSize uint32
+	// AsyncCorrelationCapacity bounds initiating traces awaiting completions.
+	// Zero uses the default.
+	AsyncCorrelationCapacity int
+	// AsyncCorrelationTTL expires initiating traces whose completion never arrives.
+	// Zero uses the default.
+	AsyncCorrelationTTL time.Duration
 	// FilterErrorFrames indicates whether error frames should be filtered.
 	FilterErrorFrames bool
 	// FilterIdleFrames indicates whether idle frames should be filtered.
@@ -275,6 +286,19 @@ func newTracePool() sync.Pool {
 
 // NewTracer loads eBPF code and map definitions from the ELF module at the configured path.
 func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
+	asyncCapacity := cfg.AsyncCorrelationCapacity
+	if asyncCapacity == 0 {
+		asyncCapacity = defaultAsyncCorrelationCapacity
+	} else if asyncCapacity < 0 {
+		return nil, fmt.Errorf("async correlation capacity must not be negative")
+	}
+	asyncTTL := cfg.AsyncCorrelationTTL
+	if asyncTTL == 0 {
+		asyncTTL = defaultAsyncCorrelationTTL
+	} else if asyncTTL < 0 {
+		return nil, fmt.Errorf("async correlation TTL must not be negative")
+	}
+
 	kernelSymbolizer, err := kallsyms.NewSymbolizer()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read kernel symbols: %v", err)
@@ -328,6 +352,8 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		processManager:         processManager,
 		triggerPIDProcessing:   make(chan bool, 1),
 		tracePool:              newTracePool(),
+		asyncCorrelator:        newAsyncTraceCorrelator(asyncCapacity, asyncTTL),
+		tcpSequenceCorrelator:  newTCPSequenceCorrelator(asyncCapacity, asyncTTL),
 		pidEvents:              make(chan libpf.PIDTID, pidEventBufferSize),
 		ebpfMaps:               ebpfMaps,
 		ebpfProgs:              ebpfProgs,
@@ -1224,31 +1250,47 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 		Origin:           ptr.Origin,
 		Value:            int64(ptr.Value),
 		KTime:            int64(ptr.Ktime),
+		CorrelationID:    ptr.Correlation_id,
+		AsyncUserData:    ptr.Async_user_data,
+		AsyncThreshold:   ptr.Async_threshold,
+		AsyncResult:      ptr.Async_result,
+		AsyncFlags:       ptr.Async_flags,
+		AsyncOperation:   ptr.Async_operation,
+		EventKind:        libpf.TraceEventKind(ptr.Event_kind),
+		AsyncKind:        libpf.AsyncKind(ptr.Async_kind),
+		AsyncAttributes:  libpf.AsyncAttributes(ptr.Async_attributes),
 		CpuID:            ptr.Cpu_id,
 		EnvVars:          procMeta.EnvVariables,
+		Resource:         procMeta.ProcessContextInfo.Resource,
 	}
 
 	if t.origins.lookup(trace.Origin) == nil {
 		return nil, fmt.Errorf("origin %d: %w", trace.Origin, errOriginUnexpected)
 	}
 
-	if ptr.Custom_labels.Len > 0 {
-		trace.CustomLabels = make(map[libpf.String]libpf.String, int(ptr.Custom_labels.Len))
-		for i := 0; i < int(ptr.Custom_labels.Len); i++ {
-			lbl := ptr.Custom_labels.Labels[i]
-			keyBytes, ok := t.customLabels.validateKey(lbl.Key[:])
-			if !ok {
-				log.Debugf("Dropping Go custom label with empty or invalid UTF-8 name")
-				continue
+	switch ptr.Custom_labels_type {
+	case support.CustomLabelsTypeGo:
+		customLabels := (*support.CustomLabelsArray)(unsafe.Pointer(&ptr.Custom_labels_data))
+		if customLabels.Len > 0 {
+			trace.CustomLabels = make(map[libpf.String]libpf.String, int(customLabels.Len))
+			for i := 0; i < int(customLabels.Len); i++ {
+				lbl := customLabels.Labels[i]
+				keyBytes, ok := t.customLabels.validateKey(lbl.Key[:])
+				if !ok {
+					log.Debugf("Dropping Go custom label with empty or invalid UTF-8 name")
+					continue
+				}
+				key := libpf.Intern(pfunsafe.ToString(keyBytes))
+				valBytes, ok := t.customLabels.validateValue(lbl.Val[:])
+				if !ok {
+					log.Debugf("Dropping Go custom label %s with invalid UTF-8 value", key)
+					continue
+				}
+				trace.CustomLabels[key] = libpf.Intern(pfunsafe.ToString(valBytes))
 			}
-			key := libpf.Intern(pfunsafe.ToString(keyBytes))
-			valBytes, ok := t.customLabels.validateValue(lbl.Val[:])
-			if !ok {
-				log.Debugf("Dropping Go custom label %s with invalid UTF-8 value", key)
-				continue
-			}
-			trace.CustomLabels[key] = libpf.Intern(pfunsafe.ToString(valBytes))
 		}
+	case support.CustomLabelsTypeNative:
+		trace.CustomLabels = procMeta.ProcessContextInfo.DecodeThreadLabels(ptr.Custom_labels_data.Data[:ptr.Custom_labels_data.Size])
 	}
 
 	trace.NumFrames = ptr.Num_frames
@@ -1322,6 +1364,12 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *libp
 		metrics.AddSlice(t.eBPFMetricsCollector(translateIDs, previousMetricValue))
 		metrics.AddSlice(t.customLabels.getAndResetMetrics())
 		metrics.AddSlice(t.collectProbeMetrics())
+		if t.asyncCorrelator != nil {
+			metrics.AddSlice(t.asyncCorrelator.getAndResetMetrics())
+		}
+		if t.tcpSequenceCorrelator != nil {
+			metrics.AddSlice(t.tcpSequenceCorrelator.getAndResetMetrics())
+		}
 	})
 
 	return nil
@@ -1523,11 +1571,58 @@ func (t *Tracer) AttachProbes(probes []string) error {
 }
 
 func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
-	t.processManager.HandleTrace(bpfTrace, t.origins.lookup(bpfTrace.Origin))
+	if t.asyncCorrelator == nil {
+		t.asyncCorrelator = newAsyncTraceCorrelator(
+			defaultAsyncCorrelationCapacity, defaultAsyncCorrelationTTL)
+	}
+	if t.tcpSequenceCorrelator == nil {
+		t.tcpSequenceCorrelator = newTCPSequenceCorrelator(
+			defaultAsyncCorrelationCapacity, defaultAsyncCorrelationTTL)
+	}
+	if (bpfTrace.AsyncKind == libpf.AsyncKindTCPAck ||
+		bpfTrace.AsyncKind == libpf.AsyncKindTCPReceive) &&
+		bpfTrace.EventKind != libpf.TraceEventNormal {
+		completions := t.tcpSequenceCorrelator.handle(bpfTrace)
+		t.releaseTrace(bpfTrace)
+		for i := range completions {
+			completion := &completions[i]
+			trace := t.tracePool.Get().(*libpf.EbpfTrace)
+			completion.snapshot.restore(trace)
+			trace.KTime = completion.ktime
+			trace.CpuID = completion.cpu
+			trace.Value = completion.value
+			trace.AsyncResult = completion.result
+			trace.AsyncKind = completion.kind
+			trace.EventKind = libpf.TraceEventNormal
+			addAsyncLabels(trace)
+			t.processManager.HandleTrace(trace, t.origins.lookup(trace.Origin))
+			t.releaseTrace(trace)
+		}
+		return
+	}
 
-	// Reclaim the EbpfTrace
-	bpfTrace.KernelFrames = bpfTrace.KernelFrames[0:0]
-	t.tracePool.Put(bpfTrace)
+	switch bpfTrace.EventKind {
+	case libpf.TraceEventAsyncStart:
+		t.asyncCorrelator.add(bpfTrace)
+		t.releaseTrace(bpfTrace)
+		return
+	case libpf.TraceEventAsyncComplete:
+		if !t.asyncCorrelator.complete(bpfTrace) ||
+			bpfTrace.AsyncAttributes&libpf.AsyncAttrFiltered != 0 {
+			t.releaseTrace(bpfTrace)
+			return
+		}
+	}
+
+	t.processManager.HandleTrace(bpfTrace, t.origins.lookup(bpfTrace.Origin))
+	t.releaseTrace(bpfTrace)
+}
+
+func (t *Tracer) releaseTrace(trace *libpf.EbpfTrace) {
+	trace.KernelFrames = trace.KernelFrames[:0]
+	trace.FrameData = trace.FrameDataBuf[:0]
+	trace.CustomLabels = nil
+	t.tracePool.Put(trace)
 }
 
 // originRegistry is the tracer-wide registry origin IDs are assigned from

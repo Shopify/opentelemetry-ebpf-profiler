@@ -28,6 +28,24 @@ const (
 )
 
 const (
+	TraceEventNormal        = 0x0
+	TraceEventAsyncStart    = 0x1
+	TraceEventAsyncComplete = 0x2
+	TraceEventAsyncRegister = 0x3
+	TraceEventAsyncProgress = 0x4
+
+	TraceAsyncNone         = 0x0
+	TraceAsyncIOUring      = 0x1
+	TraceAsyncBlock        = 0x2
+	TraceAsyncTCPConnect   = 0x3
+	TraceAsyncTCPAck       = 0x4
+	TraceAsyncTCPReceive   = 0x5
+	TraceAsyncAttrMore     = 0x1
+	TraceAsyncAttrSQPoll   = 0x2
+	TraceAsyncAttrFiltered = 0x4
+)
+
+const (
 	FrameFlagError         = 0x1
 	FrameFlagReturnAddress = 0x2
 	FrameFlagPidSpecific   = 0x4
@@ -62,7 +80,7 @@ const (
 const UnwindInfoMaxEntries = 0x4000
 
 const (
-	MetricIDBeginCumulative = 0x71
+	MetricIDBeginCumulative = 0x75
 )
 
 const (
@@ -88,6 +106,12 @@ const (
 	HSTSIDSegMapMask      = 0xffffffffffffff
 )
 
+const (
+	CustomLabelsTypeNone   = 0x0
+	CustomLabelsTypeNative = 0x1
+	CustomLabelsTypeGo     = 0x2
+)
+
 type ApmSpanID [8]byte
 type ApmTraceID [16]byte
 type CustomLabel struct {
@@ -97,6 +121,10 @@ type CustomLabel struct {
 type CustomLabelsArray struct {
 	Len    uint32
 	Labels [10]CustomLabel
+}
+type CustomLabelsData struct {
+	Size uint16
+	Data [642]uint8
 }
 type Event struct {
 	Type uint32
@@ -154,12 +182,24 @@ type Trace struct {
 	Comm               [16]uint8
 	Apm_transaction_id [8]byte
 	Apm_trace_id       [16]byte
-	Custom_labels      CustomLabelsArray
+	Custom_labels_type uint8
+	Pad_cgo_0          [3]byte
+	Custom_labels_data CustomLabelsData
 	Frame_data_len     uint16
 	Num_frames         uint16
 	Num_kernel_frames  uint16
 	Origin             uint16
 	Value              uint64
+	Correlation_id     uint64
+	Async_user_data    uint64
+	Async_threshold    uint64
+	Async_result       int64
+	Async_flags        uint32
+	Async_operation    uint16
+	Event_kind         uint8
+	Async_kind         uint8
+	Async_attributes   uint8
+	Async_reserved     [3]uint8
 	Cpu_id             uint32
 	Frame_data         [3072]uint64
 }
@@ -301,6 +341,11 @@ type RubyProcInfo struct {
 	Running_ec                   uint16
 	Pad_cgo_0                    [4]byte
 }
+type ThreadContextProcInfo struct {
+	Tls_offset int32
+	Module_id  uint32
+	Dtv_info   DTVInfo
+}
 type V8ProcInfo struct {
 	Version                      uint32
 	Type_JSFunction_first        uint16
@@ -334,7 +379,7 @@ type LuaJITProcInfo struct {
 
 const (
 	Sizeof_StackDelta = 0x4
-	Sizeof_Trace      = 0x62d8
+	Sizeof_Trace      = 0x6300
 
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4
@@ -518,4 +563,8 @@ var MetricsTranslation = []metrics.MetricID{
 	0x6c: metrics.IDUnwindNativeErrNonExecutableVMA,
 	0x6d: metrics.IDUnwindLuaJITAttempts,
 	0x6e: metrics.IDUnwindLuaJITErrNoProcInfo,
+	0x71: metrics.IDUnwindThreadContextErrReadTsdBase,
+	0x72: metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
+	0x73: metrics.IDUnwindThreadContextErrReadThreadCtxAttrs,
+	0x74: metrics.IDUnwindThreadContextReadSuccesses,
 }

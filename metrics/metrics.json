@@ -2190,6 +2190,118 @@
     "id": 299
   },
   {
+    "description": "Number of asynchronous initiating traces buffered for completion correlation",
+    "type": "counter",
+    "name": "AsyncCorrelationStarts",
+    "field": "agent.async_correlation.starts",
+    "id": 300
+  },
+  {
+    "description": "Number of asynchronous completions joined to their initiating traces",
+    "type": "counter",
+    "name": "AsyncCorrelationCompletions",
+    "field": "agent.async_correlation.completions",
+    "id": 301
+  },
+  {
+    "description": "Number of duplicate asynchronous starts, including richer stack replacements",
+    "type": "counter",
+    "name": "AsyncCorrelationDuplicateStarts",
+    "field": "agent.async_correlation.duplicate_starts",
+    "id": 302
+  },
+  {
+    "description": "Number of asynchronous completions with no buffered initiating trace",
+    "type": "counter",
+    "name": "AsyncCorrelationOrphanCompletions",
+    "field": "agent.async_correlation.orphan_completions",
+    "id": 303
+  },
+  {
+    "description": "Number of asynchronous initiating traces evicted at correlator capacity",
+    "type": "counter",
+    "name": "AsyncCorrelationCapacityEvictions",
+    "field": "agent.async_correlation.capacity_evictions",
+    "id": 304
+  },
+  {
+    "description": "Number of asynchronous initiating traces evicted after their correlation TTL",
+    "type": "counter",
+    "name": "AsyncCorrelationExpirationEvictions",
+    "field": "agent.async_correlation.expiration_evictions",
+    "id": 305
+  },
+  {
+    "description": "Number of asynchronous initiating traces currently awaiting completion",
+    "type": "gauge",
+    "name": "AsyncCorrelationPending",
+    "field": "agent.async_correlation.pending",
+    "id": 306
+  },
+  {
+    "description": "Number of correlated asynchronous completions suppressed by a duration filter",
+    "type": "counter",
+    "name": "AsyncCorrelationFilteredCompletions",
+    "field": "agent.async_correlation.filtered_completions",
+    "id": 307
+  },
+  {
+    "description": "Number of TCP sequence operations missing a packet or initiating stack",
+    "type": "counter",
+    "name": "TCPSequenceCorrelationOrphans",
+    "field": "agent.tcp_sequence_correlation.orphans",
+    "id": 308
+  },
+  {
+    "description": "Number of TCP sequence correlation records removed by capacity or TTL",
+    "type": "counter",
+    "name": "TCPSequenceCorrelationEvictions",
+    "field": "agent.tcp_sequence_correlation.evictions",
+    "id": 309
+  },
+  {
+    "description": "Number of TCP sequence latencies suppressed by a duration filter",
+    "type": "counter",
+    "name": "TCPSequenceCorrelationFiltered",
+    "field": "agent.tcp_sequence_correlation.filtered",
+    "id": 310
+  },
+  {
+    "description": "Number of TCP calls and sequence ranges awaiting correlation",
+    "type": "gauge",
+    "name": "TCPSequenceCorrelationPending",
+    "field": "agent.tcp_sequence_correlation.pending",
+    "id": 311
+  },
+  {
+    "description": "Number of failures to get TSD base for thread context",
+    "type": "counter",
+    "name": "UnwindThreadContextErrReadTsdBase",
+    "field": "bpf.threadctx.errors.read_tsd_base",
+    "id": 312
+  },
+  {
+    "description": "Number of failures to read the thread context buffer",
+    "type": "counter",
+    "name": "UnwindThreadContextErrReadThreadCtxBuf",
+    "field": "bpf.threadctx.errors.read_thread_ctx_buf",
+    "id": 313
+  },
+  {
+    "description": "Number of failures to read the thread context attributes",
+    "type": "counter",
+    "name": "UnwindThreadContextErrReadThreadCtxAttrs",
+    "field": "bpf.threadctx.errors.read_thread_ctx_attrs",
+    "id": 314
+  },
+  {
+    "description": "Number of successful reads of thread context info",
+    "type": "counter",
+    "name": "UnwindThreadContextReadSuccesses",
+    "field": "bpf.threadctx.read_successes",
+    "id": 315
+  },
+  {
     "description": "Number of mapped userspace probe objects that failed symbol or build ID resolution",
     "type": "counter",
     "name": "UserspaceProbeResolutionFailures",
