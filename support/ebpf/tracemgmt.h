@@ -980,7 +980,8 @@ static inline EBPF_INLINE int collect_trace_internal(
   u64 async_threshold,
   u16 async_operation,
   u8 async_kind,
-  u8 async_attributes)
+  u8 async_attributes,
+  const UnwindState *initial_state)
 {
   // Only continue processing the trace with a valid origin.
   if (origin == 0) {
@@ -1026,10 +1027,23 @@ static inline EBPF_INLINE int collect_trace_internal(
     record->goOffsets = *go_offsets;
   }
 
-  // Recursive unwind frames
+  // Recursive unwind frames. Latency probes may retain entry registers and
+  // supply them after return-time filtering so the measured function remains
+  // the leaf frame without paying unwind cost at every entry.
   int unwinder           = PROG_UNWIND_STOP;
   bool has_usermode_regs = false;
-  ErrorCode error        = get_usermode_regs(ctx, &record->state, &has_usermode_regs);
+  ErrorCode error;
+  if (initial_state) {
+    record->state              = *initial_state;
+    // Saved snapshots hold zero-initialized bookkeeping fields. Restore the
+    // pristine-record defaults so unwind_stop does not misread error state.
+    record->state.error_metric = -1;
+    record->state.unwind_error = ERR_OK;
+    has_usermode_regs          = true;
+    error                      = ERR_OK;
+  } else {
+    error = get_usermode_regs(ctx, &record->state, &has_usermode_regs);
+  }
   if (error || !has_usermode_regs) {
     goto exit;
   }
@@ -1060,7 +1074,21 @@ exit:
 static inline EBPF_INLINE int
 collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value)
 {
-  return collect_trace_internal(ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0);
+  return collect_trace_internal(
+    ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0, NULL);
+}
+
+static inline EBPF_INLINE int collect_trace_from_state(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 value,
+  const UnwindState *initial_state)
+{
+  return collect_trace_internal(
+    ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0, initial_state);
 }
 
 static inline EBPF_INLINE int collect_async_trace(
@@ -1087,7 +1115,8 @@ static inline EBPF_INLINE int collect_async_trace(
     0,
     async_operation,
     async_kind,
-    async_attributes);
+    async_attributes,
+    NULL);
 }
 
 static inline EBPF_INLINE int collect_async_trace_with_threshold(
@@ -1115,7 +1144,8 @@ static inline EBPF_INLINE int collect_async_trace_with_threshold(
     async_threshold,
     async_operation,
     async_kind,
-    async_attributes);
+    async_attributes,
+    NULL);
 }
 
 #endif
