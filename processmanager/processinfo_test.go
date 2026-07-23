@@ -65,6 +65,8 @@ func (td *testInterpreterData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PI
 func (td *testInterpreterData) Unload(interpreter.EbpfHandler) {}
 
 type testEbpfHandler struct {
+	removedReportedPIDs       []libpf.PID
+	deletedPidInformation     []libpf.PID
 	pidPageMappingInfoUpdates []struct {
 		pid    libpf.PID
 		prefix lpm.Prefix
@@ -95,7 +97,9 @@ func (h *testEbpfHandler) DeletePidInterpreterMapping(libpf.PID, lpm.Prefix) err
 	return nil
 }
 
-func (h *testEbpfHandler) RemoveReportedPID(libpf.PID) {}
+func (h *testEbpfHandler) RemoveReportedPID(pid libpf.PID) {
+	h.removedReportedPIDs = append(h.removedReportedPIDs, pid)
+}
 
 func (h *testEbpfHandler) CoredumpTest() bool { return false }
 
@@ -133,7 +137,8 @@ func (h *testEbpfHandler) UpdatePidPageMappingInfo(pid libpf.PID, prefix lpm.Pre
 	return nil
 }
 
-func (h *testEbpfHandler) DeletePidPageMappingInfo(libpf.PID, []lpm.Prefix) (uint64, error) {
+func (h *testEbpfHandler) DeletePidPageMappingInfo(pid libpf.PID, _ []lpm.Prefix) (uint64, error) {
+	h.deletedPidInformation = append(h.deletedPidInformation, pid)
 	return 0, nil
 }
 
@@ -145,13 +150,26 @@ func (h *testEbpfHandler) SupportsLPMTrieBatchOperations() bool {
 	return false
 }
 
+func (h *testEbpfHandler) SetHeapLivePID(libpf.PID, bool) {}
+
+func (h *testEbpfHandler) DeleteHeapAllocLiveEntries(libpf.PID, []uint64) {}
+
+func (h *testEbpfHandler) DeleteHeapPIDAllocCount(libpf.PID) {}
+
+func (h *testEbpfHandler) SetHeapPIDAllocLimit(uint32) {}
+
 type testProcess struct {
 	pid      libpf.PID
+	tid      libpf.PID
 	mappings []process.RawMapping
 }
 
 func (tp *testProcess) PID() libpf.PID {
 	return tp.pid
+}
+
+func (tp *testProcess) TID() libpf.PID {
+	return tp.tid
 }
 
 func (tp *testProcess) GetMachineData() process.MachineData {

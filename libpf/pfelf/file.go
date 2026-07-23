@@ -63,6 +63,8 @@ var (
 
 	// ErrNoDebugLink is returned when debug link does not exist.
 	ErrNoDebugLink = errors.New("no debug link")
+	// ErrSectionNotPresent is returned when an optional ELF section is absent.
+	ErrSectionNotPresent = errors.New("section not present")
 
 	// ErrNoBuildID is returned if build ID is not present in notes.
 	ErrNoBuildID = errors.New("no build ID")
@@ -519,8 +521,8 @@ func (f *File) Section(name string) *Section {
 	return nil
 }
 
-// findVirtualAddressProg determines the Prog header containing the virtual address.
-func (f *File) findVirtualAddressProg(addr uint64) *Prog {
+// ProgByVirtualAddress searches the Prog header containing the virtual address.
+func (f *File) ProgByVirtualAddress(addr uint64) *Prog {
 	// Search for the Program header that contains the start address.
 	for _, ph := range f.loadData {
 		if addr >= ph.Vaddr && addr < ph.Vaddr+ph.Memsz {
@@ -537,7 +539,7 @@ func (f *File) VirtualMemory(addr int64, sz, maxSize int) ([]byte, error) {
 	if sz == 0 {
 		return nil, nil
 	}
-	if ph := f.findVirtualAddressProg(uint64(addr)); ph != nil {
+	if ph := f.ProgByVirtualAddress(uint64(addr)); ph != nil {
 		offset := addr - int64(ph.Vaddr)
 		if offset+int64(sz) <= int64(ph.Filesz) {
 			if mapping, ok := ph.elfReader.(*mmap.ReaderAt); ok {
@@ -628,10 +630,48 @@ func (f *File) VisitNotes(visitor func(uint64, []byte) bool) error {
 	return ErrNoteNotFound
 }
 
+// visitBuildIDNoteSections iterates the named ELF note sections that can contain build IDs.
+// The visitor must make copies of the 'data' it keeps after return.
+func (f *File) visitBuildIDNoteSections(visitor func(uint64, []byte) bool) error {
+	if f.InsideCore {
+		return ErrNoteNotFound
+	}
+
+	if err := f.LoadSections(); err != nil {
+		return ErrNoteNotFound
+	}
+
+	rdr := pfbufio.GetReader()
+	defer pfbufio.PutReader(rdr)
+
+	visited := false
+	buildIDSections := []string{".note.gnu.build-id", ".note.go.buildid", ".notes"}
+	for i := range f.Sections {
+		section := &f.Sections[i]
+		if section.Type != elf.SHT_NOTE || section.Size == 0 ||
+			!slices.Contains(buildIDSections, section.Name) {
+			continue
+		}
+		visited = true
+
+		rdr.Init(f.elfReader, int64(section.Offset), int64(section.Size))
+		err := visitNotes(rdr, visitor)
+		if errors.Is(err, ErrNoteNotFound) {
+			continue
+		}
+		return err
+	}
+
+	if !visited {
+		return ErrNoteNotFound
+	}
+	return nil
+}
+
 // parseNotes parses and caches the ELF notes for the File.
 func (f *File) parseNotes() error {
 	if f.notesError == errNotProcessed {
-		f.notesError = f.VisitNotes(func(note uint64, desc []byte) bool {
+		cacheNote := func(note uint64, desc []byte) bool {
 			switch note {
 			case NoteGnuBuildId:
 				f.gnuBuildId = hex.EncodeToString(desc)
@@ -639,11 +679,19 @@ func (f *File) parseNotes() error {
 				f.goBuildId = string(desc)
 			}
 			return true
-		})
-		if errors.Is(f.notesError, ErrNoteNotFound) {
-			// Visiting every note is expected here because parseNotes caches all
-			// build ID notes, which results in terminating with ErrNoteNotFound.
-			f.notesError = nil
+		}
+
+		f.notesError = f.visitBuildIDNoteSections(cacheNote)
+		if f.notesError != nil && !errors.Is(f.notesError, ErrNoteNotFound) {
+			return f.notesError
+		}
+		if f.notesError != nil || f.gnuBuildId == "" || f.goBuildId == "" {
+			f.notesError = f.VisitNotes(cacheNote)
+			if errors.Is(f.notesError, ErrNoteNotFound) {
+				// Visiting every note is expected here because parseNotes caches all
+				// build ID notes, which results in terminating with ErrNoteNotFound.
+				f.notesError = nil
+			}
 		}
 	}
 	return f.notesError
@@ -687,21 +735,6 @@ func (f *File) GoVersion() (string, error) {
 	return bi.GoVersion, nil
 }
 
-func (f *File) IsCgoEnabled() (bool, error) {
-	_, err := f.GoVersion()
-	if err != nil {
-		return false, err
-	}
-	for _, kv := range f.goBuildInfo.Settings {
-		if kv.Key == "CGO_ENABLED" {
-			return kv.Value == "1", nil
-		}
-	}
-	// On some platforms GCO_ENABLED might be missing b/c they don't support
-	// CGO at all.
-	return false, nil
-}
-
 // DebuglinkFileName returns the debug file linked by .gnu_debuglink if any
 func (f *File) DebuglinkFileName(elfFilePath string, elfOpener ELFOpener) string {
 	if f.debuglinkChecked {
@@ -725,6 +758,8 @@ const (
 	RelTLSDESC RelocType = 1 << iota
 	// RelDTPMOD64 matches DTPMOD64 relocations (R_AARCH64_TLS_DTPMOD64, R_X86_64_DTPMOD64).
 	RelDTPMOD64
+	// RelTPOFF64 matches TP-relative relocations (R_AARCH64_TLS_TPREL64, R_X86_64_TPOFF64)
+	RelTPOFF64
 )
 
 // classifyRelocAarch64 returns the RelocType for an AARCH64 relocation.
@@ -734,6 +769,8 @@ func classifyRelocAarch64(rela ElfReloc) RelocType {
 		return RelTLSDESC
 	case elf.R_AARCH64_TLS_DTPMOD64:
 		return RelDTPMOD64
+	case elf.R_AARCH64_TLS_TPREL64:
+		return RelTPOFF64
 	default:
 		return 0
 	}
@@ -746,6 +783,8 @@ func classifyRelocX86_64(rela ElfReloc) RelocType {
 		return RelTLSDESC
 	case elf.R_X86_64_DTPMOD64:
 		return RelDTPMOD64
+	case elf.R_X86_64_TPOFF64:
+		return RelTPOFF64
 	default:
 		return 0
 	}
@@ -755,13 +794,15 @@ func classifyRelocX86_64(rela ElfReloc) RelocType {
 // for the TLS symbol, as well as a best-effort string for the symbol's name.
 // It continues until the visitor returns false.
 func (f *File) VisitTLSRelocations(visitor func(ElfReloc, string) bool) error {
-	return f.VisitRelocations(visitor, RelTLSDESC)
+	return f.VisitRelocations(func(r ElfReloc, name string, _ RelocType) bool {
+		return visitor(r, name)
+	}, RelTLSDESC)
 }
 
 // VisitRelocations visits all relocations whose type matches the relTypes
-// bitmask and provides the relocation and symbol name to the visitor. The
-// visitor can return false to stop iteration.
-func (f *File) VisitRelocations(visitor func(ElfReloc, string) bool,
+// bitmask and provides the relocation, symbol name and matched RelocType to the
+// visitor. The visitor can return false to stop iteration.
+func (f *File) VisitRelocations(visitor func(ElfReloc, string, RelocType) bool,
 	relTypes RelocType) error {
 	var classify func(ElfReloc) RelocType
 	switch f.Machine {
@@ -772,9 +813,6 @@ func (f *File) VisitRelocations(visitor func(ElfReloc, string) bool,
 	default:
 		return nil
 	}
-	filterFunc := func(rela ElfReloc) bool {
-		return classify(rela)&relTypes != 0
-	}
 	var err error
 	if err = f.LoadSections(); err != nil {
 		return err
@@ -784,7 +822,7 @@ func (f *File) VisitRelocations(visitor func(ElfReloc, string) bool,
 		section := &f.Sections[i]
 		// NOTE: SHT_REL is not relevant for the archs that we care about
 		if section.Type == elf.SHT_RELA {
-			cont, err := f.visitRelocationsForSection(visitor, filterFunc, section)
+			cont, err := f.visitRelocationsForSection(visitor, classify, relTypes, section)
 			if err != nil {
 				return err
 			}
@@ -797,8 +835,8 @@ func (f *File) VisitRelocations(visitor func(ElfReloc, string) bool,
 	return nil
 }
 
-func (f *File) visitRelocationsForSection(visitor func(ElfReloc, string) bool,
-	checkRelocation func(ElfReloc) bool,
+func (f *File) visitRelocationsForSection(visitor func(ElfReloc, string, RelocType) bool,
+	classify func(ElfReloc) RelocType, relTypes RelocType,
 	relaSection *Section,
 ) (bool, error) {
 	if relaSection.Link >= uint32(len(f.Sections)) {
@@ -841,7 +879,8 @@ func (f *File) visitRelocationsForSection(visitor func(ElfReloc, string) bool,
 			}
 			break
 		}
-		if !checkRelocation(*rela) {
+		relType := classify(*rela)
+		if relType&relTypes == 0 {
 			continue
 		}
 		symNo := int64(rela.Info >> 32)
@@ -855,7 +894,7 @@ func (f *File) visitRelocationsForSection(visitor func(ElfReloc, string) bool,
 			return false, errors.New("failed to get relocation name string")
 		}
 
-		if !visitor(*rela, symStr) {
+		if !visitor(*rela, symStr, relType) {
 			return false, nil
 		}
 	}
@@ -1032,7 +1071,7 @@ func (f *File) ReadAt(p []byte, addr int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if ph := f.findVirtualAddressProg(uint64(addr)); ph != nil {
+	if ph := f.ProgByVirtualAddress(uint64(addr)); ph != nil {
 		return ph.ReadAt(p, addr-int64(ph.Vaddr))
 	}
 	return 0, fmt.Errorf("no matching segment for 0x%x", uint64(addr))
@@ -1071,6 +1110,7 @@ func (f *File) readAndMatchSymbol(n uint32, name libpf.SymbolName) (libpf.Symbol
 		Name:    name,
 		Address: libpf.SymbolValue(sym.Value),
 		Size:    sym.Size,
+		Info:    sym.Info,
 	}, true
 }
 
@@ -1203,7 +1243,7 @@ func (f *File) LookupSymbolAddress(symbol libpf.SymbolName) (libpf.SymbolValue, 
 func (f *File) visitSymbolTable(name string, visitor func(libpf.Symbol) bool) error {
 	symTab := f.Section(name)
 	if symTab == nil {
-		return fmt.Errorf("failed to read %v: section not present", name)
+		return fmt.Errorf("failed to read %v: %w", name, ErrSectionNotPresent)
 	}
 	if symTab.Link >= uint32(len(f.Sections)) {
 		return fmt.Errorf("failed to read %v strtab: link %v out of range",
@@ -1231,6 +1271,7 @@ func (f *File) visitSymbolTable(name string, visitor func(libpf.Symbol) bool) er
 				Name:    libpf.SymbolName(name),
 				Address: libpf.SymbolValue(sym.Value),
 				Size:    sym.Size,
+				Info:    sym.Info,
 			}) {
 				break
 			}
@@ -1272,6 +1313,31 @@ func (f *File) DynString(tag elf.DynTag) ([]string, error) {
 		dynStrings = append(dynStrings, rm.String(strAddr))
 	}
 	return dynStrings, nil
+}
+
+// DynValue returns the values listed for the given tag in the file's dynamic
+// program header. It returns an empty slice (and no error) when the tag is not
+// present.
+func (f *File) DynValue(tag elf.DynTag) ([]uint64, error) {
+	var vals []uint64
+	for i := range f.Progs {
+		p := &f.Progs[i]
+		if p.ProgHeader.Type != elf.PT_DYNAMIC || p.Filesz <= 0 {
+			continue
+		}
+		rdr := pfbufio.NewReader(f.elfReader, int64(p.Off), int64(p.Filesz))
+		var dyn elf.Dyn64
+		for {
+			if _, err := rdr.Read(pfunsafe.FromPointer(&dyn)); err != nil {
+				break
+			}
+			if elf.DynTag(dyn.Tag) == tag {
+				vals = append(vals, dyn.Val)
+			}
+		}
+		pfbufio.PutReader(rdr)
+	}
+	return vals, nil
 }
 
 // IsGolang determines if this ELF is a Golang executable

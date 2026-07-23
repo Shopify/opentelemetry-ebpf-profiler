@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/pacmask"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 
@@ -29,8 +30,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// sysConfigVars supports collecting system configuration information.
-type sysConfigVars struct {
+// SysConfigVars supports collecting system configuration information.
+type SysConfigVars struct {
+	inverse_pac_mask    uint64
 	tpbase_offset       uint64
 	task_stack_offset   uint32
 	stack_ptregs_offset uint32
@@ -109,7 +111,7 @@ func getTSDBaseFieldSpec() string {
 	}
 }
 
-func parseVMAOffsets(spec *btf.Spec, vars *sysConfigVars) {
+func parseVMAOffsets(spec *btf.Spec, vars *SysConfigVars) {
 	var vmaStruct *btf.Struct
 	if err := spec.TypeByName("vm_area_struct", &vmaStruct); err != nil {
 		log.Debugf("Unable to resolve vm_area_struct from BTF: %v", err)
@@ -136,7 +138,7 @@ func parseVMAOffsets(spec *btf.Spec, vars *sysConfigVars) {
 }
 
 // parseBTF resolves the SystemConfig data from kernel BTF
-func parseBTF(vars *sysConfigVars) error {
+func parseBTF(vars *SysConfigVars) error {
 	fh, err := os.Open("/sys/kernel/btf/vmlinux")
 	if err != nil {
 		return err
@@ -269,7 +271,7 @@ func readTaskStruct(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
 // determineStackPtregs determines the offset of `struct pt_regs` within the entry stack
 // when the `stack` field offset within `task_struct` is already known.
 func determineStackPtregs(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
-	vars *sysConfigVars,
+	vars *SysConfigVars,
 ) error {
 	data, ptregs, err := readTaskStruct(coll, maps, libpf.SymbolValue(vars.task_stack_offset))
 	if err != nil {
@@ -283,7 +285,7 @@ func determineStackPtregs(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map
 // determineStackLayout scans `task_struct` for offset of the `stack` field, and using
 // its value determines the offset of `struct pt_regs` within the entry stack.
 func determineStackLayout(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
-	vars *sysConfigVars,
+	vars *SysConfigVars,
 ) error {
 	const maxTaskStructSize = 8 * 1024
 	const maxStackSize = 64 * 1024
@@ -342,7 +344,7 @@ func prepareAnalysis(orig *cebpf.CollectionSpec) (*cebpf.CollectionSpec, map[str
 }
 
 func determineSysConfig(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
-	kmod *kallsyms.Module, interpretersConfig interpreterconfig.Config, vars *sysConfigVars,
+	kmod *kallsyms.Module, interpretersConfig interpreterconfig.Config, vars *SysConfigVars,
 ) error {
 	if err := parseBTF(vars); err != nil {
 		log.Infof("Using binary analysis (BTF not available: %s)", err)
@@ -352,7 +354,7 @@ func determineSysConfig(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
 		}
 
 		if !interpretersConfig.Perl.IsDisabled() || !interpretersConfig.Python.IsDisabled() ||
-			!interpretersConfig.Labels.IsDisabled() {
+			!interpretersConfig.Go.IsLabelsDisabled() || !interpretersConfig.ThreadContext.IsDisabled() {
 			var tpbaseOffset uint64
 			tpbaseOffset, err = loadTPBaseOffset(coll, maps, kmod)
 			if err != nil {
@@ -370,7 +372,7 @@ func determineSysConfig(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
 		}
 	}
 
-	log.Infof("Found offsets: task stack %#x, pt_regs %#x, tpbase %#x, vma vm_file %#x, vma vm_flags %#x",
+	log.Debugf("Found offsets: task stack %#x, pt_regs %#x, tpbase %#x, vma vm_file %#x, vma vm_flags %#x",
 		vars.task_stack_offset,
 		vars.stack_ptregs_offset,
 		vars.tpbase_offset,
@@ -380,7 +382,7 @@ func determineSysConfig(coll *cebpf.CollectionSpec, maps map[string]*cebpf.Map,
 	return nil
 }
 
-func configureVMALookup(coll *cebpf.CollectionSpec, cfg *Config, vars *sysConfigVars) {
+func configureVMALookup(coll *cebpf.CollectionSpec, cfg *Config, vars *SysConfigVars) {
 	enabled, reason := probeVMALookupSupport(cfg)
 	vars.vma_lookup_enabled = enabled
 	if enabled {
@@ -500,7 +502,7 @@ func stripProgramExtInfos(insns asm.Instructions) {
 
 // loadRodataVars initializes RODATA variables for the eBPF programs.
 func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Config,
-	major, minor uint32,
+	major, minor uint32, origins *originRegistry, out *SysConfigVars,
 ) error {
 	if cfg.VerboseMode {
 		if err := coll.Variables["with_debug_output"].Set(uint32(1)); err != nil {
@@ -518,12 +520,21 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 		}
 	}
 
+	if err := setOriginIDs(coll, cfg, origins); err != nil {
+		return err
+	}
+
 	if err := coll.Variables["off_cpu_threshold"].Set(cfg.OffCPUThreshold); err != nil {
 		return fmt.Errorf("failed to set off_cpu_threshold: %v", err)
 	}
 
 	if err := coll.Variables["filter_error_frames"].Set(cfg.FilterErrorFrames); err != nil {
 		return fmt.Errorf("failed to set drop_error_only_traces: %v", err)
+	}
+
+	if err := coll.Variables["go_labels_disabled"].Set(
+		cfg.InterpretersConfig.Go.IsLabelsDisabled()); err != nil {
+		return fmt.Errorf("failed to set go_labels_disabled: %v", err)
 	}
 
 	if err := coll.Variables["filter_idle_frames"].Set(cfg.FilterIdleFrames); err != nil {
@@ -536,7 +547,7 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 
 	pacMask := pacmask.GetPACMask()
 	if pacMask != 0 {
-		log.Infof("Determined PAC mask to be 0x%016X", pacMask)
+		log.Debugf("Determined PAC mask to be 0x%016X", pacMask)
 	} else {
 		log.Debug("PAC is not enabled on the system.")
 	}
@@ -544,7 +555,7 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 		return fmt.Errorf("failed to set inverse_pac_mask: %v", err)
 	}
 
-	rodataVars := sysConfigVars{}
+	rodataVars := SysConfigVars{inverse_pac_mask: ^pacMask}
 	configureVMALookup(coll, cfg, &rodataVars)
 
 	systemAnalysisColl, maps, err := prepareAnalysis(coll)
@@ -572,6 +583,80 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 	}
 	if err := coll.Variables["vma_vm_flags_offset"].Set(rodataVars.vma_vm_flags_offset); err != nil {
 		return fmt.Errorf("failed to set vma_vm_flags_offset: %v", err)
+	}
+
+	*out = rodataVars
+	return nil
+}
+
+// setOriginIDs assigns an origin ID to every kind of sample the tracer's
+// eBPF programs can produce and writes each ID into the corresponding
+// RODATA variable. Sampling is always active. Off-CPU and probe profiling
+// only get one if enabled.
+// TODO: this is a temporary helper and will be removed once tracer manages
+// custom probes.
+func setOriginIDs(coll *cebpf.CollectionSpec, cfg *Config, origins *originRegistry) error {
+	sampling, err := origins.register(&samples.TypeMetadata{
+		PeriodType: "cpu",
+		PeriodUnit: "nanoseconds",
+		SampleType: "samples",
+		SampleUnit: "count",
+	})
+	if err != nil {
+		return err
+	}
+	if err := coll.Variables["origin_id_sampling"].Set(sampling); err != nil {
+		return fmt.Errorf("failed to set origin_id_sampling: %v", err)
+	}
+
+	if cfg.OffCPUThreshold > 0 {
+		offCPU, err := origins.register(&samples.TypeMetadata{
+			SampleType:   "off_cpu",
+			SampleUnit:   "nanoseconds",
+			ReportValues: true,
+		})
+		if err != nil {
+			return err
+		}
+		if err := coll.Variables["origin_id_off_cpu"].Set(uint16(offCPU)); err != nil {
+			return fmt.Errorf("failed to set origin_id_off_cpu: %v", err)
+		}
+	}
+
+	// ProbeLinks use the generic eBPF program loaded at startup and need their
+	// origin ID baked into RODATA here. Custom probes (the Enable path) skip
+	// this block: they register their own origin IDs dynamically in Tracer.Enable
+	// before calling Probe.Load, so LoadProbe alone does not require a static ID.
+	if len(cfg.ProbeLinks) > 0 {
+		probe, err := origins.register(&samples.TypeMetadata{
+			SampleType: "events",
+			SampleUnit: "count",
+		})
+		if err != nil {
+			return err
+		}
+		if err := coll.Variables["origin_id_probe"].Set(uint16(probe)); err != nil {
+			return fmt.Errorf("failed to set origin_id_probe: %v", err)
+		}
+	}
+
+	if cfg.HeapProfiling {
+		if err := origins.registerFixed(support.TraceOriginHeapAlloc, &samples.TypeMetadata{
+			SampleType:   "alloc_space",
+			SampleUnit:   "bytes",
+			ReportValues: true,
+		}); err != nil {
+			return err
+		}
+	}
+	if cfg.LiveHeapProfiling {
+		if err := origins.registerFixed(support.TraceOriginHeapFree, &samples.TypeMetadata{
+			SampleType:   "heap_free",
+			SampleUnit:   "bytes",
+			ReportValues: true,
+		}); err != nil {
+			return err
+		}
 	}
 
 	return nil

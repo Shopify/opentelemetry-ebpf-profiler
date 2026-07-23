@@ -4,7 +4,10 @@
 package libpf // import "go.opentelemetry.io/ebpf-profiler/libpf"
 
 import (
+	"hash/maphash"
 	"unique"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"go.opentelemetry.io/ebpf-profiler/stringutil"
 )
@@ -128,6 +131,38 @@ type Trace struct {
 	Frames       Frames
 }
 
+// TraceEventKind identifies an ordinary trace or an asynchronous lifecycle phase.
+type TraceEventKind uint8
+
+const (
+	TraceEventNormal TraceEventKind = iota
+	TraceEventAsyncStart
+	TraceEventAsyncComplete
+	TraceEventAsyncRegister
+	TraceEventAsyncProgress
+)
+
+// AsyncKind identifies the subsystem that emitted an asynchronous lifecycle event.
+type AsyncKind uint8
+
+const (
+	AsyncKindNone AsyncKind = iota
+	AsyncKindIOUring
+	AsyncKindBlock
+	AsyncKindTCPConnect
+	AsyncKindTCPAck
+	AsyncKindTCPReceive
+)
+
+// AsyncAttributes are lifecycle attributes carried by asynchronous events.
+type AsyncAttributes uint8
+
+const (
+	AsyncAttrMore AsyncAttributes = 1 << iota
+	AsyncAttrSQPoll
+	AsyncAttrFiltered
+)
+
 // EbpfTrace represents a stack trace from Ebpf code.
 type EbpfTrace struct {
 	EnvVars          map[String]String
@@ -140,14 +175,26 @@ type EbpfTrace struct {
 	KernelFrames     Frames
 	FrameDataBuf     [3072]uint64
 	Value            int64
+	Ptr              uint64
+	Size             uint64
 	KTime            int64
+	CorrelationID    uint64
+	AsyncUserData    uint64
+	AsyncThreshold   uint64
+	AsyncResult      int64
+	AsyncFlags       uint32
+	AsyncOperation   uint16
+	EventKind        TraceEventKind
+	AsyncKind        AsyncKind
+	AsyncAttributes  AsyncAttributes
 	CpuID            uint32
 	TID              PID
 	PID              PID
 	NumFrames        uint16
-	Origin           Origin
+	Origin           uint16
 	APMTraceID       APMTraceID
 	APMTransactionID APMTransactionID
+	Resource         *pcommon.Resource
 }
 
 type EbpfFrame []uint64
@@ -187,4 +234,21 @@ func (f EbpfFrame) NumVariables() uint8 {
 
 func (f EbpfFrame) Variable(ndx int) uint64 {
 	return f[ndx+1]
+}
+
+var labelsHashSeed = maphash.MakeSeed()
+
+// HashLabels returns a 64-bit order-independent hash of a labels map.
+// Uses XOR of per-entry hashes so map iteration order is irrelevant.
+func HashLabels(labels map[String]String) uint64 {
+	var sum uint64
+	var h maphash.Hash
+	h.SetSeed(labelsHashSeed)
+	for k, v := range labels {
+		maphash.WriteComparable(&h, k)
+		maphash.WriteComparable(&h, v)
+		sum ^= h.Sum64()
+		h.Reset()
+	}
+	return sum
 }

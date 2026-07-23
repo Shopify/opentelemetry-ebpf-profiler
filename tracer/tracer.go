@@ -17,22 +17,27 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unique"
 	"unsafe"
 
 	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
+	lru "github.com/elastic/go-freelru"
 	"github.com/elastic/go-perf"
 	"go.opentelemetry.io/ebpf-profiler/internal/linux"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 
 	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind/elfunwindinfo"
 	"go.opentelemetry.io/ebpf-profiler/periodiccaller"
@@ -42,6 +47,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/times"
+	"go.opentelemetry.io/ebpf-profiler/usdt"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -52,6 +58,9 @@ const (
 	// ProbabilisticThresholdMax defines the upper bound of the probabilistic profiling
 	// threshold.
 	ProbabilisticThresholdMax = 100
+
+	// Maximum size of the LRU cache for symbolized kernel frames.
+	kernelFrameCacheSize = 16384
 )
 
 // Constants that define the status of probabilistic profiling.
@@ -63,6 +72,7 @@ const (
 // Names of tracepoint hooks for sched_process_free. There are two hooks
 // as the tracepoint format has changed for kernel versions 6.16+.
 const (
+	schedProcessExec   = "tracepoint__sched_process_exec"
 	schedProcessFreeV1 = "tracepoint__sched_process_free_pre616"
 	schedProcessFreeV2 = "tracepoint__sched_process_free"
 )
@@ -84,6 +94,11 @@ type Intervals interface {
 // onlineCPUs once resolves and caches the list of online CPUs.
 var onlineCPUsOnce = sync.OnceValues(getOnlineCPUIDs)
 
+type kernelFrameCacheValue struct {
+	generation kallsyms.Generation
+	frame      unique.Handle[libpf.Frame]
+}
+
 // Tracer provides an interface for loading and initializing the eBPF components as
 // well as for monitoring the output maps for new traces and count updates.
 type Tracer struct {
@@ -94,6 +109,10 @@ type Tracer struct {
 
 	// kernelSymbolizer does kernel fallback symbolization
 	kernelSymbolizer *kallsyms.Symbolizer
+
+	// kernelFrameCache stores kernel address to symbolized frame mappings.
+	// Values carry the symbol source generation used to produce the frame.
+	kernelFrameCache *lru.LRU[libpf.Address, kernelFrameCacheValue]
 
 	// perfEntrypoints holds a list of frequency based perf events that are opened on the system.
 	perfEntrypoints xsync.RWMutex[[]*perf.Event]
@@ -106,8 +125,13 @@ type Tracer struct {
 	// associated eBPF maps.
 	processManager *pm.ProcessManager
 
-	// tracePool is cache of libpf.EbpfTrace to avoid GC pressure
+	// tracePool is cache of libpf.EbpfTrace to avoid GC pressure.
 	tracePool sync.Pool
+
+	// asyncCorrelator retains compact initiating traces until their completion.
+	asyncCorrelator *asyncTraceCorrelator
+	// tcpSequenceCorrelator joins byte ranges to cumulative ACK/read progress.
+	tcpSequenceCorrelator *tcpSequenceCorrelator
 
 	// triggerPIDProcessing is used as manual trigger channel to request immediate
 	// processing of pending PIDs. This is requested on notifications from eBPF code
@@ -136,6 +160,41 @@ type Tracer struct {
 	// tracks how many were dropped due to invalid UTF-8.
 	customLabels customLabelValidator
 
+	// PID event processor lifecycle is owned by Tracer so Close can stop and
+	// drain it even when the caller has not yet cancelled the parent context.
+	pidEventsMu      sync.Mutex
+	pidEventsCancel  context.CancelFunc
+	pidEventsDone    chan struct{}
+	pidEventsStarted bool
+	pidEventsClosed  bool
+
+	// liveHeapTracker tracks live (in-use) heap allocations by correlating
+	// alloc and free events. Nil when live heap profiling is disabled.
+	liveHeapTracker *liveheap.Tracker
+
+	// sysConfigVars holds kernel struct offsets determined at startup, passed
+	// to custom probes via Enable so they can reference the same layout.
+	sysConfigVars SysConfigVars
+
+	// kprobeChainLoaded records whether the kprobe tail-call unwinder chain was
+	// loaded at startup. Enable requires this; without it a custom probe's tail
+	// calls into kprobe_progs silently miss at runtime.
+	kprobeChainLoaded bool
+
+	// origins is the tracer-wide registry origin IDs are assigned from and
+	// profile type metadata is looked up by.
+	origins *originRegistry
+
+	// traceLabelers maps an origin ID (uint16) to the TraceLabeler of the
+	// probe that owns it. Registered in Enable, read on the trace path.
+	traceLabelers sync.Map
+
+	// probeMetricCollectors are registered dynamically by custom probes.
+	probeMetricsMu        sync.RWMutex
+	probeMetricCollectors map[uint64]*probeMetricCollector
+	pendingProbeMetrics   metrics.Summary
+	nextProbeMetricID     uint64
+
 	// done is closed when the tracer encounters an unrecoverable error.
 	// Use Done() to obtain a read-only channel for use in select statements.
 	done     chan libpf.Void
@@ -147,6 +206,11 @@ type Tracer struct {
 // when the tracer should be stopped.
 func (t *Tracer) Done() <-chan libpf.Void {
 	return t.done
+}
+
+// ProcessManager returns the process manager for accessing per-PID metadata.
+func (t *Tracer) ProcessManager() *pm.ProcessManager {
+	return t.processManager
 }
 
 // signalDone closes the done channel to indicate an unrecoverable error.
@@ -169,6 +233,14 @@ type Config struct {
 	SamplesPerSecond int
 	// MapScaleFactor is the scaling factor for eBPF map sizes.
 	MapScaleFactor int
+	// FrameCacheSize is the maximum size of the user-mode frame cache.
+	FrameCacheSize uint32
+	// AsyncCorrelationCapacity bounds initiating traces awaiting completions.
+	// Zero uses the default.
+	AsyncCorrelationCapacity int
+	// AsyncCorrelationTTL expires initiating traces whose completion never arrives.
+	// Zero uses the default.
+	AsyncCorrelationTTL time.Duration
 	// FilterErrorFrames indicates whether error frames should be filtered.
 	FilterErrorFrames bool
 	// FilterIdleFrames indicates whether idle frames should be filtered.
@@ -194,6 +266,19 @@ type Config struct {
 	// LoadProbe indicates whether the generic eBPF program should be loaded
 	// without being attached to something.
 	LoadProbe bool
+	// HeapProfiling enables loading of the heap USDT uprobe entry programs
+	// and per-process attach via the usdt package.
+	HeapProfiling bool
+	// LiveHeapProfiling additionally tracks deallocations so the live
+	// (in-use) heap can be reported, by loading and attaching the heap free
+	// USDT probe alongside the alloc probe. Requires HeapProfiling.
+	LiveHeapProfiling bool
+	// LiveHeapTracker is the shared tracker instance for live heap profiling.
+	// Created externally and shared with the reporter. May be nil.
+	LiveHeapTracker *liveheap.Tracker
+	// LiveHeapMaxEntriesPerPID is the per-process cap on live heap entries
+	// enforced in the eBPF map. 0 means no per-PID limit.
+	LiveHeapMaxEntriesPerPID int
 	// BPFFSRoot is the root path to BPF filesystem for pinned maps and programs.
 	BPFFSRoot string
 	// OBIProcessCtx enable the use of a known shared eBPF map with OBI.
@@ -205,16 +290,16 @@ type hookPoint struct {
 	group, name string
 }
 
-// progLoaderHelper supports the loading process of eBPF programs.
-type progLoaderHelper struct {
-	// enable tells whether a prog shall be loaded.
-	enable bool
-	// name of the eBPF program
-	name string
-	// progID defines the ID for the eBPF program that is used as key in the tailcallMap.
-	progID uint32
-	// noTailCallTarget indicates if this eBPF program should be added to the tailcallMap.
-	noTailCallTarget bool
+// ProgLoaderHelper supports the loading process of eBPF programs.
+type ProgLoaderHelper struct {
+	// Enable tells whether a prog shall be loaded.
+	Enable bool
+	// Name of the eBPF program
+	Name string
+	// ProgID defines the ID for the eBPF program that is used as key in the tailcallMap.
+	ProgID uint32
+	// NoTailCallTarget indicates if this eBPF program should be added to the tailcallMap.
+	NoTailCallTarget bool
 }
 
 // schedProcessFreeHookName returns the name of the tracepoint hook to use.
@@ -237,18 +322,36 @@ func newTracePool() sync.Pool {
 
 // NewTracer loads eBPF code and map definitions from the ELF module at the configured path.
 func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
+	if cfg.LiveHeapProfiling && !cfg.HeapProfiling {
+		return nil, errors.New("live heap profiling requires heap profiling to be enabled")
+	}
+	asyncCapacity := cfg.AsyncCorrelationCapacity
+	if asyncCapacity == 0 {
+		asyncCapacity = defaultAsyncCorrelationCapacity
+	} else if asyncCapacity < 0 {
+		return nil, fmt.Errorf("async correlation capacity must not be negative")
+	}
+	asyncTTL := cfg.AsyncCorrelationTTL
+	if asyncTTL == 0 {
+		asyncTTL = defaultAsyncCorrelationTTL
+	} else if asyncTTL < 0 {
+		return nil, fmt.Errorf("async correlation TTL must not be negative")
+	}
+
 	kernelSymbolizer, err := kallsyms.NewSymbolizer()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read kernel symbols: %v", err)
 	}
 
-	kmod, err := kernelSymbolizer.GetModuleByName(kallsyms.Kernel)
+	kmod, err := kernelSymbolizer.Snapshot().GetModuleByName(kallsyms.Kernel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read kernel symbols: %v", err)
 	}
 
+	origins := &originRegistry{}
+	var sysConfigVars SysConfigVars
 	// Based on includeTracers we decide later which are loaded into the kernel.
-	ebpfMaps, ebpfProgs, stackdeltaInnerMapSpec, err := initializeMapsAndPrograms(kmod, cfg)
+	ebpfMaps, ebpfProgs, stackdeltaInnerMapSpec, err := initializeMapsAndPrograms(kmod, cfg, origins, &sysConfigVars)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF code: %v", err)
 	}
@@ -258,21 +361,64 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		return nil, fmt.Errorf("failed to load eBPF maps: %v", err)
 	}
 
-	processManager, err := pm.New(ctx, cfg.InterpretersConfig, cfg.Intervals.MonitorInterval(),
-		cfg.Intervals.ExecutableUnloadDelay(), ebpfHandler, cfg.TraceReporter, cfg.ExecutableReporter,
-		elfunwindinfo.NewStackDeltaProvider(),
-		cfg.FilterErrorFrames, cfg.IncludeEnvVars)
+	if cfg.LiveHeapMaxEntriesPerPID > 0 {
+		ebpfHandler.SetHeapPIDAllocLimit(uint32(cfg.LiveHeapMaxEntriesPerPID))
+	}
+
+	// Set up memory profiling.
+	var usdtMgr *usdt.Manager
+	if cfg.HeapProfiling {
+		usdtProgs := map[usdt.ProbeKind]*cebpf.Program{}
+		if p, ok := ebpfProgs["uprobe_heap_alloc"]; ok {
+			usdtProgs[usdt.ProbeHeapAlloc] = p
+		}
+		// Only register the free probe when live heap profiling is opted
+		// into; without it the program is not loaded and frees are never
+		// instrumented.
+		if p, ok := ebpfProgs["uprobe_heap_free"]; ok && cfg.LiveHeapProfiling {
+			usdtProgs[usdt.ProbeHeapFree] = p
+		}
+		if usdtMgr, err = usdt.NewManager(usdtProgs); err != nil {
+			return nil, fmt.Errorf("failed to build USDT manager: %w", err)
+		}
+	}
+
+	liveTracker := cfg.LiveHeapTracker
+
+	processManager, err := pm.New(ctx, pm.Config{
+		InterpretersConfig:    cfg.InterpretersConfig,
+		MonitorInterval:       cfg.Intervals.MonitorInterval(),
+		ExecutableUnloadDelay: cfg.Intervals.ExecutableUnloadDelay(),
+		EbpfHandler:           ebpfHandler,
+		TraceReporter:         cfg.TraceReporter,
+		ExecutableReporter:    cfg.ExecutableReporter,
+		StackDeltaProvider:    elfunwindinfo.NewStackDeltaProvider(),
+		FrameCacheSize:        cfg.FrameCacheSize,
+		FilterErrorFrames:     cfg.FilterErrorFrames,
+		IncludeEnvVars:        cfg.IncludeEnvVars,
+		USDTManager:           usdtMgr,
+		LiveHeapTracker:       liveTracker,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create processManager: %v", err)
+	}
+
+	kernelFrameCache, err := lru.New[libpf.Address, kernelFrameCacheValue](
+		kernelFrameCacheSize, libpf.Address.Hash32)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create kernelFrameCache: %v", err)
 	}
 
 	perfEventList := []*perf.Event{}
 
 	tracer := &Tracer{
 		kernelSymbolizer:       kernelSymbolizer,
+		kernelFrameCache:       kernelFrameCache,
 		processManager:         processManager,
 		triggerPIDProcessing:   make(chan bool, 1),
 		tracePool:              newTracePool(),
+		asyncCorrelator:        newAsyncTraceCorrelator(asyncCapacity, asyncTTL),
+		tcpSequenceCorrelator:  newTCPSequenceCorrelator(asyncCapacity, asyncTTL),
 		pidEvents:              make(chan libpf.PIDTID, pidEventBufferSize),
 		ebpfMaps:               ebpfMaps,
 		ebpfProgs:              ebpfProgs,
@@ -282,7 +428,14 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		samplesPerSecond:       cfg.SamplesPerSecond,
 		probabilisticInterval:  cfg.ProbabilisticInterval,
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
+		pidEventsDone:          make(chan struct{}),
+		liveHeapTracker:        liveTracker,
 		done:                   make(chan libpf.Void),
+		origins:                origins,
+		probeMetricCollectors:  make(map[uint64]*probeMetricCollector),
+		pendingProbeMetrics:    make(metrics.Summary),
+		sysConfigVars:          sysConfigVars,
+		kprobeChainLoaded:      kprobeChainRequired(cfg),
 	}
 
 	return tracer, nil
@@ -303,15 +456,31 @@ func (t *Tracer) Close() {
 		}
 		delete(t.hooks, hookPoint)
 	}
+	// Dynamic probes retain final counter deltas while unregistering. Flush
+	// those deltas before tracer shutdown removes the last collection source.
+	metrics.AddSlice(t.collectProbeMetrics())
+
+	// Stop and drain PID processing before ProcessManager tears down USDT links.
+	// This is safe even when the processor was never started.
+	t.stopPIDEventProcessor()
 
 	t.processManager.Close()
 	t.kernelSymbolizer.Close()
 	t.signalDone()
 }
 
+// kprobeChainRequired reports whether the kprobe tail-call unwinder chain must be loaded.
+// It is the single source of truth consulted both during initialization and when recording
+// kprobeChainLoaded on the Tracer.
+func kprobeChainRequired(cfg *Config) bool {
+	return cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe || cfg.HeapProfiling
+}
+
 // initializeMapsAndPrograms loads the definitions for the eBPF maps and programs provided
 // by the embedded elf file and loads these into the kernel.
-func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
+func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *originRegistry,
+	sysVars *SysConfigVars,
+) (
 	ebpfMaps map[string]*cebpf.Map, ebpfProgs map[string]*cebpf.Program,
 	stackdeltaInnerMapSpec *cebpf.MapSpec, err error,
 ) {
@@ -330,6 +499,7 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to load specification for tracers: %v", err)
 	}
+	removeDynamicProbeResources(coll)
 
 	if major > 6 || (major == 6 && minor >= 16) {
 		// Tracepoint format for sched_process_free has changed in v6.16+.
@@ -339,7 +509,7 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 	}
 
 	// Initialize eBPF variables before loading programs and maps.
-	if err = loadRodataVars(coll, kmod, cfg, major, minor); err != nil {
+	if err = loadRodataVars(coll, kmod, cfg, major, minor, origins, sysVars); err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to set RODATA variables: %v", err)
 	}
 
@@ -384,71 +554,71 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 		}
 	}
 
-	tailCallProgs := []progLoaderHelper{
+	tailCallProgs := []ProgLoaderHelper{
 		{
-			progID: uint32(support.ProgUnwindStop),
-			name:   "unwind_stop",
-			enable: true,
+			ProgID: uint32(support.ProgUnwindStop),
+			Name:   "unwind_stop",
+			Enable: true,
 		},
 		{
-			progID: uint32(support.ProgUnwindNative),
-			name:   "unwind_native",
-			enable: true,
+			ProgID: uint32(support.ProgUnwindNative),
+			Name:   "unwind_native",
+			Enable: true,
 		},
 		{
-			progID: uint32(support.ProgUnwindHotspot),
-			name:   "unwind_hotspot",
-			enable: !cfg.InterpretersConfig.Hotspot.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindHotspot),
+			Name:   "unwind_hotspot",
+			Enable: !cfg.InterpretersConfig.Hotspot.IsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgUnwindPerl),
-			name:   "unwind_perl",
-			enable: !cfg.InterpretersConfig.Perl.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindPerl),
+			Name:   "unwind_perl",
+			Enable: !cfg.InterpretersConfig.Perl.IsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgUnwindPHP),
-			name:   "unwind_php",
-			enable: !cfg.InterpretersConfig.PHP.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindPHP),
+			Name:   "unwind_php",
+			Enable: !cfg.InterpretersConfig.PHP.IsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgUnwindPython),
-			name:   "unwind_python",
-			enable: !cfg.InterpretersConfig.Python.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindPython),
+			Name:   "unwind_python",
+			Enable: !cfg.InterpretersConfig.Python.IsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgUnwindRuby),
-			name:   "unwind_ruby",
-			enable: !cfg.InterpretersConfig.Ruby.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindRuby),
+			Name:   "unwind_ruby",
+			Enable: !cfg.InterpretersConfig.Ruby.IsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgUnwindV8),
-			name:   "unwind_v8",
-			enable: !cfg.InterpretersConfig.V8.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindV8),
+			Name:   "unwind_v8",
+			Enable: !cfg.InterpretersConfig.V8.IsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgUnwindDotnet),
-			name:   "unwind_dotnet",
-			enable: !cfg.InterpretersConfig.Dotnet.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindDotnet),
+			Name:   "unwind_dotnet",
+			Enable: !cfg.InterpretersConfig.Dotnet.IsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgUnwindDotnet10),
-			name:   "unwind_dotnet10",
-			enable: !cfg.InterpretersConfig.Dotnet.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindDotnet10),
+			Name:   "unwind_dotnet10",
+			Enable: !cfg.InterpretersConfig.Dotnet.IsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgGoLabels),
-			name:   "go_labels",
-			enable: !cfg.InterpretersConfig.Labels.IsDisabled(),
+			ProgID: uint32(support.ProgGoLabels),
+			Name:   "go_labels",
+			Enable: !cfg.InterpretersConfig.Go.IsLabelsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgUnwindBEAM),
-			name:   "unwind_beam",
-			enable: !cfg.InterpretersConfig.BEAM.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindBEAM),
+			Name:   "unwind_beam",
+			Enable: !cfg.InterpretersConfig.BEAM.IsDisabled(),
 		},
 		{
-			progID: uint32(support.ProgUnwindLuaJIT),
-			name:   "unwind_luajit",
-			enable: !cfg.InterpretersConfig.LuaJIT.IsDisabled(),
+			ProgID: uint32(support.ProgUnwindLuaJIT),
+			Name:   "unwind_luajit",
+			Enable: !cfg.InterpretersConfig.LuaJIT.IsDisabled(),
 		},
 	}
 
@@ -457,44 +627,73 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 		return nil, nil, nil, fmt.Errorf("failed to load perf eBPF programs: %v", err)
 	}
 
-	if cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe {
+	if kprobeChainRequired(cfg) {
 		// Load the tail call destinations if any kind of event profiling is enabled.
+		// Heap profiling needs the uprobe unwinder chain (kprobe_progs) so its
+		// USDT entry programs can tail-call into PROG_UNWIND_NATIVE.
+		// loadProbeUnwinders repoints the probe unwinder's per_cpu_records references
+		// to per_cpu_records_kp so a perf sampler can't clobber an in-flight uprobe unwind;
+		// the perf unwinder keeps per_cpu_records.
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], tailCallProgs,
-			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(),
+			ebpfMaps["per_cpu_records"].FD(), ebpfMaps["per_cpu_records_kp"]); err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
 		}
 	}
 
 	if cfg.OffCPUThreshold > 0 {
-		offCPUProgs := []progLoaderHelper{
+		offCPUProgs := []ProgLoaderHelper{
 			{
-				name:             "finish_task_switch",
-				noTailCallTarget: true,
-				enable:           true,
+				Name:             "finish_task_switch",
+				NoTailCallTarget: true,
+				Enable:           true,
 			},
 			{
-				name:             "tracepoint__sched_switch",
-				noTailCallTarget: true,
-				enable:           true,
+				Name:             "tracepoint__sched_switch",
+				NoTailCallTarget: true,
+				Enable:           true,
 			},
 		}
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], offCPUProgs,
-			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(),
+			ebpfMaps["per_cpu_records"].FD(), ebpfMaps["per_cpu_records_kp"]); err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
 		}
 	}
 
-	if len(cfg.ProbeLinks) > 0 || cfg.LoadProbe {
-		probeProgs := []progLoaderHelper{
+	if len(cfg.ProbeLinks) > 0 {
+		// kprobe__generic is only needed in ebpfProgs when ProbeLinks are configured:
+		// AttachProbes retrieves it from there. Custom probes (Enable path) load their
+		// own fresh instance via ProbeContext.LoadProbeUnwinders, so we skip it here.
+		probeProgs := []ProgLoaderHelper{
 			{
-				name:             genericProgName,
-				noTailCallTarget: true,
-				enable:           true,
+				Name:             genericProgName,
+				NoTailCallTarget: true,
+				Enable:           true,
 			},
 		}
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], probeProgs,
-			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(),
+			ebpfMaps["per_cpu_records"].FD(), ebpfMaps["per_cpu_records_kp"]); err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load uprobe eBPF programs: %v", err)
+		}
+	}
+
+	if cfg.HeapProfiling {
+		// USDT entry points for heap profiling. Attached PID-scoped from
+		// userspace by the usdt package; they themselves tail-call into
+		// the shared uprobe unwinder chain loaded above.
+		// The free probe is only needed to track deallocations for live
+		// (in-use) heap reporting; plain allocation profiling never
+		// consumes free events, so don't load it unless opted in.
+		heapProgs := []ProgLoaderHelper{
+			{Name: "uprobe_heap_alloc", NoTailCallTarget: true, Enable: true},
+			{Name: "uprobe_heap_free", NoTailCallTarget: true, Enable: cfg.LiveHeapProfiling},
+		}
+		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], heapProgs,
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(),
+			ebpfMaps["per_cpu_records"].FD(), ebpfMaps["per_cpu_records_kp"]); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to load heap USDT eBPF programs: %v", err)
 		}
 	}
 
@@ -766,37 +965,42 @@ func schedTimesSize(threshold uint32) uint32 {
 
 // loadPerfUnwinders loads all perf eBPF Programs and their tail call targets.
 func loadPerfUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.Program,
-	tailcallMap *cebpf.Map, tailCallProgs []progLoaderHelper,
+	tailcallMap *cebpf.Map, tailCallProgs []ProgLoaderHelper,
 	bpfVerifierLogLevel uint32,
 ) error {
 	programOptions := cebpf.ProgramOptions{
 		LogLevel: cebpf.LogLevel(bpfVerifierLogLevel),
 	}
 
-	progs := make([]progLoaderHelper, len(tailCallProgs)+2)
+	progs := make([]ProgLoaderHelper, len(tailCallProgs)+3)
 	copy(progs, tailCallProgs)
 
 	schedProcessFree := schedProcessFreeHookName(libpf.MapKeysToSet(coll.Programs))
 	progs = append(progs,
-		progLoaderHelper{
-			name:             schedProcessFree,
-			noTailCallTarget: true,
-			enable:           true,
+		ProgLoaderHelper{
+			Name:             schedProcessExec,
+			NoTailCallTarget: true,
+			Enable:           true,
 		},
-		progLoaderHelper{
-			name:             "native_tracer_entry",
-			noTailCallTarget: true,
-			enable:           true,
+		ProgLoaderHelper{
+			Name:             schedProcessFree,
+			NoTailCallTarget: true,
+			Enable:           true,
+		},
+		ProgLoaderHelper{
+			Name:             "native_tracer_entry",
+			NoTailCallTarget: true,
+			Enable:           true,
 		})
 
 	for _, unwindProg := range progs {
-		if !unwindProg.enable {
+		if !unwindProg.Enable {
 			continue
 		}
 
-		unwindProgName := unwindProg.name
-		if !unwindProg.noTailCallTarget {
-			unwindProgName = "perf_" + unwindProg.name
+		unwindProgName := unwindProg.Name
+		if !unwindProg.NoTailCallTarget {
+			unwindProgName = "perf_" + unwindProg.Name
 		}
 
 		progSpec, ok := coll.Programs[unwindProgName]
@@ -804,8 +1008,8 @@ func loadPerfUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.P
 			return fmt.Errorf("program %s does not exist", unwindProgName)
 		}
 
-		if err := loadProgram(ebpfProgs, tailcallMap, unwindProg.progID, progSpec,
-			programOptions, unwindProg.noTailCallTarget); err != nil {
+		if err := loadProgram(ebpfProgs, tailcallMap, unwindProg.ProgID, progSpec,
+			programOptions, unwindProg.NoTailCallTarget); err != nil {
 			return err
 		}
 	}
@@ -837,21 +1041,22 @@ func progArrayReferences(perfTailCallMapFD int, insns asm.Instructions) []int {
 // are written as perf event eBPF programs. loadProbeUnwinders dynamically rewrites the
 // specification of these programs to xProbe eBPF programs and adjusts tail call maps.
 func loadProbeUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.Program,
-	tailcallMap *cebpf.Map, progs []progLoaderHelper,
+	tailcallMap *cebpf.Map, progs []ProgLoaderHelper,
 	bpfVerifierLogLevel uint32, perfTailCallMapFD int,
+	perCPURecordsFD int, perCPURecordsKprobeMap *cebpf.Map,
 ) error {
 	programOptions := cebpf.ProgramOptions{
 		LogLevel: cebpf.LogLevel(bpfVerifierLogLevel),
 	}
 
 	for _, unwindProg := range progs {
-		if !unwindProg.enable {
+		if !unwindProg.Enable {
 			continue
 		}
 
-		unwindProgName := unwindProg.name
-		if !unwindProg.noTailCallTarget {
-			unwindProgName = "kprobe_" + unwindProg.name
+		unwindProgName := unwindProg.Name
+		if !unwindProg.NoTailCallTarget {
+			unwindProgName = "kprobe_" + unwindProg.Name
 		}
 
 		progSpec, ok := coll.Programs[unwindProgName]
@@ -867,8 +1072,16 @@ func loadProbeUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.
 			}
 		}
 
-		if err := loadProgram(ebpfProgs, tailcallMap, unwindProg.progID, progSpec,
-			programOptions, unwindProg.noTailCallTarget); err != nil {
+		// Repoint per_cpu_records to the probe unwinder's own record map.
+		recInsns := progArrayReferences(perCPURecordsFD, progSpec.Instructions)
+		for _, ins := range recInsns {
+			if err := progSpec.Instructions[ins].AssociateMap(perCPURecordsKprobeMap); err != nil {
+				return fmt.Errorf("failed to rewrite per_cpu_records ptr: %v", err)
+			}
+		}
+
+		if err := loadProgram(ebpfProgs, tailcallMap, unwindProg.ProgID, progSpec,
+			programOptions, unwindProg.NoTailCallTarget); err != nil {
 			return err
 		}
 	}
@@ -921,31 +1134,69 @@ func loadProgram(ebpfProgs map[string]*cebpf.Program, tailcallMap *cebpf.Map,
 	return nil
 }
 
+func symbolizeBPFFrame(name string, offset uint) unique.Handle[libpf.Frame] {
+	return unique.Make(libpf.Frame{
+		Type:            libpf.KernelFrame,
+		AddressOrLineno: libpf.AddressOrLineno(offset),
+		FunctionName:    libpf.Intern(name),
+	})
+}
+
+func symbolizeKernelFrame(
+	address libpf.Address,
+	resolution kallsyms.AddressResolution,
+) unique.Handle[libpf.Frame] {
+	if resolution.Source == kallsyms.SymbolSourceBPF {
+		return symbolizeBPFFrame(resolution.BPFName, resolution.BPFOffset)
+	}
+
+	frame := libpf.Frame{
+		Type:            libpf.KernelFrame,
+		AddressOrLineno: libpf.AddressOrLineno(address - 1),
+	}
+
+	if kmod := resolution.Module; kmod != nil {
+		frame.Mapping = kmod.Mapping()
+		frame.AddressOrLineno -= libpf.AddressOrLineno(kmod.Start())
+		if funcName, _, err := kmod.LookupSymbolByAddress(address); err == nil {
+			frame.FunctionName = libpf.Intern(funcName)
+		}
+	}
+
+	return unique.Make(frame)
+}
+
 // symbolizeKernelFrames converts raw kernel addresses into symbolized frames.
 func (t *Tracer) symbolizeKernelFrames(addrs []uint64, oldFrames libpf.Frames) libpf.Frames {
-	frames := oldFrames
-	if len(addrs) > len(frames) {
+	frames := oldFrames[:0]
+	if len(addrs) > cap(frames) {
 		frames = make(libpf.Frames, 0, len(addrs))
 	}
+
+	snapshot := t.kernelSymbolizer.Snapshot()
+
 	for _, addr := range addrs {
 		address := libpf.Address(addr)
-		frame := libpf.Frame{
-			Type:            libpf.KernelFrame,
-			AddressOrLineno: libpf.AddressOrLineno(address - 1),
+
+		if cached, ok := t.kernelFrameCache.Get(address); ok &&
+			snapshot.IsGenerationValid(cached.generation) {
+			frames = append(frames, cached.frame)
+			continue
 		}
-		if funcName, offset, ok := t.kernelSymbolizer.LookupBPFSymbol(address); ok {
-			// BPF program: use address relative to symbol start for deduplication.
-			frame.AddressOrLineno = libpf.AddressOrLineno(offset)
-			frame.FunctionName = libpf.Intern(funcName)
-		} else if kmod, err := t.kernelSymbolizer.GetModuleByAddress(address); err == nil {
-			frame.Mapping = kmod.Mapping()
-			frame.AddressOrLineno -= libpf.AddressOrLineno(kmod.Start())
-			if funcName, _, err := kmod.LookupSymbolByAddress(address); err == nil {
-				frame.FunctionName = libpf.Intern(funcName)
-			}
+
+		resolution, resolved := snapshot.ResolveAddress(address)
+		frame := symbolizeKernelFrame(address, resolution)
+		if resolved && (resolution.Source == kallsyms.SymbolSourceBPF ||
+			frame.Value().Mapping.Valid()) {
+			t.kernelFrameCache.Add(address, kernelFrameCacheValue{
+				generation: resolution.Generation,
+				frame:      frame,
+			})
 		}
-		frames.Append(&frame)
+
+		frames = append(frames, frame)
 	}
+
 	return frames
 }
 
@@ -972,9 +1223,15 @@ func (t *Tracer) monitorPIDEventsMap(keys *[]libpf.PIDTID) error {
 	for {
 		n, err := eventsMap.BatchLookupAndDelete(&cursor, removed, values, nil)
 
-		// There can be results even if there's an error.
+		// There can be results even if there's an error. A false map value is
+		// emitted only by sched_process_exec and invalidates process-scoped
+		// state before the replacement image is synchronized.
 		for i := range n {
-			*keys = append(*keys, libpf.PIDTID(removed[i]))
+			pidTid := libpf.PIDTID(removed[i])
+			if !values[i] {
+				t.processManager.MarkProcessExec(pidTid.PID())
+			}
+			*keys = append(*keys, pidTid)
 		}
 
 		if errors.Is(err, cebpf.ErrKeyNotExist) {
@@ -1081,38 +1338,52 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 		APMTransactionID: *(*libpf.APMTransactionID)(unsafe.Pointer(&ptr.Apm_transaction_id)),
 		PID:              pid,
 		TID:              libpf.PID(ptr.Tid),
-		Origin:           libpf.Origin(ptr.Origin),
+		Origin:           ptr.Origin,
 		Value:            int64(ptr.Value),
+		Ptr:              ptr.Ptr,
+		Size:             ptr.Size,
 		KTime:            int64(ptr.Ktime),
+		CorrelationID:    ptr.Correlation_id,
+		AsyncUserData:    ptr.Async_user_data,
+		AsyncThreshold:   ptr.Async_threshold,
+		AsyncResult:      ptr.Async_result,
+		AsyncFlags:       ptr.Async_flags,
+		AsyncOperation:   ptr.Async_operation,
+		EventKind:        libpf.TraceEventKind(ptr.Event_kind),
+		AsyncKind:        libpf.AsyncKind(ptr.Async_kind),
+		AsyncAttributes:  libpf.AsyncAttributes(ptr.Async_attributes),
 		CpuID:            ptr.Cpu_id,
 		EnvVars:          procMeta.EnvVariables,
+		Resource:         procMeta.ProcessContextInfo.Resource,
 	}
 
-	switch trace.Origin {
-	case support.TraceOriginSampling:
-	case support.TraceOriginOffCPU:
-	case support.TraceOriginProbe:
-	default:
+	if t.origins.lookup(trace.Origin) == nil {
 		return nil, fmt.Errorf("origin %d: %w", trace.Origin, errOriginUnexpected)
 	}
 
-	if ptr.Custom_labels.Len > 0 {
-		trace.CustomLabels = make(map[libpf.String]libpf.String, int(ptr.Custom_labels.Len))
-		for i := 0; i < int(ptr.Custom_labels.Len); i++ {
-			lbl := ptr.Custom_labels.Labels[i]
-			keyBytes, ok := t.customLabels.validateKey(lbl.Key[:])
-			if !ok {
-				log.Debugf("Dropping Go custom label with empty or invalid UTF-8 name")
-				continue
+	switch ptr.Custom_labels_type {
+	case support.CustomLabelsTypeGo:
+		customLabels := (*support.CustomLabelsArray)(unsafe.Pointer(&ptr.Custom_labels_data))
+		if customLabels.Len > 0 {
+			trace.CustomLabels = make(map[libpf.String]libpf.String, int(customLabels.Len))
+			for i := 0; i < int(customLabels.Len); i++ {
+				lbl := customLabels.Labels[i]
+				keyBytes, ok := t.customLabels.validateKey(lbl.Key[:])
+				if !ok {
+					log.Debugf("Dropping Go custom label with empty or invalid UTF-8 name")
+					continue
+				}
+				key := libpf.Intern(pfunsafe.ToString(keyBytes))
+				valBytes, ok := t.customLabels.validateValue(lbl.Val[:])
+				if !ok {
+					log.Debugf("Dropping Go custom label %s with invalid UTF-8 value", key)
+					continue
+				}
+				trace.CustomLabels[key] = libpf.Intern(pfunsafe.ToString(valBytes))
 			}
-			key := libpf.Intern(pfunsafe.ToString(keyBytes))
-			valBytes, ok := t.customLabels.validateValue(lbl.Val[:])
-			if !ok {
-				log.Debugf("Dropping Go custom label %s with invalid UTF-8 value", key)
-				continue
-			}
-			trace.CustomLabels[key] = libpf.Intern(pfunsafe.ToString(valBytes))
 		}
+	case support.CustomLabelsTypeNative:
+		trace.CustomLabels = procMeta.ProcessContextInfo.DecodeThreadLabels(ptr.Custom_labels_data.Data[:ptr.Custom_labels_data.Size])
 	}
 
 	trace.NumFrames = ptr.Num_frames
@@ -1185,6 +1456,13 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *libp
 		metrics.AddSlice(traceEventMetricCollector())
 		metrics.AddSlice(t.eBPFMetricsCollector(translateIDs, previousMetricValue))
 		metrics.AddSlice(t.customLabels.getAndResetMetrics())
+		if t.asyncCorrelator != nil {
+			metrics.AddSlice(t.asyncCorrelator.getAndResetMetrics())
+		}
+		if t.tcpSequenceCorrelator != nil {
+			metrics.AddSlice(t.tcpSequenceCorrelator.getAndResetMetrics())
+		}
+		metrics.AddSlice(t.collectProbeMetrics())
 	})
 
 	return nil
@@ -1322,7 +1600,7 @@ func (t *Tracer) StartOffCPUProfiling() error {
 		return errors.New("off-cpu program finish_task_switch is not available")
 	}
 
-	kmod, err := t.kernelSymbolizer.GetModuleByName(kallsyms.Kernel)
+	kmod, err := t.kernelSymbolizer.Snapshot().GetModuleByName(kallsyms.Kernel)
 	if err != nil {
 		return err
 	}
@@ -1386,9 +1664,140 @@ func (t *Tracer) AttachProbes(probes []string) error {
 }
 
 func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
-	t.processManager.HandleTrace(bpfTrace)
+	if bpfTrace.Origin == support.TraceOriginHeapFree {
+		// Free events carry no frames; just remove the allocation from the
+		// live tracker. No symbolization or reporting needed.
+		if t.liveHeapTracker != nil {
+			t.liveHeapTracker.HandleFree(bpfTrace.PID, bpfTrace.Ptr)
+		}
+		t.releaseTrace(bpfTrace)
+		return
+	}
 
-	// Reclaim the EbpfTrace
-	bpfTrace.KernelFrames = bpfTrace.KernelFrames[0:0]
-	t.tracePool.Put(bpfTrace)
+	if t.asyncCorrelator == nil {
+		t.asyncCorrelator = newAsyncTraceCorrelator(
+			defaultAsyncCorrelationCapacity, defaultAsyncCorrelationTTL)
+	}
+	if t.tcpSequenceCorrelator == nil {
+		t.tcpSequenceCorrelator = newTCPSequenceCorrelator(
+			defaultAsyncCorrelationCapacity, defaultAsyncCorrelationTTL)
+	}
+	if (bpfTrace.AsyncKind == libpf.AsyncKindTCPAck ||
+		bpfTrace.AsyncKind == libpf.AsyncKindTCPReceive) &&
+		bpfTrace.EventKind != libpf.TraceEventNormal {
+		completions := t.tcpSequenceCorrelator.handle(bpfTrace)
+		t.releaseTrace(bpfTrace)
+		for i := range completions {
+			completion := &completions[i]
+			trace := t.tracePool.Get().(*libpf.EbpfTrace)
+			completion.snapshot.restore(trace)
+			trace.KTime = completion.ktime
+			trace.CpuID = completion.cpu
+			trace.Value = completion.value
+			trace.AsyncResult = completion.result
+			trace.AsyncKind = completion.kind
+			trace.EventKind = libpf.TraceEventNormal
+			addAsyncLabels(trace)
+			t.processManager.HandleTrace(trace, t.origins.lookup(trace.Origin))
+			t.releaseTrace(trace)
+		}
+		return
+	}
+
+	switch bpfTrace.EventKind {
+	case libpf.TraceEventAsyncStart:
+		t.asyncCorrelator.add(bpfTrace)
+		t.releaseTrace(bpfTrace)
+		return
+	case libpf.TraceEventAsyncComplete:
+		if !t.asyncCorrelator.complete(bpfTrace) ||
+			bpfTrace.AsyncAttributes&libpf.AsyncAttrFiltered != 0 {
+			t.releaseTrace(bpfTrace)
+			return
+		}
+	}
+
+	// Give the owning probe a chance to attach per-sample labels derived
+	// from probe-specific trace data (e.g. thread state for off-CPU time).
+	if labeler, ok := t.traceLabelers.Load(bpfTrace.Origin); ok {
+		labeler.(TraceLabeler).LabelTrace(bpfTrace)
+	}
+
+	traceHash, frames := t.processManager.HandleTrace(bpfTrace, t.origins.lookup(bpfTrace.Origin))
+	// After symbolization and reporting, feed heap allocs to the live tracker.
+	// Called for every alloc trace (not just ptr != 0) so the tracker can count
+	// all received alloc samples; it ignores entries eBPF did not live-track.
+	if bpfTrace.Origin == support.TraceOriginHeapAlloc && t.liveHeapTracker != nil {
+		t.liveHeapTracker.HandleAlloc(
+			bpfTrace.PID,
+			bpfTrace.Ptr,
+			traceHash,
+			bpfTrace.Value,
+			frames,
+		)
+	}
+	t.releaseTrace(bpfTrace)
+}
+
+func (t *Tracer) releaseTrace(trace *libpf.EbpfTrace) {
+	trace.KernelFrames = trace.KernelFrames[:0]
+	trace.FrameData = trace.FrameDataBuf[:0]
+	trace.CustomLabels = nil
+	t.tracePool.Put(trace)
+}
+
+// originRegistry is the tracer-wide registry origin IDs are assigned from
+// and profile type metadata is looked up by. IDs are handed out by
+// atomically incrementing lastID, which guarantees they never collide, even
+// when profile types are registered dynamically after load time.
+type originRegistry struct {
+	// lastID is the most recently assigned origin ID.
+	lastID atomic.Uint32
+
+	// types maps a trace origin (uint16) to its *samples.TypeMetadata.
+	types sync.Map
+}
+
+// register hands out a fresh origin ID and stores metadata for it, keyed by
+// that ID.
+func (r *originRegistry) register(metadata *samples.TypeMetadata) (uint16, error) {
+	if last := r.lastID.Load(); last >= math.MaxUint16 {
+		return 0, fmt.Errorf("maximum number of origin registry entries exceeded")
+	}
+	id := uint16(r.lastID.Add(1))
+	r.types.Store(id, metadata)
+	return id, nil
+}
+
+// registerFixed stores metadata for an origin ID emitted directly by eBPF.
+func (r *originRegistry) registerFixed(id uint16, metadata *samples.TypeMetadata) error {
+	if id == 0 {
+		return fmt.Errorf("origin ID 0 is reserved")
+	}
+	if _, loaded := r.types.LoadOrStore(id, metadata); loaded {
+		return fmt.Errorf("origin ID %d is already registered", id)
+	}
+	for {
+		last := r.lastID.Load()
+		if uint32(id) <= last {
+			return nil
+		}
+		if r.lastID.CompareAndSwap(last, uint32(id)) {
+			return nil
+		}
+	}
+}
+
+// lookup returns the profile type metadata registered for origin, or nil if
+// origin is unknown.
+func (r *originRegistry) unregister(origin uint16) {
+	r.types.Delete(origin)
+}
+
+func (r *originRegistry) lookup(origin uint16) *samples.TypeMetadata {
+	v, ok := r.types.Load(origin)
+	if !ok {
+		return nil
+	}
+	return v.(*samples.TypeMetadata)
 }

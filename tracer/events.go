@@ -40,23 +40,78 @@ const (
 	// eventReaderDeadline is the timeout for perf event reads. It allows the
 	// reader goroutine to periodically check for context cancellation.
 	eventReaderDeadline = 100 * time.Millisecond
+
+	// usdtReconcileInterval is how often we re-check tracked PIDs that have
+	// no USDT attachments. This catches libraries loaded after initial PID
+	// discovery (e.g., JNA loading a .so with USDT probes after JVM startup).
+	usdtReconcileInterval = 30 * time.Second
+
+	// usdtReconcileBatchSize limits how many PIDs are re-reconciled per tick
+	// to amortise the cost of reading /proc/<pid>/maps.
+	usdtReconcileBatchSize = 20
 )
 
 // StartPIDEventProcessor spawns a goroutine to process PID events.
 func (t *Tracer) StartPIDEventProcessor(ctx context.Context) {
-	go t.processPIDEvents(ctx)
+	t.pidEventsMu.Lock()
+	if t.pidEventsStarted || t.pidEventsClosed {
+		t.pidEventsMu.Unlock()
+		return
+	}
+	processorCtx, cancel := context.WithCancel(ctx)
+	t.pidEventsCancel = cancel
+	t.pidEventsStarted = true
+	t.pidEventsMu.Unlock()
+
+	go t.processPIDEvents(processorCtx)
+}
+
+// stopPIDEventProcessor cancels and drains PID processing when it was started.
+// It returns immediately for partially initialized tracers.
+func (t *Tracer) stopPIDEventProcessor() {
+	t.pidEventsMu.Lock()
+	if t.pidEventsClosed {
+		t.pidEventsMu.Unlock()
+		return
+	}
+	t.pidEventsClosed = true
+	if !t.pidEventsStarted {
+		t.pidEventsMu.Unlock()
+		return
+	}
+	cancel := t.pidEventsCancel
+	done := t.pidEventsDone
+	t.pidEventsMu.Unlock()
+
+	cancel()
+	<-done
 }
 
 // Process the PID events that are incoming in the Tracer channel.
 func (t *Tracer) processPIDEvents(ctx context.Context) {
+	defer close(t.pidEventsDone)
+
 	pidCleanupTicker := time.NewTicker(t.intervals.PIDCleanupInterval())
 	defer pidCleanupTicker.Stop()
+
+	// Periodic USDT re-reconciliation catches libraries loaded after initial
+	// PID discovery (e.g., Java JNA loading a .so with USDT probes after JVM
+	// startup). We process a small batch each tick to amortise /proc I/O.
+	// Note: this only re-sweeps USDT attachment state, not the general
+	// executable-mapping cache (see the longstanding periodic-sync TODO on
+	// ProcessManager.SynchronizeProcess, which predates and is unrelated to
+	// USDT/memory profiling).
+	usdtReconcileTicker := time.NewTicker(usdtReconcileInterval)
+	defer usdtReconcileTicker.Stop()
+
 	for {
 		select {
 		case pidTid := <-t.pidEvents:
 			t.processManager.SynchronizeProcess(process.New(pidTid.PID(), pidTid.TID()))
 		case <-pidCleanupTicker.C:
 			t.processManager.CleanupPIDs()
+		case <-usdtReconcileTicker.C:
+			t.processManager.ReconcileUSDTProbes(usdtReconcileBatchSize)
 		case <-ctx.Done():
 			return
 		}
@@ -233,10 +288,13 @@ func (t *Tracer) startTraceEventMonitor(ctx context.Context,
 				case errors.Is(err, errOriginUnexpected):
 					log.Warnf("skip trace handling: %v", err)
 					continue
-				case errors.Is(err, errRecordTooSmall), errors.Is(err, errRecordUnexpectedSize):
+				case errors.Is(err, errRecordTooSmall):
 					log.Errorf("Stop receiving traces: %v", err)
 					t.signalDone()
 					return
+				case errors.Is(err, errRecordUnexpectedSize):
+					log.Warnf("skip trace with unexpected record size: %v", err)
+					continue
 				default:
 					log.Warnf("unexpected error handling trace: %v", err)
 					continue

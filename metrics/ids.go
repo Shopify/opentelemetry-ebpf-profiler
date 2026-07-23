@@ -686,6 +686,144 @@ const (
 	// Number of times we didn't find an entry for this process in the LuaJIT process info array
 	IDUnwindLuaJITErrNoProcInfo = 299
 
+	// Number of asynchronous initiating traces buffered for completion correlation
+	IDAsyncCorrelationStarts = 300
+
+	// Number of asynchronous completions joined to their initiating traces
+	IDAsyncCorrelationCompletions = 301
+
+	// Number of duplicate asynchronous starts, including richer stack replacements
+	IDAsyncCorrelationDuplicateStarts = 302
+
+	// Number of asynchronous completions with no buffered initiating trace
+	IDAsyncCorrelationOrphanCompletions = 303
+
+	// Number of asynchronous initiating traces evicted at correlator capacity
+	IDAsyncCorrelationCapacityEvictions = 304
+
+	// Number of asynchronous initiating traces evicted after their correlation TTL
+	IDAsyncCorrelationExpirationEvictions = 305
+
+	// Number of asynchronous initiating traces currently awaiting completion
+	IDAsyncCorrelationPending = 306
+
+	// Number of correlated asynchronous completions suppressed by a duration filter
+	IDAsyncCorrelationFilteredCompletions = 307
+
+	// Number of TCP sequence operations missing a packet or initiating stack
+	IDTCPSequenceCorrelationOrphans = 308
+
+	// Number of TCP sequence correlation records removed by capacity or TTL
+	IDTCPSequenceCorrelationEvictions = 309
+
+	// Number of TCP sequence latencies suppressed by a duration filter
+	IDTCPSequenceCorrelationFiltered = 310
+
+	// Number of TCP calls and sequence ranges awaiting correlation
+	IDTCPSequenceCorrelationPending = 311
+
+	// Number of failures to get TSD base for thread context
+	IDUnwindThreadContextErrReadTsdBase = 312
+
+	// Number of failures to read the thread context buffer
+	IDUnwindThreadContextErrReadThreadCtxBuf = 313
+
+	// Number of failures to read the thread context attributes
+	IDUnwindThreadContextErrReadThreadCtxAttrs = 314
+
+	// Number of successful reads of thread context info
+	IDUnwindThreadContextReadSuccesses = 315
+
+	// Number of mapped userspace probe objects that failed symbol or build ID resolution
+	IDUserspaceProbeResolutionFailures = 320
+
+	// Number of failures attaching a PID-scoped userspace probe link
+	IDUserspaceProbeAttachFailures = 321
+
+	// Number of PID-scoped userspace probe links attached
+	IDUserspaceProbeLinksAttached = 322
+
+	// Number of PID-scoped userspace probe links detached
+	IDUserspaceProbeLinksDetached = 323
+
+	// Number of userspace probe attachments rejected at the configured link bound
+	IDUserspaceProbeLinkLimitHits = 324
+
+	// Number of userspace probe link or process-state cleanup failures
+	IDUserspaceProbeCleanupFailures = 325
+
+	// Number of processes currently owning userspace probe links
+	IDUserspaceProbeActiveProcesses = 326
+
+	// Number of PID-scoped userspace probe links currently active
+	IDUserspaceProbeActiveLinks = 327
+
+	// Number of lock-wait entry probes observed
+	IDLockWaitEntries = 328
+
+	// Number of lock-wait return probes observed
+	IDLockWaitReturns = 329
+
+	// Number of lock-wait returns without acquisition state
+	IDLockWaitUnmatchedReturns = 330
+
+	// Number of lock-wait samples filtered by duration, sampling, or return policy
+	IDLockWaitFiltered = 331
+
+	// Number of lock-wait latency samples submitted for unwinding
+	IDLockWaitEmitted = 332
+
+	// Number of failures inserting lock-wait acquisition state
+	IDLockWaitStateUpdateFailures = 333
+
+	// Number of nested lock-wait entries that replaced state for one thread
+	IDLockWaitStateOverwrites = 334
+
+	// Number of lock-wait acquisition states currently active
+	IDLockWaitActiveStates = 335
+
+	// Number of failures reading lock-wait eBPF metrics
+	IDLockWaitMetricReadFailures = 336
+
+	// Current number of live heap entries tracked globally
+	IDLiveHeapEntries = 337
+
+	// Number of heap alloc samples dropped due to global live-set cap
+	IDLiveHeapDroppedAllocs = 338
+
+	// Number of heap malloc samples received per reporting interval
+	IDHeapAllocSamples = 339
+
+	// Number of heap free samples received per reporting interval
+	IDHeapFreeSamples = 340
+
+	// Number of heap allocs dropped in eBPF due to per-PID live-heap cap
+	IDHeapPerPIDLimitHit = 341
+
+	// Number of heap allocs dropped in eBPF due to global live-heap map full
+	IDHeapLiveMapFull = 342
+
+	// Number of thread switch-out events observed by the off-CPU time probe
+	IDOffCPUTimeSwitchOuts = 343
+
+	// Number of thread switch-in events observed by the off-CPU time probe
+	IDOffCPUTimeSwitchIns = 344
+
+	// Number of off-CPU time switch-ins without a recorded switch-out
+	IDOffCPUTimeUnmatchedSwitchIns = 345
+
+	// Number of off-CPU time samples filtered by duration or sampling
+	IDOffCPUTimeFiltered = 346
+
+	// Number of off-CPU time samples submitted for unwinding
+	IDOffCPUTimeEmitted = 347
+
+	// Number of failures recording off-CPU time switch-out state
+	IDOffCPUTimeStateUpdateFailures = 348
+
+	// Number of failures reading off-CPU time eBPF metrics
+	IDOffCPUTimeMetricReadFailures = 349
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 300
+	IDMax = 350
 )

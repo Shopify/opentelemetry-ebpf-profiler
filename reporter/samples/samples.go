@@ -4,6 +4,7 @@
 package samples // import "go.opentelemetry.io/ebpf-profiler/reporter/samples"
 
 import (
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 )
 
@@ -14,13 +15,19 @@ type TraceEventMeta struct {
 	ContainerID    libpf.String
 	EnvVars        map[libpf.String]libpf.String
 	APMServiceName string
+	Resource       *pcommon.Resource
 	Timestamp      libpf.UnixTime64
 	CPU            uint32
-	Origin         libpf.Origin
+	ProfileType    *TypeMetadata
 	Value          int64
-	PID, TID       libpf.PID
-	SpanID         libpf.APMSpanID
-	TraceID        libpf.APMTraceID
+	// AllocSize is the raw, un-weighted allocation size in bytes for
+	// TraceOriginHeapAlloc events (see libpf.EbpfTrace.Size); combined with
+	// Value (the byte-weighted estimator) it lets consumers derive an
+	// unbiased object-count estimate. Zero/unused for all other origins.
+	AllocSize int64
+	PID, TID  libpf.PID
+	SpanID    libpf.APMSpanID
+	TraceID   libpf.APMTraceID
 }
 
 // TraceEvents holds known information about a trace.
@@ -29,6 +36,9 @@ type TraceEvents struct {
 	Frames     libpf.Frames
 	Timestamps []uint64 // in nanoseconds
 	Values     []int64
+	// AllocSizes holds the per-event TraceEventMeta.AllocSize, index-aligned
+	// with Values. Only populated for TraceOriginHeapAlloc.
+	AllocSizes []int64
 }
 
 // TraceEventsTree stores samples and their related metadata in a tree-like
@@ -42,8 +52,11 @@ type ResourceToProfiles struct {
 	// comparable.
 	EnvVars map[libpf.String]libpf.String
 
+	// Resource is the OTel resource from ProcessContext, if available.
+	Resource *pcommon.Resource
+
 	// Events holds the actual profiling information.
-	Events map[libpf.Origin]SampleToEvents
+	Events map[*TypeMetadata]SampleToEvents
 }
 
 // SampleToEvents maps a unique trace hash with its meta data to
@@ -64,6 +77,9 @@ type ResourceKey struct {
 	// APMServiceName is provided by the eBPF programs
 	APMServiceName string
 
+	// ContextKey is the unique identifier for a service instance
+	ContextKey libpf.String
+
 	PID int64
 }
 
@@ -83,4 +99,34 @@ type SampleKey struct {
 
 	SpanID  libpf.APMSpanID
 	TraceID libpf.APMTraceID
+
+	// LabelsHash is a hash of the custom labels attached to the trace.
+	// It separates samples that share the same stack / TID / SpanID / TraceID
+	// but carry different labels so their labels aren't merged.
+	LabelsHash uint64
+}
+
+// TypeMetadata describes how profiling events of a particular kind
+// should be interpreted and exported as an OTel profile.
+type TypeMetadata struct {
+	// StaticLabels are low-cardinality labels supplied by the profile-type
+	// descriptor. They override same-named labels collected from the trace.
+	StaticLabels map[libpf.String]libpf.String
+
+	// PeriodType describes what is measured per period (e.g. "cpu").
+	// Empty means this profile type has no period (e.g. event-driven kinds).
+	PeriodType string
+
+	// PeriodUnit is the unit for PeriodType (e.g. "nanoseconds").
+	PeriodUnit string
+
+	// SampleType describes what a single sample represents (e.g. "samples").
+	SampleType string
+
+	// SampleUnit is the unit for SampleType (e.g. "count").
+	SampleUnit string
+
+	// ReportValues indicates whether a sample's value should be included
+	// in the exported sample (e.g. off-CPU durations).
+	ReportValues bool
 }

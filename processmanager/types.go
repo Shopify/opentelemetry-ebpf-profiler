@@ -13,12 +13,14 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libc"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	eim "go.opentelemetry.io/ebpf-profiler/processmanager/execinfomanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/times"
+	"go.opentelemetry.io/ebpf-profiler/usdt"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -45,6 +47,14 @@ type frameCacheKey struct {
 type ProcessManager struct {
 	// A mutex to synchronize access to internal data within this struct.
 	mu sync.RWMutex
+
+	// observerMu serializes observer registration with lifecycle notifications.
+	// Observer callbacks never run while mu is held.
+	observerMu sync.Mutex
+
+	// processObservers receive immutable process and mapping snapshots.
+	processObservers map[uint64]*processObserverEntry
+	nextObserverID   uint64
 
 	// interpreterTracerEnabled indicates if at last one non-native tracer is loaded.
 	interpreterTracerEnabled bool
@@ -123,6 +133,29 @@ type ProcessManager struct {
 	// Used as a fallback when /proc/<pid>/cgroup yields no container ID for processes
 	// that share the profiler's cgroup directory (e.g., private cgroup namespace).
 	selfContainerID libpf.String
+
+	// usdtManager handles per-process USDT (uprobe) attachment for heap
+	// profiling. May be nil if USDT support is disabled at startup.
+	usdtManager *usdt.Manager
+
+	// usdtInstances tracks the live USDT attachment state per PID. Mutated
+	// under pm.mu alongside the other per-PID maps. Entries are created/
+	// updated in SynchronizeProcess and torn down in processPIDExit.
+	usdtInstances map[libpf.PID]*usdt.Instance
+
+	// cleanupWG tracks in-flight background cleanups (USDT detach, eBPF map
+	// deletes) so Close can wait for them to drain on shutdown.
+	cleanupWG sync.WaitGroup
+
+	// cleanupSem bounds the number of concurrent background cleanups so that
+	// heavy process churn cannot spawn unbounded concurrent kernel work.
+	cleanupSem chan struct{}
+
+	// liveHeapTracker tracks live allocations for inuse heap profiling.
+	// May be nil if live heap profiling is disabled. On process exit, the
+	// process manager removes entries for the dead PID and batch-deletes
+	// the corresponding eBPF map entries.
+	liveHeapTracker *liveheap.Tracker
 }
 
 // Mapping represents an executable memory mapping of a process.
@@ -154,10 +187,24 @@ func (m *Mapping) GetOnDiskFileIdentifier() util.OnDiskFileIdentifier {
 // processInfo contains information about the executable mappings
 // and Thread Specific Data of a process.
 type processInfo struct {
-	// process metadata, fixed for process lifetime (read-only)
+	// process metadata, fixed for one process image.
 	meta process.ProcessMeta
 	// executable mappings sorted by FileID and mapping start address
 	mappings []Mapping
+	// Raw executable file mappings and inspection thread retained for observers.
+	observerMappings []process.RawMapping
+	observerTID      libpf.PID
+	// identity distinguishes exec and PID reuse generations.
+	identity ProcessIdentity
+	// execGeneration is advanced by sched_process_exec notifications;
+	// publishedExecGeneration identifies the generation observers last received.
+	execGeneration          uint64
+	publishedExecGeneration uint64
 	// C-library Thread Specific Data information
 	libcInfo *libc.LibcInfo
+	// lastSeenTID is the most recent thread ID observed for this PID via
+	// a sync event. Used by ReconcileUSDTProbes to construct a Process
+	// that can fall back to /proc/<pid>/task/<tid>/maps when the main
+	// thread has exited.
+	lastSeenTID libpf.PID
 }

@@ -10,9 +10,10 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
+	"go.opentelemetry.io/ebpf-profiler/processcontext"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/pdata"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/traceutil"
 )
 
@@ -41,20 +42,46 @@ type baseReporter struct {
 	collectionStartTime time.Time
 }
 
-var errUnknownOrigin = errors.New("unknown trace origin")
+var errUnknownProfileType = errors.New("unknown trace profile type")
+
+func isHeapAllocProfileType(profileType *samples.TypeMetadata) bool {
+	return profileType != nil &&
+		profileType.SampleType == "alloc_space" &&
+		profileType.SampleUnit == "bytes"
+}
+
+// SetLiveHeapTracker sets the live heap tracker for inuse profile reporting.
+// Must be called before Start().
+func (b *baseReporter) SetLiveHeapTracker(t *liveheap.Tracker) {
+	b.cfg.LiveHeapTracker = t
+}
+
+// SetProcessMetaForInuse sets the process metadata resolver for inuse profiles.
+func (b *baseReporter) SetProcessMetaForInuse(fn func(libpf.PID) liveheap.ProcessMeta) {
+	b.cfg.ProcessMetaForInuse = fn
+}
 
 func (b *baseReporter) Stop() {
 	b.runLoop.Stop()
 }
 
+func profileLabels(traceLabels, staticLabels map[libpf.String]libpf.String) map[libpf.String]libpf.String {
+	if len(staticLabels) == 0 {
+		return traceLabels
+	}
+	labels := make(map[libpf.String]libpf.String, len(traceLabels)+len(staticLabels))
+	for key, value := range traceLabels {
+		labels[key] = value
+	}
+	for key, value := range staticLabels {
+		labels[key] = value
+	}
+	return labels
+}
+
 func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {
-	switch meta.Origin {
-	case support.TraceOriginSampling:
-	case support.TraceOriginOffCPU:
-	case support.TraceOriginProbe:
-	default:
-		return fmt.Errorf("skip reporting trace for %d origin: %w", meta.Origin,
-			errUnknownOrigin)
+	if meta.ProfileType == nil {
+		return fmt.Errorf("skip reporting trace: %w", errUnknownProfileType)
 	}
 
 	var extraMeta any
@@ -67,44 +94,56 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 		ContainerID:    meta.ContainerID,
 		PID:            int64(meta.PID),
 		ExecutablePath: meta.ExecutablePath,
+		ContextKey:     processcontext.ResourceToContextKey(meta.Resource),
 	}
 	traceHash := traceutil.HashTrace(trace)
+	labels := profileLabels(trace.CustomLabels, meta.ProfileType.StaticLabels)
 
 	eventsTree := b.traceEvents.WLock()
 	defer b.traceEvents.WUnlock(&eventsTree)
 
 	if _, exists := (*eventsTree)[key]; !exists {
 		(*eventsTree)[key] = samples.ResourceToProfiles{
-			EnvVars: meta.EnvVars,
-			Events:  make(map[libpf.Origin]samples.SampleToEvents),
+			EnvVars:  meta.EnvVars,
+			Resource: meta.Resource,
+			Events:   make(map[*samples.TypeMetadata]samples.SampleToEvents),
 		}
 	}
 
 	rtp := (*eventsTree)[key]
-	if _, exists := rtp.Events[meta.Origin]; !exists {
-		rtp.Events[meta.Origin] = make(samples.SampleToEvents)
+	if _, exists := rtp.Events[meta.ProfileType]; !exists {
+		rtp.Events[meta.ProfileType] = make(samples.SampleToEvents)
 	}
 
 	sampleKey := samples.SampleKey{
-		Hash:      traceHash,
-		Comm:      meta.Comm,
-		TID:       int64(meta.TID),
-		CPU:       int64(meta.CPU),
-		SpanID:    meta.SpanID,
-		TraceID:   meta.TraceID,
-		ExtraMeta: extraMeta,
+		Hash:       traceHash,
+		LabelsHash: libpf.HashLabels(labels),
+		Comm:       meta.Comm,
+		TID:        int64(meta.TID),
+		CPU:        int64(meta.CPU),
+		SpanID:     meta.SpanID,
+		TraceID:    meta.TraceID,
+		ExtraMeta:  extraMeta,
 	}
-	if events, exists := rtp.Events[meta.Origin][sampleKey]; exists {
+	isHeapAlloc := isHeapAllocProfileType(meta.ProfileType)
+	if events, exists := rtp.Events[meta.ProfileType][sampleKey]; exists {
 		events.Timestamps = append(events.Timestamps, uint64(meta.Timestamp))
 		events.Values = append(events.Values, meta.Value)
+		if isHeapAlloc {
+			events.AllocSizes = append(events.AllocSizes, meta.AllocSize)
+		}
 		return nil
 	}
 
-	rtp.Events[meta.Origin][sampleKey] = &samples.TraceEvents{
+	newEvents := &samples.TraceEvents{
 		Frames:     trace.Frames,
 		Timestamps: []uint64{uint64(meta.Timestamp)},
 		Values:     []int64{meta.Value},
-		Labels:     trace.CustomLabels,
+		Labels:     labels,
 	}
+	if isHeapAlloc {
+		newEvents.AllocSizes = []int64{meta.AllocSize}
+	}
+	rtp.Events[meta.ProfileType][sampleKey] = newEvents
 	return nil
 }

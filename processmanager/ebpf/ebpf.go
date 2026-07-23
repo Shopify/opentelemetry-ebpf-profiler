@@ -50,9 +50,14 @@ type ebpfMapsImpl struct {
 	RubyProcs          *cebpf.Map `name:"ruby_procs"`
 	V8Procs            *cebpf.Map `name:"v8_procs"`
 	BeamProcs          *cebpf.Map `name:"beam_procs"`
+	LuaJitProcs        *cebpf.Map `name:"luajit_procs"`
 	ApmIntProcs        *cebpf.Map `name:"apm_int_procs"`
-	GoLabelsProcs      *cebpf.Map `name:"go_labels_procs"`
-	LuajitProcs        *cebpf.Map `name:"luajit_procs"`
+	GoProcs            *cebpf.Map `name:"go_procs"`
+	ThreadContextProcs *cebpf.Map `name:"thread_context_procs"`
+	HeapAllocLive      *cebpf.Map `name:"heap_alloc_live"`
+	HeapLivePids       *cebpf.Map `name:"heap_live_pids"`
+	HeapPIDAllocCount  *cebpf.Map `name:"heap_pid_alloc_count"`
+	HeapPIDAllocLimit  *cebpf.Map `name:"heap_pid_alloc_limit"`
 
 	// Stackdelta and process related eBPF maps
 	ExeIDToStackDeltaMaps []*cebpf.Map
@@ -171,10 +176,12 @@ func (impl *ebpfMapsImpl) getInterpreterTypeMap(typ libpf.InterpreterType) (*ceb
 		return impl.BeamProcs, nil
 	case libpf.APMInt:
 		return impl.ApmIntProcs, nil
-	case libpf.GoLabels:
-		return impl.GoLabelsProcs, nil
+	case libpf.Go:
+		return impl.GoProcs, nil
 	case libpf.LuaJIT:
-		return impl.LuajitProcs, nil
+		return impl.LuaJitProcs, nil
+	case libpf.ThreadContext:
+		return impl.ThreadContextProcs, nil
 	default:
 		return nil, fmt.Errorf("type %d is not (yet) supported", typ)
 	}
@@ -363,54 +370,6 @@ func probeMapOperations[T constraints.Unsigned](mapType cebpf.MapType, probe fun
 	return probe(probeMap, generateSlice[T](updates), generateSlice[uint64](updates))
 }
 
-// probeBatchLookupAndDeleteInner is the inner check to be used by probeBatchLookupAndDelete.
-func probeBatchLookupAndDeleteInner[T constraints.Unsigned](probeMap *cebpf.Map, keys ptrCastMarshaler[T], values ptrCastMarshaler[uint64]) error {
-	n, err := probeMap.BatchUpdate(keys, values, nil)
-	if err != nil {
-		// Older kernel do not support batch operations on maps.
-		// This is just fine and we return here.
-		return err
-	}
-
-	if n != len(keys) {
-		return fmt.Errorf("unexpected batch update return: expected %d but got %d",
-			len(keys), n)
-	}
-
-	batchKeys := make([]T, 16)
-	batchValues := make([]uint64, 16)
-
-	n, err = probeMap.BatchLookupAndDelete(&cebpf.MapBatchCursor{}, batchKeys, batchValues, nil)
-	if err != nil && !errors.Is(err, cebpf.ErrKeyNotExist) {
-		return err
-	}
-
-	if n != len(keys) {
-		return fmt.Errorf("unexpected batch lookup-and-delete return: expected %d but got %d",
-			len(keys), n)
-	}
-
-	for i := range n {
-		// Keys can come out of order, so we're checking them against returned values instead of input keys.
-		if uint64(batchKeys[i]) != batchValues[i] {
-			return fmt.Errorf("mismatched batch lookup-and-delete at index %d: expected %d but got %d",
-				i, batchKeys[i], batchValues[i])
-		}
-	}
-
-	return nil
-}
-
-// probeBatchLookupAndDelete tests if the BPF syscall supports batch lookup-and-delete operations.
-// It returns nil if batch operations are supported for mapType or an error otherwise.
-func probeBatchLookupAndDelete(mapType cebpf.MapType) error {
-	if mapType == cebpf.Array {
-		return probeMapOperations(mapType, probeBatchLookupAndDeleteInner[uint32])
-	}
-
-	return probeMapOperations(mapType, probeBatchLookupAndDeleteInner[uint64])
-}
-
 // probeBatchOperationsInner is the inner check to be used by probeBatchOperations.
 func probeBatchOperationsInner[T constraints.Unsigned](probeMap *cebpf.Map, keys ptrCastMarshaler[T], values ptrCastMarshaler[uint64]) error {
 	n, err := probeMap.BatchUpdate(keys, values, nil)
@@ -479,6 +438,58 @@ func (impl *ebpfMapsImpl) getOuterMap(mapID uint16) *cebpf.Map {
 func (impl *ebpfMapsImpl) RemoveReportedPID(pid libpf.PID) {
 	key := uint32(pid)
 	_ = impl.ReportedPIDs.Delete(unsafe.Pointer(&key))
+}
+
+// SetHeapLivePID adds or removes a PID from the heap_live_pids eBPF map.
+// When present, uprobe_heap_alloc will record allocations for this PID
+// in heap_alloc_live for free correlation.
+func (impl *ebpfMapsImpl) SetHeapLivePID(pid libpf.PID, enabled bool) {
+	if impl.HeapLivePids == nil {
+		return
+	}
+	key := uint32(pid)
+	if enabled {
+		val := uint8(1)
+		_ = impl.HeapLivePids.Put(unsafe.Pointer(&key), unsafe.Pointer(&val))
+	} else {
+		_ = impl.HeapLivePids.Delete(unsafe.Pointer(&key))
+	}
+}
+
+// DeleteHeapAllocLiveEntries removes entries from the heap_alloc_live map for
+// the given PID and pointers. Best-effort: errors are silently ignored.
+func (impl *ebpfMapsImpl) DeleteHeapAllocLiveEntries(pid libpf.PID, ptrs []uint64) {
+	if impl.HeapAllocLive == nil {
+		return
+	}
+	type heapAllocKey struct {
+		Pid uint32
+		Pad uint32
+		Ptr uint64
+	}
+	for _, ptr := range ptrs {
+		key := heapAllocKey{Pid: uint32(pid), Ptr: ptr}
+		_ = impl.HeapAllocLive.Delete(unsafe.Pointer(&key))
+	}
+}
+
+// DeleteHeapPIDAllocCount removes the per-PID alloc count entry for the given PID.
+// Called on process exit to reclaim the map slot.
+func (impl *ebpfMapsImpl) DeleteHeapPIDAllocCount(pid libpf.PID) {
+	if impl.HeapPIDAllocCount == nil {
+		return
+	}
+	key := uint32(pid)
+	_ = impl.HeapPIDAllocCount.Delete(unsafe.Pointer(&key))
+}
+
+// SetHeapPIDAllocLimit writes the per-PID allocation limit to the eBPF array map.
+func (impl *ebpfMapsImpl) SetHeapPIDAllocLimit(limit uint32) {
+	if impl.HeapPIDAllocLimit == nil {
+		return
+	}
+	key := uint32(0)
+	_ = impl.HeapPIDAllocLimit.Update(unsafe.Pointer(&key), unsafe.Pointer(&limit), cebpf.UpdateAny)
 }
 
 // UpdateUnwindInfo writes UnwindInfo into the unwind info array at the given index

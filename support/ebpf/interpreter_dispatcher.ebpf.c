@@ -18,6 +18,17 @@ struct per_cpu_records_t {
   __uint(max_entries, 1);
 } per_cpu_records SEC(".maps");
 
+// per_cpu_records_kp is a second per-CPU record used by the probe unwinder.
+// At load time loadProbeUnwinders repoints its get_per_cpu_record() from
+// per_cpu_records to this map, so a perf sampler interrupting an in-flight uprobe
+// unwind (uprobes are not covered by bpf_prog_active) cannot clobber its record.
+struct per_cpu_records_kp_t {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, int);
+  __type(value, PerCPURecord);
+  __uint(max_entries, 1);
+} per_cpu_records_kp SEC(".maps");
+
 // metrics maps metric ID to a value
 struct metrics_t {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -135,8 +146,20 @@ struct apm_int_procs_t {
   __uint(max_entries, 128);
 } apm_int_procs SEC(".maps");
 
+struct thread_context_procs_t {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, pid_t);
+  __type(value, ThreadContextProcInfo);
+  __uint(max_entries, 128);
+} thread_context_procs SEC(".maps");
+
 // filter_error_frames is set during load time.
 BPF_RODATA_VAR(bool, filter_error_frames, false)
+
+// go_labels_disabled gates Go custom-label extraction. It mirrors the Go labels
+// configuration (Config.IsLabelsDisabled). The Go runtime offsets are loaded
+// independently whenever Go support is enabled.
+BPF_RODATA_VAR(bool, go_labels_disabled, true)
 
 static EBPF_INLINE u64 go_get_g_register(UNUSED UnwindState *state)
 {
@@ -150,7 +173,7 @@ static EBPF_INLINE u64 go_get_g_register(UNUSED UnwindState *state)
 #endif
 }
 
-static EBPF_INLINE u64 go_get_g_ptr(struct GoLabelsOffsets *offs, UnwindState *state)
+static EBPF_INLINE u64 go_get_g_ptr(struct GoRuntimeOffsets *offs, UnwindState *state)
 {
   u64 g_register = go_get_g_register(state);
 
@@ -177,7 +200,7 @@ static EBPF_INLINE u64 go_get_g_ptr(struct GoLabelsOffsets *offs, UnwindState *s
   return g_addr ? g_addr : g_register;
 }
 
-static EBPF_INLINE void *go_get_m_ptr(struct GoLabelsOffsets *offs, UnwindState *state)
+static EBPF_INLINE void *go_get_m_ptr(struct GoRuntimeOffsets *offs, UnwindState *state)
 {
   u64 g_addr = go_get_g_ptr(offs, state);
   if (!g_addr) {
@@ -196,12 +219,15 @@ static EBPF_INLINE void *go_get_m_ptr(struct GoLabelsOffsets *offs, UnwindState 
 
 static EBPF_INLINE void maybe_add_go_custom_labels(struct pt_regs *ctx, PerCPURecord *record)
 {
-  u32 pid                  = record->trace.pid;
-  GoLabelsOffsets *offsets = bpf_map_lookup_elem(&go_labels_procs, &pid);
-  if (!offsets) {
-    DEBUG_PRINT("cl: no offsets, %d not recognized as a go binary", pid);
+  if (go_labels_disabled) {
     return;
   }
+
+  if (record->goOffsets.m_offset == 0) {
+    DEBUG_PRINT("cl: no offsets, %d not recognized as a go binary", record->trace.pid);
+    return;
+  }
+  GoRuntimeOffsets *offsets = &record->goOffsets;
 
   void *m_ptr_addr = go_get_m_ptr(offsets, &record->state);
   if (!m_ptr_addr) {
@@ -285,6 +311,74 @@ static EBPF_INLINE void maybe_add_apm_info(Trace *trace)
     corr_buf.trace_flags);
 }
 
+static EBPF_INLINE void maybe_add_thread_context_info(Trace *trace)
+{
+  u32 pid                     = trace->pid; // verifier needs this to be on stack on 4.15 kernel
+  ThreadContextProcInfo *proc = bpf_map_lookup_elem(&thread_context_procs, &pid);
+  if (!proc) {
+    return;
+  }
+
+  u64 tsd_base;
+  if (tsd_get_base((void **)&tsd_base) != 0) {
+    increment_metric(metricID_UnwindThreadContextErrReadTsdBase);
+    DEBUG_PRINT("Failed to get TSD base for native thread labels");
+    return;
+  }
+
+  // Read the pointer to the thread context buffer from the TLS variable. The
+  // variable is resolved as static (module_id == 0) or dynamic (DTV-based) TLS.
+  u64 thread_context_buf_ptr;
+  if (tls_read(
+        &proc->dtv_info,
+        (void *)tsd_base,
+        proc->module_id,
+        proc->tls_offset,
+        (void **)&thread_context_buf_ptr)) {
+    DEBUG_PRINT("Failed to read thread context buffer pointer");
+    return;
+  }
+
+  ThreadContextBuf thread_context_buf;
+  if (bpf_probe_read_user(
+        &thread_context_buf, sizeof(thread_context_buf), (void *)thread_context_buf_ptr)) {
+    increment_metric(metricID_UnwindThreadContextErrReadThreadCtxBuf);
+    DEBUG_PRINT("Failed to read custom labels buffer");
+    return;
+  }
+
+  if (!thread_context_buf.valid) {
+    return;
+  }
+
+  trace->apm_trace_id.as_int.hi    = thread_context_buf.trace_id.as_int.hi;
+  trace->apm_trace_id.as_int.lo    = thread_context_buf.trace_id.as_int.lo;
+  trace->apm_transaction_id.as_int = thread_context_buf.span_id.as_int;
+
+  // Truncate the data size to the size of the custom labels data
+  if (thread_context_buf.attrs_data_size > sizeof(trace->custom_labels_data.data)) {
+    thread_context_buf.attrs_data_size = sizeof(trace->custom_labels_data.data);
+  }
+  if (!bpf_probe_read_user(
+        &trace->custom_labels_data.data,
+        thread_context_buf.attrs_data_size,
+        (void *)(thread_context_buf_ptr + sizeof(thread_context_buf)))) {
+    trace->custom_labels_type      = CUSTOM_LABELS_TYPE_NATIVE;
+    trace->custom_labels_data.size = thread_context_buf.attrs_data_size;
+  } else {
+    increment_metric(metricID_UnwindThreadContextErrReadThreadCtxAttrs);
+  }
+
+  increment_metric(metricID_UnwindThreadContextReadSuccesses);
+
+  // WARN: we print this as little endian
+  DEBUG_PRINT(
+    "Thread labels trace ID: %016llX%016llX, span ID: %016llX",
+    trace->apm_trace_id.as_int.hi,
+    trace->apm_trace_id.as_int.lo,
+    trace->apm_transaction_id.as_int);
+}
+
 // unwind_stop is the tail call destination for PROG_UNWIND_STOP.
 static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
 {
@@ -294,6 +388,8 @@ static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
   Trace *trace       = &record->trace;
   UnwindState *state = &record->state;
 
+  maybe_add_thread_context_info(trace);
+  // TODO: remove apmint once thread context info is fully supported
   maybe_add_apm_info(trace);
   if (
     trace->apm_trace_id.as_int.hi == 0 && trace->apm_trace_id.as_int.lo == 0 &&

@@ -35,6 +35,24 @@ const (
 )
 
 const (
+	TraceEventNormal        = C.TRACE_EVENT_NORMAL
+	TraceEventAsyncStart    = C.TRACE_EVENT_ASYNC_START
+	TraceEventAsyncComplete = C.TRACE_EVENT_ASYNC_COMPLETE
+	TraceEventAsyncRegister = C.TRACE_EVENT_ASYNC_REGISTER
+	TraceEventAsyncProgress = C.TRACE_EVENT_ASYNC_PROGRESS
+
+	TraceAsyncNone         = C.TRACE_ASYNC_NONE
+	TraceAsyncIOUring      = C.TRACE_ASYNC_IO_URING
+	TraceAsyncBlock        = C.TRACE_ASYNC_BLOCK
+	TraceAsyncTCPConnect   = C.TRACE_ASYNC_TCP_CONNECT
+	TraceAsyncTCPAck       = C.TRACE_ASYNC_TCP_ACK
+	TraceAsyncTCPReceive   = C.TRACE_ASYNC_TCP_RECEIVE
+	TraceAsyncAttrMore     = C.TRACE_ASYNC_ATTR_MORE
+	TraceAsyncAttrSQPoll   = C.TRACE_ASYNC_ATTR_SQ_POLL
+	TraceAsyncAttrFiltered = C.TRACE_ASYNC_ATTR_FILTERED
+)
+
+const (
 	FrameFlagError         = C.FRAME_FLAG_ERROR
 	FrameFlagReturnAddress = C.FRAME_FLAG_RETURN_ADDRESS
 	FrameFlagPidSpecific   = C.FRAME_FLAG_PID_SPECIFIC
@@ -99,16 +117,23 @@ const (
 )
 
 const (
-	TraceOriginUnknown  = C.TRACE_UNKNOWN
-	TraceOriginSampling = C.TRACE_SAMPLING
-	TraceOriginOffCPU   = C.TRACE_OFF_CPU
-	TraceOriginProbe    = C.TRACE_PROBE
+	TraceOriginUnknown   = C.TRACE_UNKNOWN
+	TraceOriginSampling  = C.TRACE_SAMPLING
+	TraceOriginOffCPU    = C.TRACE_OFF_CPU
+	TraceOriginProbe     = C.TRACE_PROBE
+	TraceOriginHeapAlloc = C.TRACE_HEAP_ALLOC
+	TraceOriginHeapFree  = C.TRACE_HEAP_FREE
+
+	CustomLabelsTypeNone   = C.CUSTOM_LABELS_TYPE_NONE
+	CustomLabelsTypeNative = C.CUSTOM_LABELS_TYPE_NATIVE
+	CustomLabelsTypeGo     = C.CUSTOM_LABELS_TYPE_GO
 )
 
 type ApmSpanID C.ApmSpanID
 type ApmTraceID C.ApmTraceID
 type CustomLabel C.CustomLabel
 type CustomLabelsArray C.CustomLabelsArray
+type CustomLabelsData C.CustomLabelsData
 type Event C.Event
 type OffsetRange C.OffsetRange
 type PIDPage C.PIDPage
@@ -125,12 +150,13 @@ type UnwindInfo C.UnwindInfo
 type ApmIntProcInfo C.ApmIntProcInfo
 type BEAMProcInfo C.BEAMProcInfo
 type DotnetProcInfo C.DotnetProcInfo
-type GoLabelsOffsets C.GoLabelsOffsets
+type GoRuntimeOffsets C.GoRuntimeOffsets
 type HotspotProcInfo C.HotspotProcInfo
 type PHPProcInfo C.PHPProcInfo
 type PerlProcInfo C.PerlProcInfo
 type PyProcInfo C.PyProcInfo
 type RubyProcInfo C.RubyProcInfo
+type ThreadContextProcInfo C.ThreadContextProcInfo
 type V8ProcInfo C.V8ProcInfo
 type LuaJITProcInfo C.LuaJITProcInfo
 
@@ -324,4 +350,12 @@ var MetricsTranslation = []metrics.MetricID{
 	C.metricID_UnwindNativeErrNoVMA:                       metrics.IDUnwindNativeErrNoVMA,
 	C.metricID_UnwindNativeErrUnsupportedAnonymousMapping: metrics.IDUnwindNativeErrUnsupportedAnonymousMapping,
 	C.metricID_UnwindNativeErrNonExecutableVMA:            metrics.IDUnwindNativeErrNonExecutableVMA,
+	C.metricID_UnwindLuaJITAttempts:                       metrics.IDUnwindLuaJITAttempts,
+	C.metricID_UnwindLuaJITErrNoProcInfo:                  metrics.IDUnwindLuaJITErrNoProcInfo,
+	C.metricID_UnwindThreadContextErrReadTsdBase:          metrics.IDUnwindThreadContextErrReadTsdBase,
+	C.metricID_UnwindThreadContextErrReadThreadCtxBuf:     metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
+	C.metricID_UnwindThreadContextErrReadThreadCtxAttrs:   metrics.IDUnwindThreadContextErrReadThreadCtxAttrs,
+	C.metricID_UnwindThreadContextReadSuccesses:           metrics.IDUnwindThreadContextReadSuccesses,
+	C.metricID_HeapLiveMapFull:                            metrics.IDHeapLiveMapFull,
+	C.metricID_HeapPerPIDLimitHit:                         metrics.IDHeapPerPIDLimitHit,
 }

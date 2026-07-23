@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/internal/controller"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
 )
 
@@ -31,6 +32,7 @@ const (
 	defaultArgSendErrorFrames     = false
 	defaultOffCPUThreshold        = 0
 	defaultEnvVarsValue           = ""
+	defaultArgFrameCacheSize      = pm.DefaultFrameCacheSize
 	defaultBPFFSRoot              = "/sys/fs/bpf/"
 
 	// This is the X in 2^(n + x) where n is the default hardcoded map size value
@@ -80,10 +82,18 @@ var (
 		defaultOffCPUThreshold)
 	envVarsHelp = "Comma separated list of environment variables that will be reported with the" +
 		"captured profiling samples."
+	frameCacheSizeHelp = fmt.Sprintf("Set the maximum number of entries in the frame cache. "+
+		"Default is %d.", defaultArgFrameCacheSize)
 	probeLinkHelper = "Attach a probe to a symbol of an executable. " +
 		"Expected format: probe_type:target[:symbol]. probe_type can be kprobe, kretprobe, uprobe, or uretprobe."
 	loadProbeHelper = "Load generic eBPF program that can be attached externally to " +
 		"various user or kernel space hooks."
+	heapProfilingHelper = "Enable heap profiling via USDT uprobes. The profiler will " +
+		"scan target processes for `.note.stapsdt` entries from the heap-sampler " +
+		"provider and attach PID-scoped uprobes."
+	liveHeapProfilingHelper = "Additionally track deallocations to report the live " +
+		"(in-use) heap by attaching the heap-sampler free probe. " +
+		"Requires -heap-profiling."
 	bpffsHelp = fmt.Sprintf("Set the root BPF FS path for pinned maps. Only used for OBI span/trace ID communication. Default is %s",
 		defaultBPFFSRoot)
 	obiProcessCtxHelp = "Load or create a pinned eBPF map for sharing process context information with OBI."
@@ -105,6 +115,9 @@ func parseArgs() (*controller.Config, error) {
 	fs.BoolVar(&args.Copyright, "copyright", false, copyrightHelp)
 
 	fs.BoolVar(&args.DisableTLS, "disable-tls", false, disableTLSHelp)
+
+	fs.UintVar(&args.FrameCacheSize, "frame-cache-size",
+		uint(defaultArgFrameCacheSize), frameCacheSizeHelp)
 
 	fs.UintVar(&args.MapScaleFactor, "map-scale-factor",
 		defaultArgMapScaleFactor, mapScaleFactorHelp)
@@ -160,6 +173,14 @@ func parseArgs() (*controller.Config, error) {
 
 	fs.BoolVar(&args.LoadProbe, "load-probe", false, loadProbeHelper)
 
+	fs.BoolVar(&args.HeapProfiling, "heap-profiling", false, heapProfilingHelper)
+
+	fs.BoolVar(&args.LiveHeapProfiling, "live-heap-profiling", false, liveHeapProfilingHelper)
+
+	fs.IntVar(&args.LiveHeapMaxEntriesPerPID, "live-heap-max-entries-per-pid",
+		10000, "Maximum number of live heap entries tracked per process. "+
+			"Allocations beyond this limit are not tracked for inuse profiling.")
+
 	fs.Usage = func() {
 		fs.PrintDefaults()
 	}
@@ -202,7 +223,6 @@ func parseTracers(tracers string) (interpreterconfig.Config, error) {
 
 	// Start with all interpreters disabled; enable only the ones listed.
 	cfg := interpreterconfig.NoInterpreters()
-
 	for name := range strings.SplitSeq(tracers, ",") {
 		name = strings.ToLower(strings.TrimSpace(name))
 		switch name {
@@ -222,12 +242,17 @@ func parseTracers(tracers string) (interpreterconfig.Config, error) {
 			cfg.Dotnet.Disabled = false
 		case "go":
 			cfg.Go.Disabled = false
+			cfg.Go.Symbolization.Disabled = false
 		case "labels":
-			cfg.Labels.Disabled = false
+			cfg.Go.Disabled = false
+			cfg.Go.Labels.Disabled = false
 		case "beam":
 			cfg.BEAM.Disabled = false
 		case "luajit":
+			log.Warn("The LuaJIT interpreter is incomplete and may not work properly")
 			cfg.LuaJIT.Disabled = false
+		case "thread_context":
+			cfg.ThreadContext.Disabled = false
 		case "native":
 			log.Warn("Enabling the `native` tracer explicitly is deprecated (it's always-on)")
 		case "":

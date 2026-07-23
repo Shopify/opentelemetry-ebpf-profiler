@@ -301,18 +301,6 @@ enum {
   // number of failures to unwind code object due to its large size
   metricID_UnwindDotnetErrCodeTooLarge,
 
-  // number of attempts to unwind LuaJIT
-  metricID_UnwindLuaJITAttempts,
-
-  // number of failures to read LuaJIT proc info
-  metricID_UnwindLuaJITErrNoProcInfo,
-
-  // number of failures to read LuaJIT context pointer
-  metricID_UnwindLuaJITErrNoContext,
-
-  // number of failures in context pointer validity check
-  metricID_UnwindLuaJITErrLMismatch,
-
   // number of attempts to read Go custom labels
   metricID_UnwindGoLabelsAttempts,
 
@@ -351,6 +339,36 @@ enum {
 
   // number of times the current PC was found in a non-executable VMA
   metricID_UnwindNativeErrNonExecutableVMA,
+
+  // number of attempts to unwind LuaJIT
+  metricID_UnwindLuaJITAttempts,
+
+  // number of failures to read LuaJIT proc info
+  metricID_UnwindLuaJITErrNoProcInfo,
+
+  // number of failures to read LuaJIT context pointer
+  metricID_UnwindLuaJITErrNoContext,
+
+  // number of failures in LuaJIT context pointer validity checks
+  metricID_UnwindLuaJITErrLMismatch,
+
+  // number of failures to get TSD base for thread context
+  metricID_UnwindThreadContextErrReadTsdBase,
+
+  // number of failures read the thread context buffer
+  metricID_UnwindThreadContextErrReadThreadCtxBuf,
+
+  // number of failures read the thread context attributes
+  metricID_UnwindThreadContextErrReadThreadCtxAttrs,
+
+  // number of successful reads of thread context info
+  metricID_UnwindThreadContextReadSuccesses,
+
+  // number of dropped heap alloc entries due to map full
+  metricID_HeapLiveMapFull,
+
+  // number of heap allocs dropped due to per-PID live-heap cap
+  metricID_HeapPerPIDLimitHit,
 
   //
   // Metric IDs above are for counters (cumulative values)
@@ -393,6 +411,8 @@ typedef enum TraceOrigin {
   TRACE_SAMPLING,
   TRACE_OFF_CPU,
   TRACE_PROBE,
+  TRACE_HEAP_ALLOC,
+  TRACE_HEAP_FREE,
 } TraceOrigin;
 
 // Maximum number of unique stack deltas needed on a system. This is based on
@@ -630,6 +650,14 @@ typedef struct __attribute__((packed)) ApmCorrelationBuf {
   ApmSpanID transaction_id;
 } ApmCorrelationBuf;
 
+typedef struct __attribute__((packed)) ThreadContextBuf {
+  ApmTraceID trace_id;
+  ApmSpanID span_id;
+  u8 valid;
+  u8 _reserved;
+  u16 attrs_data_size;
+} ThreadContextBuf;
+
 #define CUSTOM_LABEL_MAX_KEY_LEN COMM_LEN
 // Big enough to hold UUIDs, etc.
 #define CUSTOM_LABEL_MAX_VAL_LEN 48
@@ -646,7 +674,39 @@ typedef struct CustomLabelsArray {
   CustomLabel labels[MAX_CUSTOM_LABELS];
 } CustomLabelsArray;
 
+typedef struct CustomLabelsData {
+  u16 size;
+  u8 data[sizeof(CustomLabelsArray) - sizeof(u16)];
+} CustomLabelsData;
+
+enum CustomLabelsType {
+  CUSTOM_LABELS_TYPE_NONE,
+  CUSTOM_LABELS_TYPE_NATIVE,
+  CUSTOM_LABELS_TYPE_GO,
+};
+
 // Container for a stack trace
+// Trace event lifecycle phases. Ordinary synchronous profiles use NORMAL.
+#define TRACE_EVENT_NORMAL         0
+#define TRACE_EVENT_ASYNC_START    1
+#define TRACE_EVENT_ASYNC_COMPLETE 2
+#define TRACE_EVENT_ASYNC_REGISTER 3
+#define TRACE_EVENT_ASYNC_PROGRESS 4
+
+// Asynchronous subsystem identifiers.
+#define TRACE_ASYNC_NONE        0
+#define TRACE_ASYNC_IO_URING    1
+#define TRACE_ASYNC_BLOCK       2
+#define TRACE_ASYNC_TCP_CONNECT 3
+#define TRACE_ASYNC_TCP_ACK     4
+#define TRACE_ASYNC_TCP_RECEIVE 5
+
+// Asynchronous event attributes.
+#define TRACE_ASYNC_ATTR_MORE     (1U << 0)
+#define TRACE_ASYNC_ATTR_SQ_POLL  (1U << 1)
+#define TRACE_ASYNC_ATTR_FILTERED (1U << 2)
+
+// Profile stack and asynchronous lifecycle data emitted through trace_events.
 typedef struct Trace {
   // The process ID
   // NOTE: Confusingly, this is what Linux calls "tgid"
@@ -662,8 +722,13 @@ typedef struct Trace {
   ApmSpanID apm_transaction_id;
   // APM trace ID or all-zero if not present.
   ApmTraceID apm_trace_id;
-  // Custom Labels
-  CustomLabelsArray custom_labels;
+  // Custom labels type (Native or Go)
+  u8 custom_labels_type;
+  union {
+    // Custom labels data
+    CustomLabelsData custom_labels_data;
+    CustomLabelsArray custom_labels;
+  };
   // The number of frame_data elements present.
   u16 frame_data_len;
   // The number of frames present.
@@ -672,12 +737,51 @@ typedef struct Trace {
   // These are raw u64 addresses from bpf_get_stack(), not encoded frames.
   u16 num_kernel_frames;
 
-  // origin indicates the source of the trace.
-  TraceOrigin origin;
+  // origin indicates the source of the trace and it is set as
+  // RODATA variable at load time.
+  u16 origin;
 
   // value stores context-specific data that was collected with the stack.
   // e.g. time in nanoseconds for off-CPU traces
   u64 value;
+
+  // correlation_id joins asynchronous start and completion events. It must be
+  // unique within an origin while the operation is in flight.
+  u64 correlation_id;
+
+  // async_user_data carries an optional subsystem-defined request identifier.
+  u64 async_user_data;
+
+  // async_threshold carries a userspace completion filter where the kernel
+  // cannot join ordered ranges by itself.
+  u64 async_threshold;
+
+  // async_result and async_flags describe the completion result.
+  s64 async_result;
+  u32 async_flags;
+
+  // async_operation identifies a subsystem operation (for example an
+  // io_uring opcode).
+  u16 async_operation;
+
+  // event_kind distinguishes ordinary traces from asynchronous lifecycle
+  // events. async_kind identifies the subsystem, and async_attributes carries
+  // subsystem-independent flags such as multishot and SQPOLL attribution.
+  u8 event_kind;
+  u8 async_kind;
+  u8 async_attributes;
+  u8 async_reserved[3];
+
+  // ptr stores a context-specific pointer collected with the stack.
+  // For TRACE_HEAP_ALLOC / TRACE_HEAP_FREE: the user-visible allocation address.
+  u64 ptr;
+
+  // size stores a context-specific raw size collected with the stack.
+  // For TRACE_HEAP_ALLOC: the un-weighted allocation size in bytes, as passed
+  // to the alloc USDT. Combined with value (the byte-weighted estimator),
+  // downstream consumers can derive an unbiased object-count estimate
+  // (value / size). Zero for all other origins.
+  u64 size;
 
   // The CPU that captured this trace.
   u32 cpu_id;
@@ -903,6 +1007,16 @@ typedef struct GoMapBucket {
   void *overflow;
 } GoMapBucket;
 
+typedef struct GoRuntimeOffsets {
+  u32 m_offset;
+  u32 curg;
+  u32 labels;
+  u32 hmap_count;
+  u32 hmap_log2_bucket_count;
+  u32 hmap_buckets;
+  s32 tls_offset;
+} GoRuntimeOffsets;
+
 typedef struct CustomLabelsState {
   void *go_m_ptr;
 } CustomLabelsState;
@@ -926,6 +1040,9 @@ typedef struct PerCPURecord {
   LJUnwindState luajitUnwindState;
   // State for Go and Native custom labels
   CustomLabelsState customLabelsState;
+  // Per-process Go runtime offsets, preloaded once per trace from go_procs in
+  // collect_trace. m_offset is always non-zero for a Go process.
+  GoRuntimeOffsets goOffsets;
   union {
     // Scratch space for the Dotnet unwinder.
     DotnetUnwindScratchSpace dotnetUnwindScratch;
@@ -1154,14 +1271,14 @@ typedef struct ApmIntProcInfo {
   u64 tls_offset;
 } ApmIntProcInfo;
 
-typedef struct GoLabelsOffsets {
-  u32 m_offset;
-  u32 curg;
-  u32 labels;
-  u32 hmap_count;
-  u32 hmap_log2_bucket_count;
-  u32 hmap_buckets;
+typedef struct ThreadContextProcInfo {
+  // tls_offset is the variable's offset: TP-relative for static TLS
+  // (local-exec / initial-exec, when module_id == 0), or the offset within the
+  // module's TLS block for dynamic TLS.
   s32 tls_offset;
-} GoLabelsOffsets;
-
+  // module_id is the TLS module ID for dynamic TLS, or 0 for static TLS.
+  u32 module_id;
+  // dtv_info locates the DTV for dynamic TLS (unused when module_id == 0).
+  DTVInfo dtv_info;
+} ThreadContextProcInfo;
 #endif // OPTI_TYPES_H

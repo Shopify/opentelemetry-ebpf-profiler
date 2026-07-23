@@ -8,11 +8,22 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-viper/mapstructure/v2"
+
 	"go.opentelemetry.io/ebpf-profiler/internal/linux"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/probes/biostacks"
+	"go.opentelemetry.io/ebpf-profiler/probes/functionlatency"
+	"go.opentelemetry.io/ebpf-profiler/probes/generic"
+	"go.opentelemetry.io/ebpf-profiler/probes/iouring"
+	"go.opentelemetry.io/ebpf-profiler/probes/offcpu"
+	"go.opentelemetry.io/ebpf-profiler/probes/tcpconnect"
+	"go.opentelemetry.io/ebpf-profiler/probes/tcpsequence"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/liveheap"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
+
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/times"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
@@ -83,33 +94,68 @@ func (c *Controller) Start(ctx context.Context) error {
 		}
 	}
 
+	// Use the pre-created live heap tracker if provided, otherwise create one.
+	liveTracker := c.config.LiveHeapTracker
+	if liveTracker == nil && c.config.LiveHeapProfiling {
+		liveTracker = liveheap.NewTracker(liveheap.DefaultMaxEntries)
+	}
+	if liveTracker != nil {
+		if setter, ok := c.reporter.(interface {
+			SetLiveHeapTracker(*liveheap.Tracker)
+		}); ok {
+			setter.SetLiveHeapTracker(liveTracker)
+		}
+	}
+
 	// Load the eBPF code and map definitions
 	trc, err := tracer.NewTracer(ctx, &tracer.Config{
-		TraceReporter:          c.reporter,
-		Intervals:              intervals,
-		InterpretersConfig:     c.config.Interpreters,
-		FilterErrorFrames:      !c.config.SendErrorFrames,
-		FilterIdleFrames:       !c.config.SendIdleFrames,
-		SamplesPerSecond:       c.config.SamplesPerSecond,
-		MapScaleFactor:         int(c.config.MapScaleFactor),
-		KernelVersionCheck:     !c.config.NoKernelVersionCheck,
-		VerboseMode:            c.config.VerboseMode,
-		BPFVerifierLogLevel:    uint32(c.config.BPFVerifierLogLevel),
-		ProbabilisticInterval:  c.config.ProbabilisticInterval,
-		ProbabilisticThreshold: c.config.ProbabilisticThreshold,
-		OffCPUThreshold:        uint32(c.config.OffCPUThreshold * float64(math.MaxUint32)),
-		IncludeEnvVars:         envVars,
-		ProbeLinks:             c.config.ProbeLinks,
-		LoadProbe:              c.config.LoadProbe,
-		ExecutableReporter:     c.config.ExecutableReporter,
-		BPFFSRoot:              c.config.BPFFSRoot,
-		OBIProcessCtx:          c.config.OBIProcessCtx,
+		TraceReporter:            c.reporter,
+		Intervals:                intervals,
+		InterpretersConfig:       c.config.Interpreters,
+		FilterErrorFrames:        !c.config.SendErrorFrames,
+		FilterIdleFrames:         !c.config.SendIdleFrames,
+		SamplesPerSecond:         c.config.SamplesPerSecond,
+		MapScaleFactor:           int(c.config.MapScaleFactor),
+		FrameCacheSize:           uint32(c.config.FrameCacheSize),
+		AsyncCorrelationCapacity: int(c.config.AsyncCorrelationCapacity),
+		AsyncCorrelationTTL:      c.config.AsyncCorrelationTTL,
+		KernelVersionCheck:       !c.config.NoKernelVersionCheck,
+		VerboseMode:              c.config.VerboseMode,
+		BPFVerifierLogLevel:      uint32(c.config.BPFVerifierLogLevel),
+		ProbabilisticInterval:    c.config.ProbabilisticInterval,
+		ProbabilisticThreshold:   c.config.ProbabilisticThreshold,
+		OffCPUThreshold:          uint32(c.config.OffCPUThreshold * float64(math.MaxUint32)),
+		IncludeEnvVars:           envVars,
+		ProbeLinks:               c.config.ProbeLinks,
+		LoadProbe:                c.config.LoadProbe || len(c.config.CustomProbes) > 0,
+		HeapProfiling:            c.config.HeapProfiling,
+		LiveHeapProfiling:        c.config.LiveHeapProfiling,
+		LiveHeapMaxEntriesPerPID: c.config.LiveHeapMaxEntriesPerPID,
+		LiveHeapTracker:          liveTracker,
+		ExecutableReporter:       c.config.ExecutableReporter,
+		BPFFSRoot:                c.config.BPFFSRoot,
+		OBIProcessCtx:            c.config.OBIProcessCtx,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to load eBPF tracer: %w", err)
 	}
 	c.tracer = trc
 	log.Info("eBPF tracer loaded")
+
+	// Wire process metadata resolver for inuse profiles now that tracer exists.
+	if liveTracker != nil {
+		if setter, ok := c.reporter.(interface {
+			SetProcessMetaForInuse(func(libpf.PID) liveheap.ProcessMeta)
+		}); ok {
+			setter.SetProcessMetaForInuse(func(pid libpf.PID) liveheap.ProcessMeta {
+				meta := trc.ProcessManager().MetaForPID(pid)
+				return liveheap.ProcessMeta{
+					ExecutablePath: meta.Executable,
+					ContainerID:    meta.ContainerID,
+				}
+			})
+		}
+	}
 
 	now := time.Now()
 
@@ -159,7 +205,77 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start trace handling: %w", err)
 	}
 
+	if err := c.enableCustomProbes(trc); err != nil {
+		return fmt.Errorf("failed to enable custom probes: %w", err)
+	}
+
 	return nil
+}
+
+func (c *Controller) enableCustomProbes(trc *tracer.Tracer) error {
+	if len(c.config.CustomProbes) == 0 {
+		return nil
+	}
+
+	for probeName, probeConfig := range c.config.CustomProbes {
+		probe, err := createCustomProbe(probeName, probeConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create custom probe %q: %w", probeName, err)
+		}
+
+		if err := trc.Enable(probe); err != nil {
+			return fmt.Errorf("failed to enable custom probe %q: %w", probeName, err)
+		}
+
+		log.Infof("Enabled custom probe %q", probeName)
+	}
+
+	return nil
+}
+
+func createCustomProbe(name string, cfg any) (tracer.Probe, error) {
+	switch name {
+	case "generic":
+		var gcfg generic.GenericConfig
+		if err := mapstructure.Decode(cfg, &gcfg); err != nil {
+			return nil, fmt.Errorf("decoding generic probe config: %w", err)
+		}
+		return generic.New(gcfg)
+	case biostacks.SampleType, biostacks.ServiceSampleType, biostacks.FullSampleType:
+		return biostacks.NewForSampleType(name, cfg)
+	case iouring.SampleType:
+		return iouring.New(cfg)
+	case tcpconnect.SampleType:
+		return tcpconnect.New(cfg)
+	case tcpsequence.SendACKSampleType:
+		return tcpsequence.NewSendACK(cfg)
+	case tcpsequence.ReceiveSampleType:
+		return tcpsequence.NewReceive(cfg)
+	case "tcp_send_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "tcp_sendmsg",
+			SampleType: name,
+		}, cfg)
+	case "tcp_receive_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "tcp_recvmsg",
+			SampleType: name,
+		}, cfg)
+	case "vfs_read_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "vfs_read",
+			SampleType: name,
+		}, cfg)
+	case "vfs_write_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "vfs_write",
+			SampleType: name,
+		}, cfg)
+	case offcpu.SampleType:
+		return offcpu.New(cfg)
+	default:
+		return nil, fmt.Errorf("unknown custom probe: %q", name)
+	}
 }
 
 // Shutdown stops the controller

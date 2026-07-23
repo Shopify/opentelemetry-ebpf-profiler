@@ -1038,7 +1038,7 @@ func (r *rubyInstance) readIseqBody(iseqBody, pc libpf.Address, frameAddrType ui
 			libpf.Address(vms.iseq_constant_body.location+vms.iseq_location_struct.base_label))
 		methodName, err = r.getStringCached(methodNamePtr, r.readRubyString)
 		if err != nil {
-			log.Warnf("Unable to find local method name on iseq method (%d) (iseq@0x%08x) %v", iseqType, iseqBody, err)
+			log.Debugf("Unable to find local method name on iseq method (%d) (iseq@0x%08x) %v", iseqType, iseqBody, err)
 		}
 	}
 
@@ -1163,7 +1163,7 @@ func (r *rubyInstance) Symbolize(ef libpf.EbpfFrame, frames *libpf.Frames, _ lib
 		if err != nil {
 			// Failing to read the class name is not a fatal error, keep going with just the method name
 			// and provide an incomplete label rather than nothing at all.
-			log.Errorf("Failed to read class name for cme (%d): %v", frameAddrType, err)
+			log.Debugf("Failed to read class name for cme (%d): %v", frameAddrType, err)
 		}
 	}
 
@@ -1179,7 +1179,7 @@ func (r *rubyInstance) Symbolize(ef libpf.EbpfFrame, frames *libpf.Frames, _ lib
 		lineNo, err := r.getRubyLineNo(cfpIseq, uint64(pc))
 		if err != nil {
 			lineNo = 0
-			log.Warnf("RubySymbolizer: Failed to get line number (%d) %v", frameAddrType, err)
+			log.Debugf("RubySymbolizer: Failed to get line number (%d) %v", frameAddrType, err)
 		}
 		iseq, err := r.readIseqBody(iseqBody, pc, frameAddrType)
 		if err != nil {
@@ -1283,17 +1283,16 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 }
 
 // findJITRegion detects the Ruby JIT code reservation from process memory mappings.
-// Ruby reserves one contiguous address range via rb_jit_reserve_addr_space(), then
-// uses mprotect to activate pages as r-x or temporarily rw. Code GC can turn pages
-// back into PROT_NONE, so that single reservation may appear as multiple VMAs with
-// holes or different protections. On systems with CONFIG_ANON_VMA_NAME, Ruby labels
-// the region via prctl(PR_SET_VMA) giving it a path like
-// "[anon:Ruby:rb_jit_reserve_addr_space]". Otherwise we use a conservative fallback
-// that spans from the first anonymous executable mapping to the end of the last
-// anonymous executable mapping, plus any contiguous anonymous tail after that last
-// executable mapping. This covers production layouts where the single Ruby JIT
-// reservation is split across several VMAs without requiring multi-segment tracking
-// in eBPF.
+// Ruby reserves address ranges via rb_jit_reserve_addr_space() and then uses
+// mprotect to activate pages as r-x or temporarily rw. Code GC can turn pages
+// back into PROT_NONE, so the reservation may appear as multiple VMAs.
+// On systems with CONFIG_ANON_VMA_NAME, Ruby labels the region via prctl(PR_SET_VMA)
+// giving it a path like "[anon:Ruby:rb_jit_reserve_addr_space]". Otherwise we use
+// a conservative fallback that spans from the first anonymous executable mapping
+// to the end of the last anonymous executable mapping, plus any contiguous
+// anonymous tail after that last executable mapping. This covers production
+// layouts where Ruby exposes multiple discontiguous anonymous executable ranges
+// without requiring multi-segment tracking in eBPF.
 // Returns (start, end, found).
 func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
 	var jitStart, jitEnd uint64
@@ -1363,33 +1362,38 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 		jitEnd = 0
 	}
 
+	var prefixes []lpm.Prefix
+	if jitFound {
+		var err error
+		prefixes, err = lpm.CalculatePrefixList(jitStart, jitEnd)
+		if err != nil {
+			return fmt.Errorf("ruby jit region lpm failure %#x-%#x: %w", jitStart, jitEnd, err)
+		}
+	}
+
 	// Publish the JIT range before publishing new interpreter prefixes. Once a
 	// prefix is visible to eBPF, samples in that range may enter the Ruby unwinder
 	// and need procInfo to already contain the matching range for JIT-frame checks.
 	if r.procInfo.Jit_start != jitStart || r.procInfo.Jit_end != jitEnd {
-		r.procInfo.Jit_start = jitStart
-		r.procInfo.Jit_end = jitEnd
-		if err := ebpf.UpdateProcData(libpf.Ruby, pr.PID(), unsafe.Pointer(r.procInfo)); err != nil {
+		updatedProcInfo := *r.procInfo
+		updatedProcInfo.Jit_start = jitStart
+		updatedProcInfo.Jit_end = jitEnd
+		if err := ebpf.UpdateProcData(libpf.Ruby, pid, unsafe.Pointer(&updatedProcInfo)); err != nil {
 			return err
 		}
+		r.procInfo.Jit_start = jitStart
+		r.procInfo.Jit_end = jitEnd
 		log.Debugf("Updated JIT region %#x-%#x in ruby proc info", jitStart, jitEnd)
 	}
 
-	if jitFound {
-		prefixes, err := lpm.CalculatePrefixList(jitStart, jitEnd)
-		if err != nil {
-			return fmt.Errorf("ruby jit region lpm failure %#x-%#x: %w", jitStart, jitEnd, err)
-		}
-
-		for _, prefix := range prefixes {
-			if _, exists := r.prefixes[prefix]; !exists {
-				if err := ebpf.UpdatePidInterpreterMapping(pid, prefix,
-					support.ProgUnwindRuby, 0, 0); err != nil {
-					return err
-				}
+	for _, prefix := range prefixes {
+		if _, exists := r.prefixes[prefix]; !exists {
+			if err := ebpf.UpdatePidInterpreterMapping(pid, prefix,
+				support.ProgUnwindRuby, 0, 0); err != nil {
+				return err
 			}
-			r.prefixes[prefix] = r.mappingGeneration
 		}
+		r.prefixes[prefix] = r.mappingGeneration
 	}
 
 	// Remove prefixes not seen.
@@ -1600,7 +1604,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		}
 		return true
 	}); err != nil {
-		log.Warnf("failed to visit symbols: %v", err)
+		log.Debugf("failed to visit symbols: %v", err)
 	}
 
 	// NOTE for ruby 3.3.0+, if ruby is stripped, we have no way of locating
@@ -1615,7 +1619,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		}
 		return true
 	}); err != nil {
-		log.Warnf("failed to locate TLS descriptor: %v", err)
+		log.Debugf("failed to locate TLS descriptor: %v", err)
 	}
 
 	// For statically-linked ruby, extract the direct TP-relative offset from
@@ -1625,7 +1629,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	if isBinRuby {
 		offset, ecErr := extractEcTLSOffset(ef)
 		if ecErr != nil {
-			log.Warnf("failed to extract EC TLS offset for static ruby: %v", ecErr)
+			log.Debugf("failed to extract EC TLS offset for static ruby: %v", ecErr)
 		} else {
 			staticTLSOffset = offset
 		}
@@ -1634,12 +1638,12 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// Look for DTPMOD64 relocation to find the TLS module ID offset.
 	// This is used for DTV-based TLS access when TLSDESC is unavailable.
 	var tlsModuleIdOffset libpf.Address
-	if err = ef.VisitRelocations(func(r pfelf.ElfReloc, _ string) bool {
+	if err = ef.VisitRelocations(func(r pfelf.ElfReloc, _ string, _ pfelf.RelocType) bool {
 		log.Debugf("Found DTPMOD64 relocation at offset %x", r.Off)
 		tlsModuleIdOffset = libpf.Address(r.Off)
 		return false
 	}, pfelf.RelDTPMOD64); err != nil {
-		log.Warnf("failed to find DTPMOD64 relocation: %v", err)
+		log.Debugf("failed to find DTPMOD64 relocation: %v", err)
 	}
 
 	log.Debugf("Discovered EC tls tpbase offset %x, static tls offset %d, dtpmod offset %x, fallback ctx %x, interp ranges: %v, global symbols: %x",

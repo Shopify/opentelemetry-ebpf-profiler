@@ -53,6 +53,9 @@ extern u32 vma_vm_file_offset;
 // vma_vm_flags_offset is declared in native_stack_trace.ebpf.c
 extern u32 vma_vm_flags_offset;
 
+// origin_id_sampling is declared in native_stack_trace.ebpf.c
+extern u16 origin_id_sampling;
+
 // Strips the PAC tag from a pointer.
 //
 // While all pointers can contain PAC tags, we only apply this function to code pointers, because
@@ -132,13 +135,31 @@ static inline EBPF_INLINE PIDPageMappingInfo *pid_information(int pid)
   key.pid       = __constant_cpu_to_be32((u32)pid);
   key.page      = 0;
 
-  return bpf_map_lookup_elem(&pid_page_to_mapping_info, &key);
+  PIDPageMappingInfo *info = bpf_map_lookup_elem(&pid_page_to_mapping_info, &key);
+  if (!info || (info->file_id & ~PID_PAGE_MAPPING_INFO_FLAG_USES_ANONYMOUS_MAPPINGS) != 0) {
+    // A less-specific executable mapping can match page zero after the exact
+    // marker is deleted. It must not be mistaken for the per-PID marker.
+    return NULL;
+  }
+  return info;
 }
 
 // pid_information_exists checks if the given pid exists in pid_page_to_mapping_info or not.
 static inline EBPF_INLINE bool pid_information_exists(int pid)
 {
   return pid_information(pid) != NULL;
+}
+
+// forget_pid_information removes the exact per-PID marker without walking the
+// process's LPM mappings. A missing marker suppresses trace emission until
+// userspace reconciles the replacement image after exec.
+static inline EBPF_INLINE void forget_pid_information(int pid)
+{
+  PIDPage key   = {};
+  key.prefixLen = BIT_WIDTH_PID + BIT_WIDTH_PAGE;
+  key.pid       = __constant_cpu_to_be32((u32)pid);
+  key.page      = 0;
+  bpf_map_delete_elem(&pid_page_to_mapping_info, &key);
 }
 
 static inline EBPF_INLINE bool pid_uses_anonymous_mappings(PIDPageMappingInfo *info)
@@ -215,10 +236,13 @@ static inline EBPF_INLINE bool pid_event_ratelimit(u32 pid, int ratelimit_action
   return false;
 }
 
-// report_pid informs userspace about a PID that needs to be processed.
+// report_pid_value informs userspace about a PID that needs to be processed.
+// A false value identifies an exec invalidation. Normal true-valued reports do
+// not overwrite a pending exec event before userspace consumes it.
 // See pid_event_ratelimit for ratelimit_action functional specifics.
 // Returns true if the PID was successfully reported to user space.
-static inline EBPF_INLINE bool report_pid(void *ctx, u64 pid_tgid, int ratelimit_action)
+static inline EBPF_INLINE bool
+report_pid_value(void *ctx, u64 pid_tgid, int ratelimit_action, bool value)
 {
   u32 pid = pid_tgid >> 32;
 
@@ -226,8 +250,11 @@ static inline EBPF_INLINE bool report_pid(void *ctx, u64 pid_tgid, int ratelimit
     return false;
   }
 
-  bool value = true;
-  int errNo  = bpf_map_update_elem(&pid_events, &pid_tgid, &value, BPF_ANY);
+  bool *pending = bpf_map_lookup_elem(&pid_events, &pid_tgid);
+  int errNo     = 0;
+  if (!pending || !value || *pending) {
+    errNo = bpf_map_update_elem(&pid_events, &pid_tgid, &value, BPF_ANY);
+  }
   if (errNo != 0) {
     __attribute__((unused)) u32 tid = pid_tgid & 0xFFFFFFFF;
     DEBUG_PRINT("Failed to update pid_events with PID %d TID: %d: %d", pid, tid, errNo);
@@ -244,6 +271,11 @@ static inline EBPF_INLINE bool report_pid(void *ctx, u64 pid_tgid, int ratelimit
   // and we can simply return success.
   event_send_trigger(ctx, EVENT_TYPE_GENERIC_PID);
   return true;
+}
+
+static inline EBPF_INLINE bool report_pid(void *ctx, u64 pid_tgid, int ratelimit_action)
+{
+  return report_pid_value(ctx, pid_tgid, ratelimit_action, true);
 }
 
 // Return the per-cpu record.
@@ -289,6 +321,7 @@ static inline EBPF_INLINE PerCPURecord *get_pristine_per_cpu_record()
   record->ratelimitAction                   = RATELIMIT_ACTION_DEFAULT;
   record->usesAnonymousMappings             = false;
   record->customLabelsState.go_m_ptr        = NULL;
+  record->goOffsets.m_offset                = 0;
 
   Trace *trace             = &record->trace;
   trace->frame_data_len    = 0;
@@ -296,12 +329,22 @@ static inline EBPF_INLINE PerCPURecord *get_pristine_per_cpu_record()
   trace->num_kernel_frames = 0;
   trace->pid               = 0;
   trace->tid               = 0;
+  trace->correlation_id    = 0;
+  trace->async_user_data   = 0;
+  trace->async_threshold   = 0;
+  trace->async_result      = 0;
+  trace->async_flags       = 0;
+  trace->async_operation   = 0;
+  trace->event_kind        = TRACE_EVENT_NORMAL;
+  trace->async_kind        = TRACE_ASYNC_NONE;
+  trace->async_attributes  = 0;
 
   trace->apm_trace_id.as_int.hi    = 0;
   trace->apm_trace_id.as_int.lo    = 0;
   trace->apm_transaction_id.as_int = 0;
 
-  trace->custom_labels.len = 0;
+  trace->custom_labels_type = CUSTOM_LABELS_TYPE_NONE;
+  trace->custom_labels.len  = 0;
 
   return record;
 }
@@ -925,9 +968,38 @@ get_usermode_regs(struct pt_regs *ctx, UnwindState *state, bool *has_usermode_re
 
 #endif // TESTING_COREDUMP
 
-static inline EBPF_INLINE int collect_trace(
-  struct pt_regs *ctx, TraceOrigin origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value)
+// EntryFrameState carries the minimum function-entry context a latency probe
+// needs to synthesize the probed function as the leaf frame at return time.
+// Return-probe trampolines rewrite the return-address slot (x86-64) or link
+// register (aarch64) at entry, so the caller identity must be captured on
+// entry rather than recovered from stack memory during return-time unwinding.
+typedef struct EntryFrameState {
+  u64 pc; // instruction pointer at function entry
+  u64 sp; // stack pointer at function entry
+  u64 fp; // frame pointer at function entry
+  u64 ra; // return address captured at function entry, 0 if unavailable
+} EntryFrameState;
+
+static inline EBPF_INLINE int collect_trace_internal(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 value,
+  u64 correlation_id,
+  u64 async_user_data,
+  u64 async_threshold,
+  u16 async_operation,
+  u8 async_kind,
+  u8 async_attributes,
+  const EntryFrameState *entry_frame)
 {
+  // Only continue processing the trace with a valid origin.
+  if (origin == 0) {
+    return -1;
+  }
+
   // The trace is reused on each call to this function so we have to reset the
   // variables used to maintain state.
   DEBUG_PRINT("Resetting CPU record");
@@ -936,12 +1008,19 @@ static inline EBPF_INLINE int collect_trace(
     return -1;
   }
 
-  Trace *trace  = &record->trace;
-  trace->origin = origin;
-  trace->pid    = pid;
-  trace->tid    = tid;
-  trace->ktime  = trace_timestamp;
-  trace->value  = value;
+  Trace *trace            = &record->trace;
+  trace->origin           = origin;
+  trace->pid              = pid;
+  trace->tid              = tid;
+  trace->ktime            = trace_timestamp;
+  trace->value            = value;
+  trace->correlation_id   = correlation_id;
+  trace->async_user_data  = async_user_data;
+  trace->async_threshold  = async_threshold;
+  trace->async_operation  = async_operation;
+  trace->event_kind       = correlation_id ? TRACE_EVENT_ASYNC_START : TRACE_EVENT_NORMAL;
+  trace->async_kind       = async_kind;
+  trace->async_attributes = async_attributes;
   if (bpf_get_current_comm(&(trace->comm), sizeof(trace->comm)) < 0) {
     increment_metric(metricID_ErrBPFCurrentComm);
   }
@@ -954,10 +1033,27 @@ static inline EBPF_INLINE int collect_trace(
     return 0;
   }
 
-  // Recursive unwind frames
+  // Preload this trace's go_procs entry into record->goOffsets.
+  GoRuntimeOffsets *go_offsets = bpf_map_lookup_elem(&go_procs, &pid);
+  if (go_offsets) {
+    record->goOffsets = *go_offsets;
+  }
+
+  // Recursive unwind frames. Latency probes may retain a function-entry
+  // snapshot and supply it after return-time filtering so the measured
+  // function remains the leaf frame without unwind cost at every entry.
   int unwinder           = PROG_UNWIND_STOP;
   bool has_usermode_regs = false;
-  ErrorCode error        = get_usermode_regs(ctx, &record->state, &has_usermode_regs);
+  ErrorCode error;
+  if (entry_frame) {
+    record->state.pc  = entry_frame->pc;
+    record->state.sp  = entry_frame->sp;
+    record->state.fp  = entry_frame->fp;
+    has_usermode_regs = true;
+    error             = ERR_OK;
+  } else {
+    error = get_usermode_regs(ctx, &record->state, &has_usermode_regs);
+  }
   if (error || !has_usermode_regs) {
     goto exit;
   }
@@ -975,6 +1071,31 @@ static inline EBPF_INLINE int collect_trace(
 
   record->usesAnonymousMappings = pid_uses_anonymous_mappings(pidInfo);
 
+  if (entry_frame && entry_frame->ra) {
+    // Push the probed function as an explicit leaf frame, then resume
+    // ordinary unwinding at its caller. The return address was captured at
+    // entry because the return-probe trampoline consumes the on-stack slot.
+    int leaf_unwinder = PROG_UNWIND_STOP;
+    error             = resolve_unwind_mapping(record, &leaf_unwinder);
+    if (error == ERR_OK && leaf_unwinder == PROG_UNWIND_NATIVE) {
+      u64 *leaf = push_frame(
+        &record->state, trace, FRAME_MARKER_NATIVE, 0, record->state.text_section_offset, 1);
+      if (!leaf) {
+        error = ERR_STACK_LENGTH_EXCEEDED;
+        goto exit;
+      }
+      leaf[0]          = record->state.text_section_id;
+      record->state.pc = normalize_pac_ptr(entry_frame->ra);
+#if defined(__x86_64__)
+      // The call instruction pushed the return address below the entry SP.
+      record->state.sp = entry_frame->sp + sizeof(u64);
+#endif
+      unwinder_mark_nonleaf_frame(&record->state);
+    }
+    // On resolution failure fall through unchanged: the ordinary lookup below
+    // reports the same missing-mapping error and drives process sync.
+  }
+
   error                   = get_next_unwinder_after_native_frame(record, &unwinder);
   record->initialUnwinder = unwinder;
 
@@ -983,6 +1104,94 @@ exit:
   tail_call(ctx, unwinder);
   DEBUG_PRINT("bpf_tail call failed for %d in native_tracer_entry", unwinder);
   return -1;
+}
+
+static inline EBPF_INLINE int
+collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value)
+{
+  return collect_trace_internal(
+    ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0, NULL);
+}
+
+// collect_trace_with_user_data collects a synchronous trace that carries a
+// probe-defined value in the trace's async_user_data slot. The event stays
+// TRACE_EVENT_NORMAL (no correlation id); the owning probe interprets the
+// value in userspace, e.g. to attach per-sample labels.
+static inline EBPF_INLINE int collect_trace_with_user_data(
+  struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value, u64 user_data)
+{
+  return collect_trace_internal(
+    ctx, origin, pid, tid, trace_timestamp, value, 0, user_data, 0, 0, 0, 0, NULL);
+}
+
+static inline EBPF_INLINE int collect_trace_with_entry_frame(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 value,
+  const EntryFrameState *entry_frame)
+{
+  return collect_trace_internal(
+    ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0, entry_frame);
+}
+
+static inline EBPF_INLINE int collect_async_trace(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 correlation_id,
+  u64 async_user_data,
+  u16 async_operation,
+  u8 async_kind,
+  u8 async_attributes)
+{
+  return collect_trace_internal(
+    ctx,
+    origin,
+    pid,
+    tid,
+    trace_timestamp,
+    0,
+    correlation_id,
+    async_user_data,
+    0,
+    async_operation,
+    async_kind,
+    async_attributes,
+    NULL);
+}
+
+static inline EBPF_INLINE int collect_async_trace_with_threshold(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 correlation_id,
+  u64 async_user_data,
+  u64 async_threshold,
+  u16 async_operation,
+  u8 async_kind,
+  u8 async_attributes)
+{
+  return collect_trace_internal(
+    ctx,
+    origin,
+    pid,
+    tid,
+    trace_timestamp,
+    0,
+    correlation_id,
+    async_user_data,
+    async_threshold,
+    async_operation,
+    async_kind,
+    async_attributes,
+    NULL);
 }
 
 #endif

@@ -9,12 +9,30 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/pdata"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
+)
+
+var (
+	profileTypeSampling = &samples.TypeMetadata{
+		PeriodType: "cpu",
+		PeriodUnit: "nanoseconds",
+		SampleType: "samples",
+		SampleUnit: "count",
+	}
+	profileTypeOffCPU = &samples.TypeMetadata{
+		SampleType:   "off_cpu",
+		SampleUnit:   "nanoseconds",
+		ReportValues: true,
+	}
+	profileTypeProbe = &samples.TypeMetadata{
+		SampleType: "events",
+		SampleUnit: "count",
+	}
 )
 
 // createTestBaseReporter creates a minimal baseReporter for testing purposes
@@ -39,6 +57,82 @@ func createTestBaseReporter(t *testing.T, cfg *Config) *baseReporter {
 		pdata:               pdataInstance,
 		traceEvents:         xsync.NewRWMutex(make(samples.TraceEventsTree)),
 		collectionStartTime: time.Now(),
+	}
+}
+
+func TestReportTraceEventSeparatesCustomLabels(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	meta := &samples.TraceEventMeta{
+		Timestamp:   libpf.UnixTime64(time.Now().UnixNano()),
+		ProfileType: profileTypeProbe,
+	}
+	readLabels := map[libpf.String]libpf.String{
+		libpf.Intern("io.operation"): libpf.Intern("R"),
+	}
+	writeLabels := map[libpf.String]libpf.String{
+		libpf.Intern("io.operation"): libpf.Intern("W"),
+	}
+
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: readLabels}, meta))
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: writeLabels}, meta))
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: readLabels}, meta))
+
+	eventsTree := reporter.traceEvents.RLock()
+	defer reporter.traceEvents.RUnlock(&eventsTree)
+	require.Len(t, *eventsTree, 1)
+	for _, profiles := range *eventsTree {
+		events := profiles.Events[profileTypeProbe]
+		require.Len(t, events, 2)
+		counts := make(map[string]int, 2)
+		for _, traceEvents := range events {
+			operation := traceEvents.Labels[libpf.Intern("io.operation")].String()
+			counts[operation] = len(traceEvents.Timestamps)
+		}
+		require.Equal(t, map[string]int{"R": 2, "W": 1}, counts)
+	}
+}
+
+func TestProfileLabelsDoesNotAliasStaticLabels(t *testing.T) {
+	key := libpf.Intern("lock.kind")
+	static := map[libpf.String]libpf.String{key: libpf.Intern("spinlock")}
+	merged := profileLabels(nil, static)
+	merged[key] = libpf.Intern("mutated")
+	require.Equal(t, "spinlock", static[key].String())
+}
+
+func TestReportTraceEventMergesStaticLabels(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	profileType := &samples.TypeMetadata{
+		SampleType: "lock_wait_latency",
+		SampleUnit: "nanoseconds",
+		StaticLabels: map[libpf.String]libpf.String{
+			libpf.Intern("lock.kind"): libpf.Intern("spinlock"),
+			libpf.Intern("lock.mode"): libpf.Intern("exclusive"),
+		},
+	}
+	meta := &samples.TraceEventMeta{
+		Timestamp:   libpf.UnixTime64(time.Now().UnixNano()),
+		ProfileType: profileType,
+	}
+	dynamic := map[libpf.String]libpf.String{
+		libpf.Intern("lock.kind"):  libpf.Intern("spoofed"),
+		libpf.Intern("request.id"): libpf.Intern("bounded"),
+	}
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: dynamic}, meta))
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: dynamic}, meta))
+
+	eventsTree := reporter.traceEvents.RLock()
+	defer reporter.traceEvents.RUnlock(&eventsTree)
+	require.Len(t, *eventsTree, 1)
+	for _, profiles := range *eventsTree {
+		events := profiles.Events[profileType]
+		require.Len(t, events, 1)
+		for _, event := range events {
+			require.Len(t, event.Timestamps, 2)
+			require.Equal(t, "spinlock", event.Labels[libpf.Intern("lock.kind")].String())
+			require.Equal(t, "exclusive", event.Labels[libpf.Intern("lock.mode")].String())
+			require.Equal(t, "bounded", event.Labels[libpf.Intern("request.id")].String())
+		}
 	}
 }
 
@@ -96,7 +190,7 @@ func TestBaseReporterGenerate(t *testing.T) {
 		PID:            1000,
 		TID:            1001,
 		CPU:            0,
-		Origin:         support.TraceOriginSampling,
+		ProfileType:    profileTypeSampling,
 	}
 
 	meta2 := &samples.TraceEventMeta{
@@ -109,7 +203,7 @@ func TestBaseReporterGenerate(t *testing.T) {
 		PID:            2000,
 		TID:            2001,
 		CPU:            1,
-		Origin:         support.TraceOriginOffCPU,
+		ProfileType:    profileTypeOffCPU,
 		Value:          5000000, // 5ms
 	}
 
@@ -133,6 +227,7 @@ func TestBaseReporterGenerate(t *testing.T) {
 		reporter.version,
 		collectionStart,
 		collectionEnd,
+		nil, nil,
 	)
 
 	// Validate the generation succeeded
@@ -158,4 +253,87 @@ func TestBaseReporterGenerate(t *testing.T) {
 	// Verify profiles exist
 	assert.Greater(t, scopeProfile.Profiles().Len(), 0,
 		"Should have at least one profile")
+}
+
+// TestReportTraceEventResourceKeyContextKey verifies that the ContextKey
+// derived from meta.Resource controls bucketing in the events tree:
+//   - Same (namespace,name,instance.id) triplet collapses to one bucket.
+//   - A different service.instance.id splits into a second bucket.
+//   - A partial triplet (e.g. only service.name) produces a non-null key
+//     like ":svc:" — distinct from the populated triplets and from nil.
+//   - A nil Resource yields a NullString ContextKey, also distinct.
+func TestReportTraceEventResourceKeyContextKey(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+
+	makeResource := func(namespace, name, instanceID string) *pcommon.Resource {
+		r := pcommon.NewResource()
+		if namespace != "" {
+			r.Attributes().PutStr("service.namespace", namespace)
+		}
+		if name != "" {
+			r.Attributes().PutStr("service.name", name)
+		}
+		if instanceID != "" {
+			r.Attributes().PutStr("service.instance.id", instanceID)
+		}
+		return &r
+	}
+
+	trace := &libpf.Trace{
+		Frames: func() libpf.Frames {
+			frames := make(libpf.Frames, 0, 1)
+			frames.Append(&libpf.Frame{
+				Type:            libpf.NativeFrame,
+				AddressOrLineno: 0x100,
+				FunctionName:    libpf.Intern("f"),
+			})
+			return frames
+		}(),
+	}
+
+	now := libpf.UnixTime64(time.Now().UnixNano())
+	baseMeta := func(resource *pcommon.Resource) *samples.TraceEventMeta {
+		return &samples.TraceEventMeta{
+			Timestamp:      now,
+			Comm:           libpf.NewCommFromString("svc"),
+			ProcessName:    libpf.Intern("svc"),
+			ExecutablePath: libpf.Intern("/usr/bin/svc"),
+			ContainerID:    libpf.Intern("c1"),
+			PID:            1234,
+			TID:            1235,
+			ProfileType:    profileTypeSampling,
+			Resource:       resource,
+		}
+	}
+
+	// Two events with the same triplet -> one bucket.
+	resA := makeResource("ns", "svc", "instance-1")
+	require.NoError(t, reporter.ReportTraceEvent(trace, baseMeta(resA)))
+	resADup := makeResource("ns", "svc", "instance-1")
+	require.NoError(t, reporter.ReportTraceEvent(trace, baseMeta(resADup)))
+
+	// Different service.instance.id -> second bucket.
+	resB := makeResource("ns", "svc", "instance-2")
+	require.NoError(t, reporter.ReportTraceEvent(trace, baseMeta(resB)))
+
+	// Partial triplet (only service.name) -> non-null key ":svc:" -> third bucket.
+	resPartial := makeResource("", "svc", "")
+	require.NoError(t, reporter.ReportTraceEvent(trace, baseMeta(resPartial)))
+
+	// Nil Resource -> ContextKey is NullString -> fourth bucket.
+	require.NoError(t, reporter.ReportTraceEvent(trace, baseMeta(nil)))
+
+	treePtr := reporter.traceEvents.RLock()
+	defer reporter.traceEvents.RUnlock(&treePtr)
+	tree := *treePtr
+
+	keys := make(map[libpf.String]bool)
+	for k := range tree {
+		keys[k.ContextKey] = true
+	}
+	assert.Equal(t, 4, len(tree), "expected four buckets")
+	assert.True(t, keys[libpf.Intern("ns:svc:instance-1")], "missing bucket for instance-1")
+	assert.True(t, keys[libpf.Intern("ns:svc:instance-2")], "missing bucket for instance-2")
+	assert.True(t, keys[libpf.Intern(":svc:")], "missing bucket for partial-triplet key")
+	assert.True(t, keys[libpf.NullString], "missing NullString bucket for nil resource")
 }

@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/internal/controller"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 )
 
 var errInvalidConfig = errors.New("invalid config")
@@ -37,18 +38,21 @@ func NewFactory() receiver.Factory {
 
 func defaultConfig() component.Config {
 	return &config.Config{
-		ReporterInterval:       5 * time.Second,
-		ReporterJitter:         0.2,
-		MonitorInterval:        5 * time.Second,
-		SamplesPerSecond:       20,
-		ProbabilisticInterval:  1 * time.Minute,
-		ProbabilisticThreshold: 100,
-		Interpreters:           interpreterconfig.AllInterpreters(),
-		ClockSyncInterval:      3 * time.Minute,
-		MaxGRPCRetries:         5,
-		MaxRPCMsgSize:          32 << 20, // 32 MiB
-		BPFFSRoot:              "/sys/fs/bpf/",
-		ErrorMode:              config.PropagateError,
+		ReporterInterval:         5 * time.Second,
+		ReporterJitter:           0.2,
+		MonitorInterval:          5 * time.Second,
+		SamplesPerSecond:         20,
+		FrameCacheSize:           uint(pm.DefaultFrameCacheSize),
+		AsyncCorrelationCapacity: 16 * 1024,
+		AsyncCorrelationTTL:      5 * time.Minute,
+		ProbabilisticInterval:    1 * time.Minute,
+		ProbabilisticThreshold:   100,
+		Interpreters:             interpreterconfig.AllInterpreters(),
+		ClockSyncInterval:        3 * time.Minute,
+		MaxGRPCRetries:           5,
+		MaxRPCMsgSize:            32 << 20, // 32 MiB
+		BPFFSRoot:                "/sys/fs/bpf/",
+		ErrorMode:                config.PropagateError,
 	}
 }
 
