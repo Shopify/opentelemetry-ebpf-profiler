@@ -39,7 +39,6 @@ var dynamicProbeResources = struct {
 		"tcp_receive_calls",
 		"lock_wait_metrics",
 		"lock_wait_starts",
-		"lock_wait_scratch",
 	},
 	programs: []string{
 		"block_io_submit_bio",

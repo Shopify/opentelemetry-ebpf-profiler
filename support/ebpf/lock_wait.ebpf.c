@@ -21,30 +21,19 @@ typedef struct LockWaitMetrics {
 
 typedef struct LockWaitStart {
   u64 timestamp;
-  UnwindState entry_state;
-  bool has_entry_state;
+  EntryFrameState entry_frame;
 } LockWaitStart;
 
 // State is private to one runtime descriptor, so pid_tgid is sufficient to
-// distinguish callers without requiring attach cookies. Entry registers are
-// retained so selected returns unwind the measured function's complete user
-// stack rather than the caller-only stack visible from a uretprobe trampoline.
+// distinguish callers without requiring attach cookies. The entry frame
+// snapshot lets selected returns report the measured function as the leaf
+// frame with its true caller chain, which a uretprobe context cannot recover.
 struct lock_wait_starts_t {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, u64); // pid_tgid
   __type(value, LockWaitStart);
   __uint(max_entries, 16384);
 } lock_wait_starts SEC(".maps");
-
-// Selected return paths copy their state here before deleting the pid_tgid
-// entry. A per-CPU map avoids exceeding the 512-byte BPF stack limit while the
-// trace initializer copies saved registers into its existing per-CPU record.
-struct lock_wait_scratch_t {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __type(key, u32);
-  __type(value, LockWaitStart);
-  __uint(max_entries, 1);
-} lock_wait_scratch SEC(".maps");
 
 struct lock_wait_metrics_t {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -128,9 +117,29 @@ int lock_wait_entry(UNUSED struct pt_regs *ctx)
   LockWaitStart start = {
     .timestamp = bpf_ktime_get_ns(),
   };
-  if (copy_state_regs(&start.entry_state, ctx, false) == ERR_OK) {
-    start.has_entry_state = true;
+#if defined(__x86_64__)
+  if (ctx->cs != __USER32_CS) {
+    start.entry_frame.pc = ctx->ip;
+    start.entry_frame.sp = ctx->sp;
+    start.entry_frame.fp = ctx->bp;
+    u64 return_address   = 0;
+    // At function entry the return address is on the stack. It must be read
+    // here: the return-probe trampoline consumes the slot before the exit
+    // program runs. A failed read leaves ra 0 and selects caller-only stacks.
+    if (bpf_probe_read_user(&return_address, sizeof(return_address), (void *)ctx->sp) == 0) {
+      start.entry_frame.ra = return_address;
+    }
   }
+#elif defined(__aarch64__)
+  if (!(ctx->pstate & PSR_MODE32_BIT)) {
+    start.entry_frame.pc = normalize_pac_ptr(ctx->pc);
+    start.entry_frame.sp = ctx->sp;
+    start.entry_frame.fp = ctx->regs[29];
+    start.entry_frame.ra = normalize_pac_ptr(ctx->regs[30]);
+  }
+#else
+  #error "Unsupported architecture"
+#endif
   if (bpf_map_update_elem(&lock_wait_starts, &pid_tgid, &start, BPF_NOEXIST) != 0) {
     // Nested calls on one thread are exceptional. Pay the additional lookup
     // and replacement only on that path, preserving the newer timestamp.
@@ -171,35 +180,21 @@ int lock_wait_exit(struct pt_regs *ctx)
     return 0;
   }
 
-  u64 started = stored->timestamp;
+  // Copy the small snapshot before deleting the map entry.
+  LockWaitStart start = *stored;
+  if (bpf_map_delete_elem(&lock_wait_starts, &pid_tgid) == 0 && metrics) {
+    metrics->active_states--;
+  }
+
   if (
-    timestamp < started || timestamp - started < lock_wait_min_ns ||
+    timestamp < start.timestamp || timestamp - start.timestamp < lock_wait_min_ns ||
     !lock_wait_return_succeeded(ctx) ||
     (lock_wait_sample_threshold != 0xffffffff &&
      bpf_get_prandom_u32() > lock_wait_sample_threshold)) {
-    if (bpf_map_delete_elem(&lock_wait_starts, &pid_tgid) == 0 && metrics) {
-      metrics->active_states--;
-    }
     if (metrics) {
       metrics->filtered++;
     }
     return 0;
-  }
-
-  u32 zero               = 0;
-  LockWaitStart *scratch = bpf_map_lookup_elem(&lock_wait_scratch, &zero);
-  if (!scratch) {
-    if (bpf_map_delete_elem(&lock_wait_starts, &pid_tgid) == 0 && metrics) {
-      metrics->active_states--;
-    }
-    if (metrics) {
-      metrics->state_update_failures++;
-    }
-    return 0;
-  }
-  *scratch = *stored;
-  if (bpf_map_delete_elem(&lock_wait_starts, &pid_tgid) == 0 && metrics) {
-    metrics->active_states--;
   }
 
   if (metrics) {
@@ -207,12 +202,12 @@ int lock_wait_exit(struct pt_regs *ctx)
   }
   u64 pid = pid_tgid >> 32;
   u64 tid = pid_tgid & 0xffffffff;
-  return collect_trace_from_state(
+  return collect_trace_with_entry_frame(
     ctx,
     lock_wait_origin,
     pid,
     tid,
     timestamp,
-    timestamp - scratch->timestamp,
-    scratch->has_entry_state ? &scratch->entry_state : NULL);
+    timestamp - start.timestamp,
+    start.entry_frame.ra ? &start.entry_frame : NULL);
 }

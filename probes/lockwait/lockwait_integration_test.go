@@ -68,9 +68,10 @@ func (reporter *captureTraceReporter) ReportTraceEvent(
 }
 
 // hasLockWaitLeafAt reports whether any captured lock-wait event has the
-// probed function itself as the leaf user frame. Entry-state unwinding must
-// keep the measured function visible instead of only its callers, and the
-// snapshot is taken at function entry, so the leaf address is exact.
+// probed function itself as the leaf user frame followed by a native caller
+// frame. The snapshot is taken at function entry, so the leaf address is
+// exact, and the caller chain must survive the return-probe trampoline's
+// rewrite of the entry-time return address.
 func (reporter *captureTraceReporter) hasLockWaitLeafAt(
 	pid libpf.PID, minValue int64, entryVaddr uint64) bool {
 	reporter.mu.Lock()
@@ -81,13 +82,15 @@ func (reporter *captureTraceReporter) hasLockWaitLeafAt(
 			event.meta.ProfileType.SampleType != defaultSampleType {
 			continue
 		}
-		for _, handle := range event.trace.Frames {
+		for index, handle := range event.trace.Frames {
 			frame := handle.Value()
 			if frame.Type == libpf.KernelFrame {
 				continue
 			}
 			if frame.Type == libpf.NativeFrame &&
-				uint64(frame.AddressOrLineno) == entryVaddr {
+				uint64(frame.AddressOrLineno) == entryVaddr &&
+				index+1 < len(event.trace.Frames) &&
+				event.trace.Frames[index+1].Value().Type == libpf.NativeFrame {
 				return true
 			}
 			break

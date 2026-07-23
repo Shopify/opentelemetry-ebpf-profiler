@@ -968,6 +968,18 @@ get_usermode_regs(struct pt_regs *ctx, UnwindState *state, bool *has_usermode_re
 
 #endif // TESTING_COREDUMP
 
+// EntryFrameState carries the minimum function-entry context a latency probe
+// needs to synthesize the probed function as the leaf frame at return time.
+// Return-probe trampolines rewrite the return-address slot (x86-64) or link
+// register (aarch64) at entry, so the caller identity must be captured on
+// entry rather than recovered from stack memory during return-time unwinding.
+typedef struct EntryFrameState {
+  u64 pc; // instruction pointer at function entry
+  u64 sp; // stack pointer at function entry
+  u64 fp; // frame pointer at function entry
+  u64 ra; // return address captured at function entry, 0 if unavailable
+} EntryFrameState;
+
 static inline EBPF_INLINE int collect_trace_internal(
   struct pt_regs *ctx,
   u16 origin,
@@ -981,7 +993,7 @@ static inline EBPF_INLINE int collect_trace_internal(
   u16 async_operation,
   u8 async_kind,
   u8 async_attributes,
-  const UnwindState *initial_state)
+  const EntryFrameState *entry_frame)
 {
   // Only continue processing the trace with a valid origin.
   if (origin == 0) {
@@ -1027,20 +1039,18 @@ static inline EBPF_INLINE int collect_trace_internal(
     record->goOffsets = *go_offsets;
   }
 
-  // Recursive unwind frames. Latency probes may retain entry registers and
-  // supply them after return-time filtering so the measured function remains
-  // the leaf frame without paying unwind cost at every entry.
+  // Recursive unwind frames. Latency probes may retain a function-entry
+  // snapshot and supply it after return-time filtering so the measured
+  // function remains the leaf frame without unwind cost at every entry.
   int unwinder           = PROG_UNWIND_STOP;
   bool has_usermode_regs = false;
   ErrorCode error;
-  if (initial_state) {
-    record->state              = *initial_state;
-    // Saved snapshots hold zero-initialized bookkeeping fields. Restore the
-    // pristine-record defaults so unwind_stop does not misread error state.
-    record->state.error_metric = -1;
-    record->state.unwind_error = ERR_OK;
-    has_usermode_regs          = true;
-    error                      = ERR_OK;
+  if (entry_frame) {
+    record->state.pc  = entry_frame->pc;
+    record->state.sp  = entry_frame->sp;
+    record->state.fp  = entry_frame->fp;
+    has_usermode_regs = true;
+    error             = ERR_OK;
   } else {
     error = get_usermode_regs(ctx, &record->state, &has_usermode_regs);
   }
@@ -1061,6 +1071,31 @@ static inline EBPF_INLINE int collect_trace_internal(
 
   record->usesAnonymousMappings = pid_uses_anonymous_mappings(pidInfo);
 
+  if (entry_frame && entry_frame->ra) {
+    // Push the probed function as an explicit leaf frame, then resume
+    // ordinary unwinding at its caller. The return address was captured at
+    // entry because the return-probe trampoline consumes the on-stack slot.
+    int leaf_unwinder = PROG_UNWIND_STOP;
+    error             = resolve_unwind_mapping(record, &leaf_unwinder);
+    if (error == ERR_OK && leaf_unwinder == PROG_UNWIND_NATIVE) {
+      u64 *leaf = push_frame(
+        &record->state, trace, FRAME_MARKER_NATIVE, 0, record->state.text_section_offset, 1);
+      if (!leaf) {
+        error = ERR_STACK_LENGTH_EXCEEDED;
+        goto exit;
+      }
+      leaf[0]          = record->state.text_section_id;
+      record->state.pc = normalize_pac_ptr(entry_frame->ra);
+#if defined(__x86_64__)
+      // The call instruction pushed the return address below the entry SP.
+      record->state.sp = entry_frame->sp + sizeof(u64);
+#endif
+      unwinder_mark_nonleaf_frame(&record->state);
+    }
+    // On resolution failure fall through unchanged: the ordinary lookup below
+    // reports the same missing-mapping error and drives process sync.
+  }
+
   error                   = get_next_unwinder_after_native_frame(record, &unwinder);
   record->initialUnwinder = unwinder;
 
@@ -1078,17 +1113,17 @@ collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_times
     ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0, NULL);
 }
 
-static inline EBPF_INLINE int collect_trace_from_state(
+static inline EBPF_INLINE int collect_trace_with_entry_frame(
   struct pt_regs *ctx,
   u16 origin,
   u32 pid,
   u32 tid,
   u64 trace_timestamp,
   u64 value,
-  const UnwindState *initial_state)
+  const EntryFrameState *entry_frame)
 {
   return collect_trace_internal(
-    ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0, initial_state);
+    ctx, origin, pid, tid, trace_timestamp, value, 0, 0, 0, 0, 0, 0, entry_frame);
 }
 
 static inline EBPF_INLINE int collect_async_trace(
