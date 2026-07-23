@@ -137,6 +137,8 @@ var dynamicProbeResources = struct {
 		"off_cpu_time_min_ns",
 		"off_cpu_time_origin",
 		"off_cpu_time_sample_threshold",
+		"off_cpu_time_state_offset",
+		"off_cpu_time_state_size",
 	},
 }
 
@@ -560,6 +562,17 @@ func (c *ProbeContext) LoadProbeUnwinders(
 		bpfVerifierLogLevel, perfProgs.FD(), perCPURecords.FD(), perCPURecordsKp)
 }
 
+// TraceLabeler is an optional interface for probes. When a probe implements
+// it, LabelTrace is called for every synchronous trace from the probe's
+// origin before symbolization, so the probe can turn probe-specific trace
+// data (e.g. the async_user_data slot) into per-sample custom labels.
+// LabelTrace runs on the trace-handling goroutine and must not block; label
+// values must stay low-cardinality because every distinct combination forms
+// its own sample key.
+type TraceLabeler interface {
+	LabelTrace(trace *libpf.EbpfTrace)
+}
+
 // Probe defines the interface that allows custom stack unwinding trigger points.
 type Probe interface {
 	// Load attaches a probe that triggers stack unwinding.
@@ -618,6 +631,10 @@ func (t *Tracer) Enable(p Probe) error {
 	if lnk == nil {
 		t.origins.unregister(originID)
 		return errors.New("probe returned a nil link")
+	}
+
+	if labeler, ok := p.(TraceLabeler); ok {
+		t.traceLabelers.Store(originID, labeler)
 	}
 
 	t.hooks[hookPoint{group: "probe", name: fmt.Sprintf("%d", originID)}] = lnk

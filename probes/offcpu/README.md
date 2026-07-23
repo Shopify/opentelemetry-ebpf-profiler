@@ -27,9 +27,21 @@ time — the flame graph answers "where does wall-clock time go while blocked".
 ## Semantics
 
 - Duration covers **all** off-CPU time: blocking on I/O, locks, timers, and
-  also runqueue wait after involuntary preemption. Distinguishing blocked
-  from runnable time (`prev_state` filtering) is possible future work; the
-  tracepoint encoding of `prev_state` is not stable across kernel versions.
+  also runqueue wait after involuntary preemption. Every sample carries a
+  **`thread.state` label** with the thread's state at switch-out so the two
+  populations separate cleanly: `interruptible`/`uninterruptible`/`parked`/
+  `idle`/… mean the thread blocked voluntarily, while `running` (entered the
+  scheduler while still runnable, e.g. `cond_resched`/yield) and `preempted`
+  (descheduled involuntarily) mean the thread was denied CPU by saturation.
+  Filter `thread.state` out of `{running, preempted}` for pure blocking
+  analysis, or onto them to quantify CPU pressure.
+- The `prev_state` field is located by parsing the sched_switch **tracepoint
+  format file** (`/sys/kernel/tracing/events/sched/sched_switch/format`,
+  debugfs fallback) rather than assuming a struct layout, because the
+  tracepoint encoding is not a stable ABI. If the field cannot be resolved,
+  the probe logs and continues without the label; durations are unaffected.
+  Values use the post-4.14 `task_state_index` encoding; unrecognized
+  encodings collapse to `other` to bound label cardinality.
 - `min_duration` and `sample_rate` are applied at **switch-in**, on the
   measured duration. Durations are always exact; sampling only reduces unwind
   and export volume and can never miss a long wait, unlike the built-in
@@ -56,6 +68,7 @@ time — the flame graph answers "where does wall-clock time go while blocked".
 | CPU migration | lost (per-CPU LRU map) | measured (global LRU map) |
 | duration filter | none | `min_duration` |
 | drop accounting | none | per-path metrics |
+| thread state | not captured | `thread.state` sample label |
 | activation | static flag at startup | dynamic `custom_probes` entry |
 
 ## Configuration
