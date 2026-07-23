@@ -7,6 +7,7 @@ package lockwait
 
 import (
 	"context"
+	"debug/elf"
 	"os"
 	"sync"
 	"testing"
@@ -48,10 +49,71 @@ func (probe *originCaptureProbe) Load(origin uint16, ctx *tracer.ProbeContext) (
 	return probe.Probe.Load(origin, ctx)
 }
 
-type discardTraceReporter struct{}
+type capturedTraceEvent struct {
+	trace *libpf.Trace
+	meta  *samples.TraceEventMeta
+}
 
-func (discardTraceReporter) ReportTraceEvent(*libpf.Trace, *samples.TraceEventMeta) error {
+type captureTraceReporter struct {
+	mu     sync.Mutex
+	events []capturedTraceEvent
+}
+
+func (reporter *captureTraceReporter) ReportTraceEvent(
+	trace *libpf.Trace, meta *samples.TraceEventMeta) error {
+	reporter.mu.Lock()
+	defer reporter.mu.Unlock()
+	reporter.events = append(reporter.events, capturedTraceEvent{trace: trace, meta: meta})
 	return nil
+}
+
+// hasLockWaitLeafAt reports whether any captured lock-wait event has the
+// probed function itself as the leaf user frame. Entry-state unwinding must
+// keep the measured function visible instead of only its callers, and the
+// snapshot is taken at function entry, so the leaf address is exact.
+func (reporter *captureTraceReporter) hasLockWaitLeafAt(
+	pid libpf.PID, minValue int64, entryVaddr uint64) bool {
+	reporter.mu.Lock()
+	defer reporter.mu.Unlock()
+	for _, event := range reporter.events {
+		if event.meta.PID != pid || event.meta.Value < minValue ||
+			event.meta.ProfileType == nil ||
+			event.meta.ProfileType.SampleType != defaultSampleType {
+			continue
+		}
+		for _, handle := range event.trace.Frames {
+			frame := handle.Value()
+			if frame.Type == libpf.KernelFrame {
+				continue
+			}
+			if frame.Type == libpf.NativeFrame &&
+				uint64(frame.AddressOrLineno) == entryVaddr {
+				return true
+			}
+			break
+		}
+	}
+	return false
+}
+
+// integrationTargetVaddr translates the target's file offset into the ELF
+// virtual address space that reported native frames use. Symbol tables are
+// deliberately not used: `go test` strips .symtab from run-mode binaries.
+func integrationTargetVaddr(t *testing.T, path string, fileOffset uint64) uint64 {
+	t.Helper()
+	parsed, err := pfelf.Open(path)
+	require.NoError(t, err)
+	defer parsed.Close()
+	for _, prog := range parsed.Progs {
+		if prog.Type != elf.PT_LOAD {
+			continue
+		}
+		if fileOffset >= prog.Off && fileOffset < prog.Off+prog.Filesz {
+			return prog.Vaddr + (fileOffset - prog.Off)
+		}
+	}
+	t.Fatal("target file offset is not inside any PT_LOAD segment")
+	return 0
 }
 
 func integrationTargetOffset(t *testing.T, path string, address uint64) (string, uint64) {
@@ -146,8 +208,9 @@ func TestLockWaitProbe(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
+	reporter := &captureTraceReporter{}
 	trc, err := tracer.NewTracer(ctx, &tracer.Config{
-		TraceReporter:          discardTraceReporter{},
+		TraceReporter:          reporter,
 		Intervals:              integrationIntervals{},
 		InterpretersConfig:     interpreterconfig.AllInterpreters(),
 		SamplesPerSecond:       50,
@@ -165,6 +228,7 @@ func TestLockWaitProbe(t *testing.T) {
 	executable, err := os.Executable()
 	require.NoError(t, err)
 	buildID, targetOffset := integrationTargetOffset(t, executable, lockWaitCTargetAddress())
+	targetVaddr := integrationTargetVaddr(t, executable, targetOffset)
 	created, err := New(Definition{
 		Target: usertarget.Target{
 			Name:     "integration-lock-wait",
@@ -205,9 +269,8 @@ func TestLockWaitProbe(t *testing.T) {
 			if trace == nil {
 				continue
 			}
-			matched := trace.PID == pid && trace.Origin == probe.origin &&
-				trace.Value >= int64(4*time.Millisecond)
-			if matched {
+			if trace.PID == pid && trace.Origin == probe.origin &&
+				trace.Value >= int64(4*time.Millisecond) {
 				require.NotEmpty(t, trace.FrameData)
 				require.Positive(t, trace.NumFrames)
 			}
@@ -216,11 +279,16 @@ func TestLockWaitProbe(t *testing.T) {
 			if trace.PID == pid {
 				trc.HandleTrace(trace)
 			}
-			if matched {
+			// Success requires a fully converted lock-wait event whose leaf user
+			// frame is the probed function itself. Early events may predate
+			// mapping synchronization, so keep driving the workload until the
+			// deadline instead of failing on the first partial trace.
+			if reporter.hasLockWaitLeafAt(
+				pid, int64(4*time.Millisecond), targetVaddr) {
 				return
 			}
 		case <-deadline.C:
-			t.Fatal("timed out waiting for a userspace lock-wait latency trace")
+			t.Fatal("timed out waiting for a whole-stack lock-wait latency trace")
 		default:
 		}
 	}

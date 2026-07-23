@@ -19,6 +19,7 @@ import (
 
 const (
 	startsMapName      = "lock_wait_starts"
+	scratchMapName     = "lock_wait_scratch"
 	metricsMapName     = "lock_wait_metrics"
 	entryProgramName   = "lock_wait_entry"
 	exitProgramName    = "lock_wait_exit"
@@ -117,7 +118,7 @@ func (probe *lockWaitProbe) Load(origin uint16, ctx *tracer.ProbeContext) (link.
 	}
 	variableNames = append(variableNames, successValueNames[:]...)
 	collection, err := ctx.CollectionSpecWith(
-		[]string{startsMapName, metricsMapName},
+		[]string{startsMapName, scratchMapName, metricsMapName},
 		[]string{entryProgramName, exitProgramName},
 		variableNames,
 	)
@@ -148,7 +149,7 @@ func (probe *lockWaitProbe) Load(origin uint16, ctx *tracer.ProbeContext) (link.
 
 	resources := &probeutil.Resources{}
 	ownedMaps, err := probeutil.LoadMaps(
-		collection, []string{startsMapName, metricsMapName}, resources)
+		collection, []string{startsMapName, scratchMapName, metricsMapName}, resources)
 	if err != nil {
 		return failLoad(resources, err)
 	}
