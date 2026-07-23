@@ -135,13 +135,31 @@ static inline EBPF_INLINE PIDPageMappingInfo *pid_information(int pid)
   key.pid       = __constant_cpu_to_be32((u32)pid);
   key.page      = 0;
 
-  return bpf_map_lookup_elem(&pid_page_to_mapping_info, &key);
+  PIDPageMappingInfo *info = bpf_map_lookup_elem(&pid_page_to_mapping_info, &key);
+  if (!info || (info->file_id & ~PID_PAGE_MAPPING_INFO_FLAG_USES_ANONYMOUS_MAPPINGS) != 0) {
+    // A less-specific executable mapping can match page zero after the exact
+    // marker is deleted. It must not be mistaken for the per-PID marker.
+    return NULL;
+  }
+  return info;
 }
 
 // pid_information_exists checks if the given pid exists in pid_page_to_mapping_info or not.
 static inline EBPF_INLINE bool pid_information_exists(int pid)
 {
   return pid_information(pid) != NULL;
+}
+
+// forget_pid_information removes the exact per-PID marker without walking the
+// process's LPM mappings. A missing marker suppresses trace emission until
+// userspace reconciles the replacement image after exec.
+static inline EBPF_INLINE void forget_pid_information(int pid)
+{
+  PIDPage key   = {};
+  key.prefixLen = BIT_WIDTH_PID + BIT_WIDTH_PAGE;
+  key.pid       = __constant_cpu_to_be32((u32)pid);
+  key.page      = 0;
+  bpf_map_delete_elem(&pid_page_to_mapping_info, &key);
 }
 
 static inline EBPF_INLINE bool pid_uses_anonymous_mappings(PIDPageMappingInfo *info)
@@ -218,10 +236,13 @@ static inline EBPF_INLINE bool pid_event_ratelimit(u32 pid, int ratelimit_action
   return false;
 }
 
-// report_pid informs userspace about a PID that needs to be processed.
+// report_pid_value informs userspace about a PID that needs to be processed.
+// A false value identifies an exec invalidation. Normal true-valued reports do
+// not overwrite a pending exec event before userspace consumes it.
 // See pid_event_ratelimit for ratelimit_action functional specifics.
 // Returns true if the PID was successfully reported to user space.
-static inline EBPF_INLINE bool report_pid(void *ctx, u64 pid_tgid, int ratelimit_action)
+static inline EBPF_INLINE bool
+report_pid_value(void *ctx, u64 pid_tgid, int ratelimit_action, bool value)
 {
   u32 pid = pid_tgid >> 32;
 
@@ -229,8 +250,11 @@ static inline EBPF_INLINE bool report_pid(void *ctx, u64 pid_tgid, int ratelimit
     return false;
   }
 
-  bool value = true;
-  int errNo  = bpf_map_update_elem(&pid_events, &pid_tgid, &value, BPF_ANY);
+  bool *pending = bpf_map_lookup_elem(&pid_events, &pid_tgid);
+  int errNo     = 0;
+  if (!pending || !value || *pending) {
+    errNo = bpf_map_update_elem(&pid_events, &pid_tgid, &value, BPF_ANY);
+  }
   if (errNo != 0) {
     __attribute__((unused)) u32 tid = pid_tgid & 0xFFFFFFFF;
     DEBUG_PRINT("Failed to update pid_events with PID %d TID: %d: %d", pid, tid, errNo);
@@ -247,6 +271,11 @@ static inline EBPF_INLINE bool report_pid(void *ctx, u64 pid_tgid, int ratelimit
   // and we can simply return success.
   event_send_trigger(ctx, EVENT_TYPE_GENERIC_PID);
   return true;
+}
+
+static inline EBPF_INLINE bool report_pid(void *ctx, u64 pid_tgid, int ratelimit_action)
+{
+  return report_pid_value(ctx, pid_tgid, ratelimit_action, true);
 }
 
 // Return the per-cpu record.

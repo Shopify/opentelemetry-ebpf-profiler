@@ -24,6 +24,24 @@ struct sched_process_free_ctx {
   int prio;
 };
 
+// sched_process_exec runs after the replacement address space is committed.
+// Remove the per-PID marker before notifying userspace so process-scoped
+// uprobes cannot report against stale metadata during reconciliation.
+SEC("tracepoint/sched/sched_process_exec")
+int tracepoint__sched_process_exec(void *ctx)
+{
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 pid      = pid_tgid >> 32;
+
+  if (!bpf_map_lookup_elem(&reported_pids, &pid) && !pid_information_exists(pid)) {
+    return 0;
+  }
+
+  forget_pid_information(pid);
+  report_pid_value(ctx, pid_tgid, RATELIMIT_ACTION_RESET, false);
+  return 0;
+}
+
 static EBPF_INLINE int do_process_free(void *ctx, u32 pid)
 {
   if (!bpf_map_lookup_elem(&reported_pids, &pid) && !pid_information_exists(pid)) {

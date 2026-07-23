@@ -2300,5 +2300,61 @@
     "name": "UnwindThreadContextReadSuccesses",
     "field": "bpf.threadctx.read_successes",
     "id": 315
+  },
+  {
+    "description": "Number of mapped userspace probe objects that failed symbol or build ID resolution",
+    "type": "counter",
+    "name": "UserspaceProbeResolutionFailures",
+    "field": "agent.userspace_probe.resolution.failures",
+    "id": 320
+  },
+  {
+    "description": "Number of failures attaching a PID-scoped userspace probe link",
+    "type": "counter",
+    "name": "UserspaceProbeAttachFailures",
+    "field": "agent.userspace_probe.attach.failures",
+    "id": 321
+  },
+  {
+    "description": "Number of PID-scoped userspace probe links attached",
+    "type": "counter",
+    "name": "UserspaceProbeLinksAttached",
+    "field": "agent.userspace_probe.links.attached",
+    "id": 322
+  },
+  {
+    "description": "Number of PID-scoped userspace probe links detached",
+    "type": "counter",
+    "name": "UserspaceProbeLinksDetached",
+    "field": "agent.userspace_probe.links.detached",
+    "id": 323
+  },
+  {
+    "description": "Number of userspace probe attachments rejected at the configured link bound",
+    "type": "counter",
+    "name": "UserspaceProbeLinkLimitHits",
+    "field": "agent.userspace_probe.links.limit_hits",
+    "id": 324
+  },
+  {
+    "description": "Number of userspace probe link or process-state cleanup failures",
+    "type": "counter",
+    "name": "UserspaceProbeCleanupFailures",
+    "field": "agent.userspace_probe.cleanup.failures",
+    "id": 325
+  },
+  {
+    "description": "Number of processes currently owning userspace probe links",
+    "type": "gauge",
+    "name": "UserspaceProbeActiveProcesses",
+    "field": "agent.userspace_probe.processes.active",
+    "id": 326
+  },
+  {
+    "description": "Number of PID-scoped userspace probe links currently active",
+    "type": "gauge",
+    "name": "UserspaceProbeActiveLinks",
+    "field": "agent.userspace_probe.links.active",
+    "id": 327
   }
 ]

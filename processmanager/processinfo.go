@@ -12,12 +12,14 @@ package processmanager // import "go.opentelemetry.io/ebpf-profiler/processmanag
 // HA/tracer and tools/coredump modules only.
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -42,6 +44,67 @@ import (
 // isPIDLive checks if a PID belongs to a live process. It will never produce a false negative but
 // may produce a false positive (e.g. due to permissions) in which case an error will also be
 // returned.
+// ReadProcessIdentity reads the executable, start-time, and address-space
+// identity for the process currently occupying pid.
+func ReadProcessIdentity(pid libpf.PID) (ProcessIdentity, error) {
+	executable, err := os.Open(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return ProcessIdentity{}, fmt.Errorf("open executable identity: %w", err)
+	}
+	defer executable.Close()
+
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(int(executable.Fd()), &stat); err != nil {
+		return ProcessIdentity{}, fmt.Errorf("stat executable identity: %w", err)
+	}
+
+	contents, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return ProcessIdentity{}, fmt.Errorf("read process stat identity: %w", err)
+	}
+	commEnd := bytes.LastIndexByte(contents, ')')
+	if commEnd < 0 {
+		return ProcessIdentity{}, errors.New("process stat identity has no closing comm parenthesis")
+	}
+	fields := strings.Fields(string(contents[commEnd+1:]))
+	// fields starts at proc stat field 3. env_end is field 51, index 48 here.
+	if len(fields) <= 48 {
+		return ProcessIdentity{}, fmt.Errorf(
+			"process stat identity has %d fields after comm, need 49", len(fields))
+	}
+	parseField := func(index int) (uint64, error) {
+		value, parseErr := strconv.ParseUint(fields[index], 10, 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("parse process stat field %d: %w", index+3, parseErr)
+		}
+		return value, nil
+	}
+
+	startTime, err := parseField(19)
+	if err != nil {
+		return ProcessIdentity{}, err
+	}
+	// These address-space fields change across exec, including same-path
+	// re-exec. Fold them into a stable token without exposing process addresses.
+	indices := [...]int{23, 24, 25, 42, 43, 44, 45, 46, 47, 48}
+	addressSpace := uint64(14695981039346656037)
+	for _, index := range indices {
+		value, parseErr := parseField(index)
+		if parseErr != nil {
+			return ProcessIdentity{}, parseErr
+		}
+		addressSpace ^= value
+		addressSpace *= 1099511628211
+	}
+
+	return ProcessIdentity{
+		ExecutableDevice: uint64(stat.Dev),
+		ExecutableInode:  stat.Ino,
+		StartTime:        startTime,
+		AddressSpace:     addressSpace,
+	}, nil
+}
+
 func isPIDLive(pid libpf.PID) (bool, error) {
 	// Check first with the kill syscall which is the fastest route.
 	// A kill syscall with a 0 signal is documented to still do the check
@@ -466,6 +529,12 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 		}
 	}()
 	defer pm.ebpf.RemoveReportedPID(pid)
+	notifyObservers := false
+	defer func() {
+		if notifyObservers {
+			pm.notifyProcessExited(pid)
+		}
+	}()
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -479,17 +548,21 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 	// for the same PID, don't update exitKTime if we've previously recorded it.
 	if _, pidExitProcessed := pm.exitEvents[pid]; !pidExitProcessed {
 		pm.exitEvents[pid] = exitKTime
+		notifyObservers = true
 	} else {
 		log.Debugf("Skip duplicate process exit handling for PID %d", pid)
 		return
 	}
 
 	// Delete all entries we have for this particular PID from pid_page_to_mapping_info.
-	deleted, err2 := pm.ebpf.DeletePidPageMappingInfo(pid, []lpm.Prefix{dummyPrefix})
+	// ProcessManager owns one logical dummy entry even if sched_process_exec
+	// already removed the kernel marker before this exit was processed.
+	_, err2 := pm.ebpf.DeletePidPageMappingInfo(pid, []lpm.Prefix{dummyPrefix})
 	if err2 != nil {
 		err = errors.Join(err, fmt.Errorf("failed to delete dummy prefix for PID %d: %v",
 			pid, err2))
 	}
+	deleted := uint64(1)
 
 	for idx := range info.mappings {
 		deleted += pm.processRemovedMapping(pid, &info.mappings[idx])
@@ -540,6 +613,55 @@ func (c *interpreterMappingCollector) mappings() []process.RawMapping {
 	return c.collected
 }
 
+type threadIdentifiedProcess interface {
+	TID() libpf.PID
+}
+
+// MarkProcessExec records a sched_process_exec notification before the
+// replacement image is synchronized. The generation counter also detects an
+// exec racing with an in-progress /proc mapping scan.
+func (pm *ProcessManager) MarkProcessExec(pid libpf.PID) {
+	pm.mu.Lock()
+	info := pm.pidToProcessInfo[pid]
+	if info != nil {
+		info.execGeneration++
+		// Hide the pre-exec snapshot before a concurrent observer can subscribe.
+		// The generation remains unpublished so the next synchronization still
+		// carries ImageChanged with the replacement image.
+		info.observerMappings = nil
+		info.observerTID = 0
+	}
+	pm.mu.Unlock()
+	if info != nil {
+		// Queue cancellation immediately. Delivery and concrete link cleanup stay
+		// off the PID-event processor on observer-owned workers.
+		pm.notifyProcessExited(pid)
+	}
+}
+
+func (pm *ProcessManager) invalidateSynchronizationRace(pid libpf.PID, syncGeneration uint64) {
+	pm.mu.Lock()
+	info := pm.pidToProcessInfo[pid]
+	if info != nil {
+		info.observerMappings = nil
+		info.observerTID = 0
+		// If no explicit exec event has advanced the generation, force the next
+		// synchronization to publish an image change (including PID reuse).
+		if info.execGeneration == syncGeneration {
+			info.execGeneration++
+		}
+	}
+	pm.mu.Unlock()
+
+	if _, err := pm.ebpf.DeletePidPageMappingInfo(pid, []lpm.Prefix{dummyPrefix}); err != nil {
+		log.Debugf("Failed to remove raced PID marker for PID %d: %v", pid, err)
+	}
+	if info != nil {
+		pm.notifyProcessExited(pid)
+	}
+	pm.ebpf.RemoveReportedPID(pid)
+}
+
 // SynchronizeProcess triggers ProcessManager to update its internal information
 // about a process. It synchronizes executable mappings for the given PID by
 // parsing /proc/PID/maps and building the internal mapping state directly in
@@ -555,6 +677,10 @@ func (c *interpreterMappingCollector) mappings() []process.RawMapping {
 // TODO: Periodic synchronization of mappings for every tracked PID.
 func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	pid := pr.PID()
+	observerTID := pid
+	if identified, ok := pr.(threadIdentifiedProcess); ok && identified.TID() != 0 {
+		observerTID = identified.TID()
+	}
 	log.Debugf("= PID: %v", pid)
 
 	// Abort early if process is waiting for cleanup in ProcessedUntil
@@ -568,11 +694,16 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 		return
 	}
 
-	// Get current executable name
+	// Get current executable name and address-space identity. Identity is
+	// best-effort for coredump/test Process implementations without /proc.
 	exe, exeErr := pr.GetExe()
 	if exeErr != nil && !os.IsNotExist(exeErr) {
 		// The /proc/PID/exe returns "not exists" error also in
 		// the case of main thread exit. Ignore it.
+	}
+	currentIdentity, identityErr := ReadProcessIdentity(pid)
+	if identityErr != nil && !os.IsNotExist(identityErr) {
+		log.Debugf("Failed to read process identity for PID %d: %v", pid, identityErr)
 	}
 
 	pm.mu.Lock()
@@ -581,8 +712,13 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 		pm.mu.Unlock()
 		return
 	}
-	// Check if process meta needs an update
-	updateProcessMeta := exe != libpf.NullString && exe != info.meta.Executable
+	syncExecGeneration := info.execGeneration
+	imageChanged := info.publishedExecGeneration != syncExecGeneration ||
+		(info.identity.Valid() && currentIdentity.Valid() && info.identity != currentIdentity)
+	// Check if process meta needs an update. Exec can retain the same path, so
+	// identity changes also force a fresh metadata snapshot.
+	updateProcessMeta := imageChanged ||
+		(exe != libpf.NullString && exe != info.meta.Executable)
 
 	// Get existing info
 	oldProcessContextPublishedAtNs := info.meta.ProcessContextInfo.PublishedAtNs
@@ -600,8 +736,13 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 			}
 		}
 	}
-	previousAnonymousMappingsWanted := collectAnonymousMappings
 	pm.mu.Unlock()
+
+	// Close process-scoped observer resources before reconciling a replacement
+	// image or a reused PID. Callbacks never run while pm.mu is held.
+	if imageChanged {
+		pm.notifyProcessExited(pid)
+	}
 
 	// Create a lookup map for the old mappings
 	mpRemove := make(map[uint64]*Mapping, len(oldMappings))
@@ -618,6 +759,7 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	interpretersValid := make(libpf.Set[util.OnDiskFileIdentifier], numInterpreters)
 	capHint := max(32, min(len(oldMappings), 256))
 	mappings := make([]Mapping, 0, capHint)
+	observerMappings := make([]process.RawMapping, 0, capHint)
 	mpAdd := make([]*Mapping, 0, capHint)
 
 	pm.mappingStats.numProcAttempts.Add(1)
@@ -633,6 +775,11 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	// requests them so runtimes with JIT reservations split across r-x/rw/--- VMAs
 	// can detect the full reserved area. All other mappings are skipped.
 	numParseErrors, err := pr.IterateMappings(func(m process.RawMapping) bool {
+		if m.IsExecutable() && m.IsFileBacked() {
+			m.Path = libpf.Intern(m.Path).String()
+			observerMappings = append(observerMappings, m)
+		}
+
 		if processcontext.IsContextMapping(m.IsExecutable(), m.Path) {
 			contextMappingAddr = m.Vaddr
 			// Even if process context is not found, it might be published in the future.
@@ -749,11 +896,6 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	pm.pidPageToMappingInfoSize -= min(pm.pidPageToMappingInfoSize, numChanges)
 	pm.mu.Lock()
 	collectAnonymousMappings = pm.processRemovedInterpreters(pid, interpretersValid)
-	if collectAnonymousMappings != previousAnonymousMappingsWanted {
-		if err := pm.updatePIDAnonymousMappingInterest(pid, collectAnonymousMappings); err != nil {
-			log.Debugf("Failed to update anonymous mapping interest for PID %d: %v", pid, err)
-		}
-	}
 	pm.mu.Unlock()
 
 	// Add new mappings
@@ -803,6 +945,67 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 					pid)
 			}
 		}
+	}
+
+	// Republish the per-PID marker on every successful synchronization.
+	// sched_process_exec removes it even when anonymous-mapping interest does
+	// not change. Verify that the image did not change while maps were read.
+	finalIdentity, finalIdentityErr := ReadProcessIdentity(pid)
+	if currentIdentity.Valid() &&
+		(finalIdentityErr != nil || finalIdentity != currentIdentity) {
+		log.Debugf("Process image changed while synchronizing PID %d; retrying", pid)
+		pm.invalidateSynchronizationRace(pid, syncExecGeneration)
+		return
+	}
+	if err := pm.updatePIDAnonymousMappingInterest(pid, collectAnonymousMappings); err != nil {
+		log.Debugf("Failed to refresh synchronized PID marker for PID %d: %v", pid, err)
+		pm.ebpf.RemoveReportedPID(pid)
+		return
+	}
+	if currentIdentity.Valid() {
+		publishedIdentity, publishedErr := ReadProcessIdentity(pid)
+		if publishedErr != nil || publishedIdentity != currentIdentity {
+			pm.invalidateSynchronizationRace(pid, syncExecGeneration)
+			return
+		}
+	}
+
+	// Publish observer state only after the PID marker and image identity are
+	// stable. This prevents a concurrently registered observer from receiving
+	// a mapping snapshot collected across exec.
+	var observerMeta process.ProcessMeta
+	pm.mu.Lock()
+	info = pm.pidToProcessInfo[pid]
+	if info != nil && info.execGeneration != syncExecGeneration {
+		pm.mu.Unlock()
+		// An exec raced with the mapping scan. Keep observer state unpublished
+		// and suppress traces until the already-enqueued exec event completes a
+		// fresh scan.
+		if _, err := pm.ebpf.DeletePidPageMappingInfo(pid, []lpm.Prefix{dummyPrefix}); err != nil {
+			log.Debugf("Failed to remove raced PID marker for PID %d: %v", pid, err)
+		}
+		pm.ebpf.RemoveReportedPID(pid)
+		return
+	}
+	if info != nil {
+		info.observerMappings = observerMappings
+		info.observerTID = observerTID
+		info.publishedExecGeneration = syncExecGeneration
+		if currentIdentity.Valid() {
+			info.identity = currentIdentity
+		}
+		observerMeta = info.meta
+	}
+	pm.mu.Unlock()
+	if info != nil {
+		pm.notifyProcessSynchronized(ProcessEvent{
+			PID:          pid,
+			TID:          observerTID,
+			Identity:     currentIdentity,
+			Meta:         observerMeta,
+			Mappings:     slices.Clone(observerMappings),
+			ImageChanged: imageChanged,
+		})
 	}
 
 	if len(mpAdd) > 0 || len(mpRemove) > 0 || len(interpreters) > 0 {
