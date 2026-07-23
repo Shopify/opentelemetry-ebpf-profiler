@@ -137,8 +137,7 @@ var dynamicProbeResources = struct {
 		"off_cpu_time_min_ns",
 		"off_cpu_time_origin",
 		"off_cpu_time_sample_threshold",
-		"off_cpu_time_state_offset",
-		"off_cpu_time_state_size",
+		"off_cpu_time_state_enabled",
 	},
 }
 

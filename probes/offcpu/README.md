@@ -35,13 +35,14 @@ time — the flame graph answers "where does wall-clock time go while blocked".
   (descheduled involuntarily) mean the thread was denied CPU by saturation.
   Filter `thread.state` out of `{running, preempted}` for pure blocking
   analysis, or onto them to quantify CPU pressure.
-- The `prev_state` field is located by parsing the sched_switch **tracepoint
-  format file** (`/sys/kernel/tracing/events/sched/sched_switch/format`,
-  debugfs fallback) rather than assuming a struct layout, because the
-  tracepoint encoding is not a stable ABI. If the field cannot be resolved,
-  the probe logs and continues without the label; durations are unaffected.
-  Values use the post-4.14 `task_state_index` encoding; unrecognized
-  encodings collapse to `other` to bound label cardinality.
+- The `prev_state` layout is validated by parsing the sched_switch
+  **tracepoint format file** (`/sys/kernel/tracing/events/sched/sched_switch/format`,
+  debugfs fallback) before direct context access is enabled. Regular tracepoint
+  contexts require direct field access (`bpf_probe_read_kernel` may fail on
+  them), so the supported 64-bit x86_64/aarch64 layout must report offset 32,
+  size 8. A mismatch logs and continues without the label; durations are
+  unaffected. Values use the post-4.14 `task_state_index` encoding;
+  unrecognized encodings collapse to `other` to bound label cardinality.
 - `min_duration` and `sample_rate` are applied at **switch-in**, on the
   measured duration. Durations are always exact; sampling only reduces unwind
   and export volume and can never miss a long wait, unlike the built-in

@@ -71,32 +71,25 @@ BPF_RODATA_VAR(u16, off_cpu_time_origin, 0)
 BPF_RODATA_VAR(u64, off_cpu_time_min_ns, 0)
 BPF_RODATA_VAR(u32, off_cpu_time_sample_threshold, 0xffffffff)
 
-// Byte offset and size of the prev_state field in the raw sched_switch
-// tracepoint buffer, resolved from the tracefs format file at load time.
-// The tracepoint encoding of prev_state is not a stable ABI across kernel
-// versions, so the offset is never assumed: 0xffffffff disables state
-// capture and samples carry no state.
-BPF_RODATA_VAR(u32, off_cpu_time_state_offset, 0xffffffff)
-BPF_RODATA_VAR(u32, off_cpu_time_state_size, 0)
+// Regular tracepoint programs must access their context fields directly;
+// bpf_probe_read_kernel() against the tracepoint context can fail even when
+// the field lies in range. We still validate this layout against tracefs at
+// load time before enabling the read. The profiler supports only 64-bit
+// x86_64/aarch64 kernels, whose sched_switch format places the signed long
+// prev_state at byte 32 with size 8.
+typedef struct SchedSwitchContext {
+  u8 common_and_previous_task[32];
+  s64 prev_state;
+} SchedSwitchContext;
 
-static EBPF_INLINE u64 off_cpu_time_read_state(const void *ctx)
+BPF_RODATA_VAR(u32, off_cpu_time_state_enabled, 0)
+
+static EBPF_INLINE u64 off_cpu_time_read_state(const SchedSwitchContext *ctx)
 {
-  if (off_cpu_time_state_offset == 0xffffffff) {
+  if (!off_cpu_time_state_enabled) {
     return OFF_CPU_TIME_STATE_UNAVAILABLE;
   }
-  const u8 *field = (const u8 *)ctx + off_cpu_time_state_offset;
-  if (off_cpu_time_state_size == sizeof(u64)) {
-    u64 raw;
-    if (bpf_probe_read_kernel(&raw, sizeof(raw), field) == 0) {
-      return raw;
-    }
-  } else if (off_cpu_time_state_size == sizeof(u32)) {
-    u32 raw;
-    if (bpf_probe_read_kernel(&raw, sizeof(raw), field) == 0) {
-      return raw;
-    }
-  }
-  return OFF_CPU_TIME_STATE_UNAVAILABLE;
+  return (u64)ctx->prev_state;
 }
 
 static EBPF_INLINE OffCpuTimeMetrics *off_cpu_time_get_metrics()
@@ -110,7 +103,7 @@ static EBPF_INLINE OffCpuTimeMetrics *off_cpu_time_get_metrics()
 // the system, so it must stay minimal: all filtering and the unwind happen at
 // switch-in, once the off-CPU duration is known.
 SEC("tracepoint/sched/sched_switch")
-int off_cpu_time_switch_out(void *ctx)
+int off_cpu_time_switch_out(SchedSwitchContext *ctx)
 {
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid      = pid_tgid >> 32;
@@ -131,7 +124,7 @@ int off_cpu_time_switch_out(void *ctx)
     // describes exactly the thread being recorded: it distinguishes threads
     // that blocked voluntarily from runnable threads descheduled by CPU
     // pressure, which would otherwise be indistinguishable in the profile.
-    .state = off_cpu_time_read_state(ctx),
+    .state     = off_cpu_time_read_state(ctx),
   };
   // BPF_ANY: switch-out and switch-in strictly alternate per thread, so an
   // existing entry means the matching switch-in was missed (attach race or a

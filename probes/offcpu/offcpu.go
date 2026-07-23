@@ -42,12 +42,13 @@ const (
 	originVariableName   = "off_cpu_time_origin"
 	minNSVariableName    = "off_cpu_time_min_ns"
 	sampleVariableName   = "off_cpu_time_sample_threshold"
-	stateOffsetVariable  = "off_cpu_time_state_offset"
-	stateSizeVariable    = "off_cpu_time_state_size"
+	stateEnabledVariable = "off_cpu_time_state_enabled"
 
-	// stateOffsetUnavailable disables thread-state capture in eBPF when the
-	// prev_state field cannot be resolved from the tracepoint format file.
-	stateOffsetUnavailable = uint32(0xffffffff)
+	// The profiler supports only 64-bit x86_64/aarch64 kernels. Both expose
+	// prev_state at byte 32 as an 8-byte signed long in sched_switch; this
+	// layout is validated against tracefs before direct context access is enabled.
+	expectedStateOffset = uint32(32)
+	expectedStateSize   = uint32(8)
 
 	// stateUnavailable is the sentinel the eBPF side reports when no thread
 	// state was captured for a sample. Must match OFF_CPU_TIME_STATE_UNAVAILABLE.
@@ -136,7 +137,7 @@ func (p *offCPUTimeProbe) Load(origin uint16, ctx *tracer.ProbeContext) (link.Li
 		[]string{switchOutProgramName, switchInProgramName},
 		[]string{
 			originVariableName, minNSVariableName, sampleVariableName,
-			stateOffsetVariable, stateSizeVariable,
+			stateEnabledVariable,
 		},
 	)
 	if err != nil {
@@ -147,19 +148,26 @@ func (p *offCPUTimeProbe) Load(origin uint16, ctx *tracer.ProbeContext) (link.Li
 	// The tracepoint encoding of prev_state is not a stable ABI, so the field
 	// location is resolved from the tracefs format file rather than assumed.
 	// Failure only disables the thread.state label; durations are unaffected.
+	stateEnabled := uint32(0)
 	stateOffset, stateSize, stateErr := resolveSchedSwitchStateField()
 	if stateErr != nil {
 		log.Infof("Off-CPU time probe continues without thread state: %v", stateErr)
-		stateOffset = stateOffsetUnavailable
-		stateSize = 0
+	} else if stateOffset != expectedStateOffset || stateSize != expectedStateSize {
+		log.Infof(
+			"Off-CPU time probe continues without thread state: unexpected sched_switch "+
+				"prev_state layout offset=%d size=%d (expected offset=%d size=%d)",
+			stateOffset, stateSize, expectedStateOffset, expectedStateSize)
+	} else {
+		stateEnabled = 1
+		log.Infof("Off-CPU time thread-state capture enabled: prev_state offset=%d size=%d",
+			stateOffset, stateSize)
 	}
 
 	variables := map[string]any{
-		originVariableName:  origin,
-		minNSVariableName:   uint64(p.minDuration),
-		sampleVariableName:  p.sampleThreshold,
-		stateOffsetVariable: stateOffset,
-		stateSizeVariable:   stateSize,
+		originVariableName:   origin,
+		minNSVariableName:    uint64(p.minDuration),
+		sampleVariableName:   p.sampleThreshold,
+		stateEnabledVariable: stateEnabled,
 	}
 	for name, value := range variables {
 		if err := collection.Variables[name].Set(value); err != nil {
