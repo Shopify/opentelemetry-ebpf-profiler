@@ -5,6 +5,7 @@ package tracer // import "go.opentelemetry.io/ebpf-profiler/tracer"
 
 import (
 	"testing"
+	"time"
 	"unique"
 
 	cebpf "github.com/cilium/ebpf"
@@ -17,6 +18,21 @@ import (
 // Make accessible for testing
 func (t *Tracer) GetEbpfMaps() map[string]*cebpf.Map {
 	return t.ebpfMaps
+}
+
+func TestStopPIDEventProcessorBeforeStart(t *testing.T) {
+	tracer := &Tracer{pidEventsDone: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		tracer.stopPIDEventProcessor()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stopPIDEventProcessor blocked before the processor was started")
+	}
 }
 
 func TestSymbolizeKernelFramesIgnoresInvalidCacheEntries(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind"
 	"go.opentelemetry.io/ebpf-profiler/periodiccaller"
 	"go.opentelemetry.io/ebpf-profiler/process"
+	"go.opentelemetry.io/ebpf-profiler/processcontext"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	eim "go.opentelemetry.io/ebpf-profiler/processmanager/execinfomanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
@@ -89,6 +91,17 @@ func New(ctx context.Context, cfg Config) (*ProcessManager, error) {
 		cfg.FrameCacheSize = DefaultFrameCacheSize
 	}
 
+	// Always collect the env vars used to derive process context resource
+	// attributes, independently of the user-configured set. Clone first to avoid
+	// mutating the caller's set.
+	includeEnvVars := maps.Clone(cfg.IncludeEnvVars)
+	if includeEnvVars == nil {
+		includeEnvVars = make(libpf.Set[string])
+	}
+	for _, env := range processcontext.EnvVars() {
+		includeEnvVars[env] = libpf.Void{}
+	}
+
 	elfInfoCache, err := lru.New[util.OnDiskFileIdentifier, elfInfo](elfInfoCacheSize,
 		util.OnDiskFileIdentifier.Hash32)
 	if err != nil {
@@ -133,7 +146,7 @@ func New(ctx context.Context, cfg Config) (*ProcessManager, error) {
 		exeReporter:              cfg.ExecutableReporter,
 		metricsAddSlice:          metrics.AddSlice,
 		filterErrorFrames:        cfg.FilterErrorFrames,
-		includeEnvVars:           cfg.IncludeEnvVars,
+		includeEnvVars:           includeEnvVars,
 		selfCgroupIno:            selfCgroupIno,
 		selfContainerID:          selfContainerID,
 		usdtManager:              cfg.USDTManager,
@@ -219,6 +232,18 @@ func collectInterpreterMetrics(ctx context.Context, pm *ProcessManager,
 }
 
 func (pm *ProcessManager) Close() {
+	// Stop observer workers before releasing process-scoped USDT state.
+	pm.observerMu.Lock()
+	observers := make([]*processObserverEntry, 0, len(pm.processObservers))
+	for id, observer := range pm.processObservers {
+		observers = append(observers, observer)
+		delete(pm.processObservers, id)
+	}
+	pm.observerMu.Unlock()
+	for _, observer := range observers {
+		observer.close()
+	}
+
 	// Tear down any remaining per-PID USDT attachments. Detach() closes kernel
 	// uprobe links and must run without pm.mu held, so collect the instances
 	// under the lock, clear the map, then detach outside it. Done synchronously
@@ -406,6 +431,7 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace, profileType *sa
 		Value:          bpfTrace.Value,
 		AllocSize:      int64(bpfTrace.Size),
 		EnvVars:        bpfTrace.EnvVars,
+		Resource:       bpfTrace.Resource,
 		TraceID:        bpfTrace.APMTraceID,
 		SpanID:         bpfTrace.APMTransactionID,
 	}

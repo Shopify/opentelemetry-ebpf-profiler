@@ -8,8 +8,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-viper/mapstructure/v2"
+
 	"go.opentelemetry.io/ebpf-profiler/internal/linux"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/probes/biostacks"
+	"go.opentelemetry.io/ebpf-profiler/probes/functionlatency"
+	"go.opentelemetry.io/ebpf-profiler/probes/generic"
+	"go.opentelemetry.io/ebpf-profiler/probes/iouring"
+	"go.opentelemetry.io/ebpf-profiler/probes/tcpconnect"
+	"go.opentelemetry.io/ebpf-profiler/probes/tcpsequence"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/liveheap"
@@ -108,6 +116,8 @@ func (c *Controller) Start(ctx context.Context) error {
 		SamplesPerSecond:         c.config.SamplesPerSecond,
 		MapScaleFactor:           int(c.config.MapScaleFactor),
 		FrameCacheSize:           uint32(c.config.FrameCacheSize),
+		AsyncCorrelationCapacity: int(c.config.AsyncCorrelationCapacity),
+		AsyncCorrelationTTL:      c.config.AsyncCorrelationTTL,
 		KernelVersionCheck:       !c.config.NoKernelVersionCheck,
 		VerboseMode:              c.config.VerboseMode,
 		BPFVerifierLogLevel:      uint32(c.config.BPFVerifierLogLevel),
@@ -116,7 +126,7 @@ func (c *Controller) Start(ctx context.Context) error {
 		OffCPUThreshold:          uint32(c.config.OffCPUThreshold * float64(math.MaxUint32)),
 		IncludeEnvVars:           envVars,
 		ProbeLinks:               c.config.ProbeLinks,
-		LoadProbe:                c.config.LoadProbe,
+		LoadProbe:                c.config.LoadProbe || len(c.config.CustomProbes) > 0,
 		HeapProfiling:            c.config.HeapProfiling,
 		LiveHeapProfiling:        c.config.LiveHeapProfiling,
 		LiveHeapMaxEntriesPerPID: c.config.LiveHeapMaxEntriesPerPID,
@@ -194,7 +204,75 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start trace handling: %w", err)
 	}
 
+	if err := c.enableCustomProbes(trc); err != nil {
+		return fmt.Errorf("failed to enable custom probes: %w", err)
+	}
+
 	return nil
+}
+
+func (c *Controller) enableCustomProbes(trc *tracer.Tracer) error {
+	if len(c.config.CustomProbes) == 0 {
+		return nil
+	}
+
+	for probeName, probeConfig := range c.config.CustomProbes {
+		probe, err := createCustomProbe(probeName, probeConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create custom probe %q: %w", probeName, err)
+		}
+
+		if err := trc.Enable(probe); err != nil {
+			return fmt.Errorf("failed to enable custom probe %q: %w", probeName, err)
+		}
+
+		log.Infof("Enabled custom probe %q", probeName)
+	}
+
+	return nil
+}
+
+func createCustomProbe(name string, cfg any) (tracer.Probe, error) {
+	switch name {
+	case "generic":
+		var gcfg generic.GenericConfig
+		if err := mapstructure.Decode(cfg, &gcfg); err != nil {
+			return nil, fmt.Errorf("decoding generic probe config: %w", err)
+		}
+		return generic.New(gcfg)
+	case biostacks.SampleType, biostacks.ServiceSampleType, biostacks.FullSampleType:
+		return biostacks.NewForSampleType(name, cfg)
+	case iouring.SampleType:
+		return iouring.New(cfg)
+	case tcpconnect.SampleType:
+		return tcpconnect.New(cfg)
+	case tcpsequence.SendACKSampleType:
+		return tcpsequence.NewSendACK(cfg)
+	case tcpsequence.ReceiveSampleType:
+		return tcpsequence.NewReceive(cfg)
+	case "tcp_send_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "tcp_sendmsg",
+			SampleType: name,
+		}, cfg)
+	case "tcp_receive_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "tcp_recvmsg",
+			SampleType: name,
+		}, cfg)
+	case "vfs_read_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "vfs_read",
+			SampleType: name,
+		}, cfg)
+	case "vfs_write_latency":
+		return functionlatency.New(functionlatency.Definition{
+			Symbol:     "vfs_write",
+			SampleType: name,
+		}, cfg)
+	default:
+		return nil, fmt.Errorf("unknown custom probe: %q", name)
+	}
 }
 
 // Shutdown stops the controller

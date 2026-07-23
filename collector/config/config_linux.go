@@ -20,8 +20,9 @@ const (
 	// 1TB of executable address space
 	MaxArgMapScaleFactor = 8
 
-	minFrameCacheSize = 1024
-	maxFrameCacheSize = 1024 * 1024
+	minFrameCacheSize           = 1024
+	maxFrameCacheSize           = 1024 * 1024
+	maxAsyncCorrelationCapacity = 1024 * 1024
 )
 
 // ErrorMode controls how the profiler receiver handles startup errors.
@@ -52,6 +53,8 @@ type Config struct {
 	MonitorInterval          time.Duration            `mapstructure:"monitor_interval"`
 	SamplesPerSecond         int                      `mapstructure:"samples_per_second"`
 	FrameCacheSize           uint                     `mapstructure:"frame_cache_size"`
+	AsyncCorrelationCapacity uint                     `mapstructure:"async_correlation_capacity"`
+	AsyncCorrelationTTL      time.Duration            `mapstructure:"async_correlation_ttl"`
 	ProbabilisticInterval    time.Duration            `mapstructure:"probabilistic_interval"`
 	ProbabilisticThreshold   uint                     `mapstructure:"probabilistic_threshold"`
 	Interpreters             interpreterconfig.Config `mapstructure:"interpreters"`
@@ -74,6 +77,7 @@ type Config struct {
 	BPFFSRoot                string                   `mapstructure:"bpf_fs_root"`
 	ErrorMode                ErrorMode                `mapstructure:"error_mode"`
 	OBIProcessCtx            bool                     `mapstructure:"obi_process_ctx"`
+	CustomProbes             map[string]any           `mapstructure:"custom_probes"`
 }
 
 // Validate validates the config.
@@ -90,6 +94,14 @@ func (cfg *Config) Validate() error {
 	if cfg.FrameCacheSize < minFrameCacheSize || cfg.FrameCacheSize > maxFrameCacheSize {
 		return fmt.Errorf("invalid frame cache size %d (min: %d, max: %d)",
 			cfg.FrameCacheSize, minFrameCacheSize, maxFrameCacheSize)
+	}
+
+	if cfg.AsyncCorrelationCapacity > maxAsyncCorrelationCapacity {
+		return fmt.Errorf("async correlation capacity %d exceeds limit (max: %d)",
+			cfg.AsyncCorrelationCapacity, maxAsyncCorrelationCapacity)
+	}
+	if cfg.AsyncCorrelationTTL < 0 {
+		return errors.New("async correlation TTL must not be negative")
 	}
 
 	if cfg.MapScaleFactor > MaxArgMapScaleFactor {

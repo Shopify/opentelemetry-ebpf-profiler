@@ -98,6 +98,8 @@ func (sp *systemProcess) PID() libpf.PID {
 	return sp.pid
 }
 
+// TID returns the thread used to inspect this process. ProcessManager uses it
+// opportunistically when the thread-group leader has already exited.
 func (sp *systemProcess) TID() libpf.PID {
 	return sp.tid
 }
@@ -332,7 +334,7 @@ func iterateMappings(mapsFile io.Reader, callback func(m RawMapping) bool) (uint
 			numParseErrors++
 			continue
 		}
-		device := major<<8 + minor
+		device := unix.Mkdev(uint32(major), uint32(minor))
 
 		var path string
 		if inode == 0 {
@@ -481,6 +483,182 @@ func openInProcRoot(pid libpf.PID, filePath string) (*os.File, error) {
 	return openInRoot(fmt.Sprintf("/proc/%d/root", pid), filePath)
 }
 
+func sameMapping(left, right *RawMapping) bool {
+	return left.Vaddr == right.Vaddr && left.Length == right.Length &&
+		left.Flags == right.Flags && left.FileOffset == right.FileOffset &&
+		left.Device == right.Device && left.Inode == right.Inode
+}
+
+func mappingPresentInMaps(mapsPath string, wanted *RawMapping) (present, nonEmpty bool, err error) {
+	mapsFile, err := os.Open(mapsPath)
+	if err != nil {
+		return false, false, err
+	}
+	defer mapsFile.Close()
+	_, err = iterateMappings(mapsFile, func(candidate RawMapping) bool {
+		nonEmpty = true
+		present = present || sameMapping(&candidate, wanted)
+		return true
+	})
+	return present, nonEmpty, err
+}
+
+const maxAlternateTaskRoots = 32
+
+func alternateTaskIDs(pid, preferred libpf.PID) ([]libpf.PID, error) {
+	directory, err := os.Open(fmt.Sprintf("/proc/%v/task", pid))
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	// Read only enough entries to cover the bounded attempts plus the leader and
+	// preferred TID that may be skipped.
+	threads, err := directory.ReadDir(maxAlternateTaskRoots + 2)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	result := make([]libpf.PID, 0, min(len(threads), maxAlternateTaskRoots))
+	for _, thread := range threads {
+		tid, parseErr := strconv.ParseUint(thread.Name(), 10, 32)
+		threadID := libpf.PID(tid)
+		if parseErr != nil || threadID == pid || threadID == preferred {
+			continue
+		}
+		result = append(result, threadID)
+		if len(result) == maxAlternateTaskRoots {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (sp *systemProcess) mappingStillPresent(m *RawMapping) error {
+	checked := false
+	var lastErr error
+	check := func(mapsPath string) (bool, error) {
+		present, nonEmpty, err := mappingPresentInMaps(mapsPath, m)
+		if err != nil {
+			lastErr = err
+			return false, nil
+		}
+		checked = true
+		if present {
+			return true, nil
+		}
+		if nonEmpty {
+			// Every thread observes the same mm. A readable nonempty maps file is
+			// authoritative, so avoid scanning attacker-controlled thread counts.
+			return false, errors.New("mapping is no longer present in process maps")
+		}
+		return false, nil
+	}
+
+	if present, err := check(fmt.Sprintf("/proc/%v/maps", sp.pid)); present || err != nil {
+		return err
+	}
+	if sp.tid != sp.pid && threadBelongsToProcess(sp.pid, sp.tid) {
+		if present, err := check(fmt.Sprintf("/proc/%v/maps", sp.tid)); present || err != nil {
+			return err
+		}
+	}
+	threads, threadErr := alternateTaskIDs(sp.pid, sp.tid)
+	if threadErr != nil {
+		lastErr = threadErr
+	}
+	for _, tid := range threads {
+		if present, err := check(fmt.Sprintf("/proc/%v/task/%v/maps", sp.pid, tid)); present || err != nil {
+			return err
+		}
+	}
+	if checked {
+		return errors.New("mapping is no longer present in process maps")
+	}
+	return fmt.Errorf("cannot verify mapping in process maps: %w", lastErr)
+}
+
+func openVerifiedMappingInRoot(rootPath string, m *RawMapping) (*os.File, error) {
+	f, err := openInRoot(rootPath, m.Path)
+	if err != nil {
+		return nil, err
+	}
+	if err = checkInodeDeviceMapping(f, m); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func threadBelongsToProcess(pid, tid libpf.PID) bool {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%v/status", tid))
+	if err != nil {
+		return false
+	}
+	for line := range strings.SplitSeq(string(status), "\n") {
+		if !strings.HasPrefix(line, "Tgid:") {
+			continue
+		}
+		value, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "Tgid:")), 10, 32)
+		return err == nil && libpf.PID(value) == pid
+	}
+	return false
+}
+
+func (sp *systemProcess) openMappingFromTIDRoot(tid libpf.PID, m *RawMapping) (*os.File, error) {
+	if !threadBelongsToProcess(sp.pid, tid) {
+		return nil, fmt.Errorf("TID %d no longer belongs to PID %d", tid, sp.pid)
+	}
+	var errs []error
+	for _, rootPath := range []string{
+		fmt.Sprintf("/proc/%v/task/%v/root", sp.pid, tid),
+		fmt.Sprintf("/proc/%v/root", tid),
+	} {
+		if f, err := openVerifiedMappingInRoot(rootPath, m); err == nil {
+			return f, nil
+		} else {
+			errs = append(errs, err)
+		}
+	}
+	return nil, errors.Join(errs...)
+}
+
+func (sp *systemProcess) verifyCurrentMappingFile(f *os.File, m *RawMapping) (*os.File, error) {
+	if err := sp.mappingStillPresent(m); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func (sp *systemProcess) openMappingFromThreadRoot(m *RawMapping) (*os.File, error) {
+	var preferredErr error
+	if sp.tid != sp.pid {
+		if f, err := sp.openMappingFromTIDRoot(sp.tid, m); err == nil {
+			return f, nil
+		} else {
+			preferredErr = err
+		}
+	}
+	threads, err := alternateTaskIDs(sp.pid, sp.tid)
+	if err != nil {
+		return nil, errors.Join(preferredErr, err)
+	}
+	var lastErr error
+	attempts := 0
+	for _, tid := range threads {
+		attempts++
+		f, openErr := sp.openMappingFromTIDRoot(tid, m)
+		if openErr == nil {
+			return f, nil
+		}
+		lastErr = openErr
+	}
+	if attempts == 0 && preferredErr == nil {
+		return nil, errors.New("no surviving task root")
+	}
+	return nil, errors.Join(preferredErr, lastErr,
+		fmt.Errorf("failed to open mapping through %d alternate task roots", attempts))
+}
+
 // getMappingFile opens the backing file for a mapping and returns an open file descriptor.
 // The caller is responsible for closing the returned file.
 func (sp *systemProcess) getMappingFile(m *RawMapping) (*os.File, error) {
@@ -491,20 +669,47 @@ func (sp *systemProcess) getMappingFile(m *RawMapping) (*os.File, error) {
 		// Neither /proc/sp.pid/map_files nor /proc/sp.pid/task/sp.tid/map_files
 		// nor /proc/sp.pid/root exist if main thread has exited, so we use the
 		// mapping path directly under the sp.tid root.
-		rootPath := fmt.Sprintf("/proc/%v/task/%v/root", sp.pid, sp.tid)
-		f, err := openInRoot(rootPath, m.Path)
+		if err := sp.mappingStillPresent(m); err != nil {
+			return nil, err
+		}
+		f, err := sp.openMappingFromThreadRoot(m)
 		if err != nil {
 			return nil, err
 		}
-		// Verify inode and device match the mapping to detect file substitution.
-		if err = checkInodeDeviceMapping(f, m); err != nil {
+		return sp.verifyCurrentMappingFile(f, m)
+	}
+	filename := fmt.Sprintf("/proc/%v/map_files/%x-%x", sp.pid, m.Vaddr, m.Vaddr+m.Length)
+	f, mapFilesErr := os.Open(filename)
+	if mapFilesErr == nil {
+		// The mapping snapshot may be delivered asynchronously. Verify that the
+		// address range still names the inode observed in that snapshot rather
+		// than a replacement mapping installed at the same virtual address.
+		if err := checkInodeDeviceMapping(f, m); err != nil {
 			_ = f.Close()
 			return nil, err
 		}
 		return f, nil
 	}
-	filename := fmt.Sprintf("/proc/%v/map_files/%x-%x", sp.pid, m.Vaddr, m.Vaddr+m.Length)
-	return os.Open(filename)
+
+	// Some kernels restrict map_files even when the process root remains
+	// accessible. A missing map_files range can also mean this asynchronous
+	// snapshot is stale, so verify the full VMA tuple in a fresh maps scan before
+	// falling back to a namespace-correct path.
+	mappingErr := sp.mappingStillPresent(m)
+	if mappingErr != nil {
+		return nil, errors.Join(mapFilesErr, mappingErr)
+	}
+	f, rootErr := openVerifiedMappingInRoot(fmt.Sprintf("/proc/%d/root", sp.pid), m)
+	if rootErr == nil {
+		return sp.verifyCurrentMappingFile(f, m)
+	}
+	// If the thread-group leader has exited, /proc/<pid>/root disappears.
+	// Resolve through any surviving task and retain the same inode check.
+	f, threadErr := sp.openMappingFromThreadRoot(m)
+	if threadErr == nil {
+		return sp.verifyCurrentMappingFile(f, m)
+	}
+	return nil, errors.Join(mapFilesErr, rootErr, threadErr)
 }
 
 func (sp *systemProcess) OpenMappingFile(m *RawMapping) (ReadAtCloser, error) {

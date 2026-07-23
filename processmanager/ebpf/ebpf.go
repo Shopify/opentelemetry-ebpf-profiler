@@ -53,6 +53,7 @@ type ebpfMapsImpl struct {
 	LuaJitProcs        *cebpf.Map `name:"luajit_procs"`
 	ApmIntProcs        *cebpf.Map `name:"apm_int_procs"`
 	GoProcs            *cebpf.Map `name:"go_procs"`
+	ThreadContextProcs *cebpf.Map `name:"thread_context_procs"`
 	HeapAllocLive      *cebpf.Map `name:"heap_alloc_live"`
 	HeapLivePids       *cebpf.Map `name:"heap_live_pids"`
 	HeapPIDAllocCount  *cebpf.Map `name:"heap_pid_alloc_count"`
@@ -179,6 +180,8 @@ func (impl *ebpfMapsImpl) getInterpreterTypeMap(typ libpf.InterpreterType) (*ceb
 		return impl.GoProcs, nil
 	case libpf.LuaJIT:
 		return impl.LuaJitProcs, nil
+	case libpf.ThreadContext:
+		return impl.ThreadContextProcs, nil
 	default:
 		return nil, fmt.Errorf("type %d is not (yet) supported", typ)
 	}

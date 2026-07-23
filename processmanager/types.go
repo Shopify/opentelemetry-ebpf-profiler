@@ -48,6 +48,14 @@ type ProcessManager struct {
 	// A mutex to synchronize access to internal data within this struct.
 	mu sync.RWMutex
 
+	// observerMu serializes observer registration with lifecycle notifications.
+	// Observer callbacks never run while mu is held.
+	observerMu sync.Mutex
+
+	// processObservers receive immutable process and mapping snapshots.
+	processObservers map[uint64]*processObserverEntry
+	nextObserverID   uint64
+
 	// interpreterTracerEnabled indicates if at last one non-native tracer is loaded.
 	interpreterTracerEnabled bool
 
@@ -179,10 +187,19 @@ func (m *Mapping) GetOnDiskFileIdentifier() util.OnDiskFileIdentifier {
 // processInfo contains information about the executable mappings
 // and Thread Specific Data of a process.
 type processInfo struct {
-	// process metadata, fixed for process lifetime (read-only)
+	// process metadata, fixed for one process image.
 	meta process.ProcessMeta
 	// executable mappings sorted by FileID and mapping start address
 	mappings []Mapping
+	// Raw executable file mappings and inspection thread retained for observers.
+	observerMappings []process.RawMapping
+	observerTID      libpf.PID
+	// identity distinguishes exec and PID reuse generations.
+	identity ProcessIdentity
+	// execGeneration is advanced by sched_process_exec notifications;
+	// publishedExecGeneration identifies the generation observers last received.
+	execGeneration          uint64
+	publishedExecGeneration uint64
 	// C-library Thread Specific Data information
 	libcInfo *libc.LibcInfo
 	// lastSeenTID is the most recent thread ID observed for this PID via

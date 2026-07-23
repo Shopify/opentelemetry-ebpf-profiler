@@ -53,7 +53,38 @@ const (
 
 // StartPIDEventProcessor spawns a goroutine to process PID events.
 func (t *Tracer) StartPIDEventProcessor(ctx context.Context) {
-	go t.processPIDEvents(ctx)
+	t.pidEventsMu.Lock()
+	if t.pidEventsStarted || t.pidEventsClosed {
+		t.pidEventsMu.Unlock()
+		return
+	}
+	processorCtx, cancel := context.WithCancel(ctx)
+	t.pidEventsCancel = cancel
+	t.pidEventsStarted = true
+	t.pidEventsMu.Unlock()
+
+	go t.processPIDEvents(processorCtx)
+}
+
+// stopPIDEventProcessor cancels and drains PID processing when it was started.
+// It returns immediately for partially initialized tracers.
+func (t *Tracer) stopPIDEventProcessor() {
+	t.pidEventsMu.Lock()
+	if t.pidEventsClosed {
+		t.pidEventsMu.Unlock()
+		return
+	}
+	t.pidEventsClosed = true
+	if !t.pidEventsStarted {
+		t.pidEventsMu.Unlock()
+		return
+	}
+	cancel := t.pidEventsCancel
+	done := t.pidEventsDone
+	t.pidEventsMu.Unlock()
+
+	cancel()
+	<-done
 }
 
 // Process the PID events that are incoming in the Tracer channel.

@@ -1283,17 +1283,16 @@ func profileFrameFullLabel(classPath, label, baseLabel, methodName libpf.String,
 }
 
 // findJITRegion detects the Ruby JIT code reservation from process memory mappings.
-// Ruby reserves one contiguous address range via rb_jit_reserve_addr_space(), then
-// uses mprotect to activate pages as r-x or temporarily rw. Code GC can turn pages
-// back into PROT_NONE, so that single reservation may appear as multiple VMAs with
-// holes or different protections. On systems with CONFIG_ANON_VMA_NAME, Ruby labels
-// the region via prctl(PR_SET_VMA) giving it a path like
-// "[anon:Ruby:rb_jit_reserve_addr_space]". Otherwise we use a conservative fallback
-// that spans from the first anonymous executable mapping to the end of the last
-// anonymous executable mapping, plus any contiguous anonymous tail after that last
-// executable mapping. This covers production layouts where the single Ruby JIT
-// reservation is split across several VMAs without requiring multi-segment tracking
-// in eBPF.
+// Ruby reserves address ranges via rb_jit_reserve_addr_space() and then uses
+// mprotect to activate pages as r-x or temporarily rw. Code GC can turn pages
+// back into PROT_NONE, so the reservation may appear as multiple VMAs.
+// On systems with CONFIG_ANON_VMA_NAME, Ruby labels the region via prctl(PR_SET_VMA)
+// giving it a path like "[anon:Ruby:rb_jit_reserve_addr_space]". Otherwise we use
+// a conservative fallback that spans from the first anonymous executable mapping
+// to the end of the last anonymous executable mapping, plus any contiguous
+// anonymous tail after that last executable mapping. This covers production
+// layouts where Ruby exposes multiple discontiguous anonymous executable ranges
+// without requiring multi-segment tracking in eBPF.
 // Returns (start, end, found).
 func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
 	var jitStart, jitEnd uint64
@@ -1363,33 +1362,38 @@ func (r *rubyInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 		jitEnd = 0
 	}
 
+	var prefixes []lpm.Prefix
+	if jitFound {
+		var err error
+		prefixes, err = lpm.CalculatePrefixList(jitStart, jitEnd)
+		if err != nil {
+			return fmt.Errorf("ruby jit region lpm failure %#x-%#x: %w", jitStart, jitEnd, err)
+		}
+	}
+
 	// Publish the JIT range before publishing new interpreter prefixes. Once a
 	// prefix is visible to eBPF, samples in that range may enter the Ruby unwinder
 	// and need procInfo to already contain the matching range for JIT-frame checks.
 	if r.procInfo.Jit_start != jitStart || r.procInfo.Jit_end != jitEnd {
-		r.procInfo.Jit_start = jitStart
-		r.procInfo.Jit_end = jitEnd
-		if err := ebpf.UpdateProcData(libpf.Ruby, pr.PID(), unsafe.Pointer(r.procInfo)); err != nil {
+		updatedProcInfo := *r.procInfo
+		updatedProcInfo.Jit_start = jitStart
+		updatedProcInfo.Jit_end = jitEnd
+		if err := ebpf.UpdateProcData(libpf.Ruby, pid, unsafe.Pointer(&updatedProcInfo)); err != nil {
 			return err
 		}
+		r.procInfo.Jit_start = jitStart
+		r.procInfo.Jit_end = jitEnd
 		log.Debugf("Updated JIT region %#x-%#x in ruby proc info", jitStart, jitEnd)
 	}
 
-	if jitFound {
-		prefixes, err := lpm.CalculatePrefixList(jitStart, jitEnd)
-		if err != nil {
-			return fmt.Errorf("ruby jit region lpm failure %#x-%#x: %w", jitStart, jitEnd, err)
-		}
-
-		for _, prefix := range prefixes {
-			if _, exists := r.prefixes[prefix]; !exists {
-				if err := ebpf.UpdatePidInterpreterMapping(pid, prefix,
-					support.ProgUnwindRuby, 0, 0); err != nil {
-					return err
-				}
+	for _, prefix := range prefixes {
+		if _, exists := r.prefixes[prefix]; !exists {
+			if err := ebpf.UpdatePidInterpreterMapping(pid, prefix,
+				support.ProgUnwindRuby, 0, 0); err != nil {
+				return err
 			}
-			r.prefixes[prefix] = r.mappingGeneration
 		}
+		r.prefixes[prefix] = r.mappingGeneration
 	}
 
 	// Remove prefixes not seen.
@@ -1461,6 +1465,21 @@ func determineRubyVersion(ef *pfelf.File) (uint32, error) {
 	return rubyVersion(uint32(major), uint32(minor), uint32(release)), nil
 }
 
+const ruby405PShopifyRevision = "21a2595676"
+
+// rubyUses406Layout reports whether a Ruby 4.0 binary contains the two layout
+// changes released in 4.0.6. Shopify's transitional 4.0.5-pshopify3 build is
+// cut from ruby/ruby@21a2595676 and therefore contains both changes despite its
+// older version string. ruby_description is an exported, on-disk symbol, unlike
+// the pshopify branch suffix which is present only in DWARF.
+func rubyUses406Layout(version uint32, description string) bool {
+	if version >= rubyVersion(4, 0, 6) {
+		return true
+	}
+	return version == rubyVersion(4, 0, 5) &&
+		strings.Contains(description, " revision "+ruby405PShopifyRevision+")")
+}
+
 func GetLoader(_ Config) interpreter.Loader {
 	return loader
 }
@@ -1479,6 +1498,17 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	version, err := determineRubyVersion(ef)
 	if err != nil {
 		return nil, err
+	}
+
+	var description string
+	if version == rubyVersion(4, 0, 5) {
+		if _, memory, descriptionErr := ef.SymbolData("ruby_description", 128); descriptionErr == nil {
+			description = strings.TrimRight(pfunsafe.ToString(memory), "\x00")
+		}
+	}
+	usesRuby406Layout := rubyUses406Layout(version, description)
+	if version < rubyVersion(4, 0, 6) && usesRuby406Layout {
+		log.Debugf("Ruby %s uses backported 4.0.6 VM layout", description)
 	}
 
 	// Reason for lowest supported version:
@@ -1608,7 +1638,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// Look for DTPMOD64 relocation to find the TLS module ID offset.
 	// This is used for DTV-based TLS access when TLSDESC is unavailable.
 	var tlsModuleIdOffset libpf.Address
-	if err = ef.VisitRelocations(func(r pfelf.ElfReloc, _ string) bool {
+	if err = ef.VisitRelocations(func(r pfelf.ElfReloc, _ string, _ pfelf.RelocType) bool {
 		log.Debugf("Found DTPMOD64 relocation at offset %x", r.Off)
 		tlsModuleIdOffset = libpf.Address(r.Off)
 		return false
@@ -1722,7 +1752,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		} else {
 			vms.vm_struct.gc_objspace = 1272
 		}
-		if version >= rubyVersion(4, 0, 6) {
+		if usesRuby406Layout {
 			// Ruby 4.0.6 inserted rb_vm_t.master_box before root_box,
 			// shifting the gc.objspace field by one pointer.
 			// https://github.com/ruby/ruby/blob/v4.0.6/vm_core.h
@@ -1885,7 +1915,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 			} else {
 				vms.rb_ractor_struct.running_ec = 0x148
 			}
-			if version >= rubyVersion(4, 0, 6) {
+			if usesRuby406Layout {
 				// Ruby 4.0.6 added runnable_hot_th and runnable_hot_th_waiting
 				// to struct rb_thread_sched, which is embedded in
 				// rb_ractor_struct.threads before running_ec.

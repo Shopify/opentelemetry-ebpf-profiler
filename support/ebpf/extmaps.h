@@ -16,6 +16,7 @@ extern struct inhibit_events_t inhibit_events;
 extern struct interpreter_offsets_t interpreter_offsets;
 extern struct trace_events_t trace_events;
 extern struct go_procs_t go_procs;
+extern struct thread_context_procs_t thread_context_procs;
 extern struct heap_alloc_live_t heap_alloc_live;
 extern struct heap_live_pids_t heap_live_pids;
 extern struct heap_pid_alloc_count_t heap_pid_alloc_count;
