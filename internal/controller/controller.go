@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/internal/linux"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/probes/generic"
+	"go.opentelemetry.io/ebpf-profiler/probes/offcpu"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
@@ -210,6 +211,8 @@ func createCustomProbe(name string, cfg any) (tracer.Probe, error) {
 			return nil, fmt.Errorf("decoding generic probe config: %w", err)
 		}
 		return generic.New(gcfg)
+	case offcpu.SampleType:
+		return offcpu.New(cfg)
 	default:
 		return nil, fmt.Errorf("unknown custom probe: %q", name)
 	}

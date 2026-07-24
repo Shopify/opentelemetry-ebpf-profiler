@@ -686,6 +686,27 @@ const (
 	// Number of times we didn't find an entry for this process in the LuaJIT process info array
 	IDUnwindLuaJITErrNoProcInfo = 299
 
+	// Number of thread switch-out events observed by the off-CPU time probe
+	IDOffCPUTimeSwitchOuts = 300
+
+	// Number of thread switch-in events observed by the off-CPU time probe
+	IDOffCPUTimeSwitchIns = 301
+
+	// Number of off-CPU time switch-ins without a recorded switch-out
+	IDOffCPUTimeUnmatchedSwitchIns = 302
+
+	// Number of off-CPU time samples filtered by duration or sampling
+	IDOffCPUTimeFiltered = 303
+
+	// Number of off-CPU time samples submitted for unwinding
+	IDOffCPUTimeEmitted = 304
+
+	// Number of failures recording off-CPU time switch-out state
+	IDOffCPUTimeStateUpdateFailures = 305
+
+	// Number of failures reading off-CPU time eBPF metrics
+	IDOffCPUTimeMetricReadFailures = 306
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 300
+	IDMax = 307
 )

@@ -140,6 +140,7 @@ type EbpfTrace struct {
 	KernelFrames     Frames
 	FrameDataBuf     [3072]uint64
 	Value            int64
+	ProbeUserData    uint64
 	KTime            int64
 	CpuID            uint32
 	TID              PID

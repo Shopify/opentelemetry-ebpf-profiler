@@ -2188,5 +2188,54 @@
     "name": "UnwindLuaJITErrNoProcInfo",
     "field": "bpf.luajit.errors.no_proc_info",
     "id": 299
+  },
+  {
+    "description": "Number of thread switch-out events observed by the off-CPU time probe",
+    "type": "counter",
+    "name": "OffCPUTimeSwitchOuts",
+    "field": "agent.off_cpu_time.switch_outs",
+    "id": 300
+  },
+  {
+    "description": "Number of thread switch-in events observed by the off-CPU time probe",
+    "type": "counter",
+    "name": "OffCPUTimeSwitchIns",
+    "field": "agent.off_cpu_time.switch_ins",
+    "id": 301
+  },
+  {
+    "description": "Number of off-CPU time switch-ins without a recorded switch-out",
+    "type": "counter",
+    "name": "OffCPUTimeUnmatchedSwitchIns",
+    "field": "agent.off_cpu_time.switch_ins.unmatched",
+    "id": 302
+  },
+  {
+    "description": "Number of off-CPU time samples filtered by duration or sampling",
+    "type": "counter",
+    "name": "OffCPUTimeFiltered",
+    "field": "agent.off_cpu_time.filtered",
+    "id": 303
+  },
+  {
+    "description": "Number of off-CPU time samples submitted for unwinding",
+    "type": "counter",
+    "name": "OffCPUTimeEmitted",
+    "field": "agent.off_cpu_time.emitted",
+    "id": 304
+  },
+  {
+    "description": "Number of failures recording off-CPU time switch-out state",
+    "type": "counter",
+    "name": "OffCPUTimeStateUpdateFailures",
+    "field": "agent.off_cpu_time.state.update_failures",
+    "id": 305
+  },
+  {
+    "description": "Number of failures reading off-CPU time eBPF metrics",
+    "type": "counter",
+    "name": "OffCPUTimeMetricReadFailures",
+    "field": "agent.off_cpu_time.metrics.read_failures",
+    "id": 306
   }
 ]

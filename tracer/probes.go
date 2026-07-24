@@ -14,6 +14,7 @@ import (
 	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
@@ -435,6 +436,13 @@ func (c *ProbeContext) LoadProbeUnwinders(
 		bpfVerifierLogLevel, perfProgs.FD(), perCPURecords.FD(), perCPURecordsKp)
 }
 
+// TraceLabeler is an optional interface for probes. LabelTrace runs before
+// symbolization for each trace emitted by the probe's origin and may merge
+// low-cardinality, probe-specific sample labels.
+type TraceLabeler interface {
+	LabelTrace(trace *libpf.EbpfTrace)
+}
+
 // Probe defines the interface that allows custom stack unwinding trigger points.
 type Probe interface {
 	// Load attaches a probe that triggers stack unwinding.
@@ -492,6 +500,9 @@ func (t *Tracer) Enable(p Probe) error {
 	if lnk == nil {
 		t.origins.unregister(originID)
 		return errors.New("probe returned a nil link")
+	}
+	if labeler, ok := p.(TraceLabeler); ok {
+		t.traceLabelers.Store(originID, labeler)
 	}
 
 	t.hooks[hookPoint{group: "probe", name: fmt.Sprintf("%d", originID)}] = lnk
