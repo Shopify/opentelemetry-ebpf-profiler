@@ -671,6 +671,10 @@ typedef struct Trace {
   // e.g. time in nanoseconds for off-CPU traces
   u64 value;
 
+  // probe_user_data carries an optional probe-defined value for userspace
+  // per-origin labelers. It is not part of the profile sample value.
+  u64 probe_user_data;
+
   // The CPU that captured this trace.
   u32 cpu_id;
 

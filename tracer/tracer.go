@@ -165,6 +165,9 @@ type Tracer struct {
 	// profile type metadata is looked up by.
 	origins *originRegistry
 
+	// traceLabelers maps dynamic origin IDs to optional probe labelers.
+	traceLabelers sync.Map
+
 	// probeMetricCollectors are registered dynamically by custom probes.
 	probeMetricsMu        sync.RWMutex
 	probeMetricCollectors map[uint64]*probeMetricCollector
@@ -1214,6 +1217,7 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 		TID:              libpf.PID(ptr.Tid),
 		Origin:           ptr.Origin,
 		Value:            int64(ptr.Value),
+		ProbeUserData:    ptr.Probe_user_data,
 		KTime:            int64(ptr.Ktime),
 		CpuID:            ptr.Cpu_id,
 		EnvVars:          procMeta.EnvVariables,
@@ -1514,6 +1518,9 @@ func (t *Tracer) AttachProbes(probes []string) error {
 }
 
 func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
+	if labeler, ok := t.traceLabelers.Load(bpfTrace.Origin); ok {
+		labeler.(TraceLabeler).LabelTrace(bpfTrace)
+	}
 	t.processManager.HandleTrace(bpfTrace, t.origins.lookup(bpfTrace.Origin))
 
 	// Reclaim the EbpfTrace

@@ -929,8 +929,14 @@ get_usermode_regs(struct pt_regs *ctx, UnwindState *state, bool *has_usermode_re
 
 #endif // TESTING_COREDUMP
 
-static inline EBPF_INLINE int
-collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value)
+static inline EBPF_INLINE int collect_trace_internal(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 value,
+  u64 probe_user_data)
 {
   // Only continue processing the trace with a valid origin.
   if (origin == 0) {
@@ -945,12 +951,13 @@ collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_times
     return -1;
   }
 
-  Trace *trace  = &record->trace;
-  trace->origin = origin;
-  trace->pid    = pid;
-  trace->tid    = tid;
-  trace->ktime  = trace_timestamp;
-  trace->value  = value;
+  Trace *trace           = &record->trace;
+  trace->origin          = origin;
+  trace->pid             = pid;
+  trace->tid             = tid;
+  trace->ktime           = trace_timestamp;
+  trace->value           = value;
+  trace->probe_user_data = probe_user_data;
   if (bpf_get_current_comm(&(trace->comm), sizeof(trace->comm)) < 0) {
     increment_metric(metricID_ErrBPFCurrentComm);
   }
@@ -998,6 +1005,20 @@ exit:
   tail_call(ctx, unwinder);
   DEBUG_PRINT("bpf_tail call failed for %d in native_tracer_entry", unwinder);
   return -1;
+}
+
+static inline EBPF_INLINE int
+collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value)
+{
+  return collect_trace_internal(ctx, origin, pid, tid, trace_timestamp, value, 0);
+}
+
+// collect_trace_with_user_data keeps the trace synchronous while carrying a
+// probe-defined value to its optional userspace TraceLabeler.
+static inline EBPF_INLINE int collect_trace_with_user_data(
+  struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value, u64 user_data)
+{
+  return collect_trace_internal(ctx, origin, pid, tid, trace_timestamp, value, user_data);
 }
 
 #endif
