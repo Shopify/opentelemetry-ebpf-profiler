@@ -4,12 +4,16 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-viper/mapstructure/v2"
+
 	"go.opentelemetry.io/ebpf-profiler/internal/linux"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/probes/generic"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
@@ -85,26 +89,27 @@ func (c *Controller) Start(ctx context.Context) error {
 
 	// Load the eBPF code and map definitions
 	trc, err := tracer.NewTracer(ctx, &tracer.Config{
-		TraceReporter:          c.reporter,
-		Intervals:              intervals,
-		InterpretersConfig:     c.config.Interpreters,
-		FilterErrorFrames:      !c.config.SendErrorFrames,
-		FilterIdleFrames:       !c.config.SendIdleFrames,
-		SamplesPerSecond:       c.config.SamplesPerSecond,
-		MapScaleFactor:         int(c.config.MapScaleFactor),
-		FrameCacheSize:         uint32(c.config.FrameCacheSize),
-		KernelVersionCheck:     !c.config.NoKernelVersionCheck,
-		VerboseMode:            c.config.VerboseMode,
-		BPFVerifierLogLevel:    uint32(c.config.BPFVerifierLogLevel),
-		ProbabilisticInterval:  c.config.ProbabilisticInterval,
-		ProbabilisticThreshold: c.config.ProbabilisticThreshold,
-		OffCPUThreshold:        uint32(c.config.OffCPUThreshold * float64(math.MaxUint32)),
-		IncludeEnvVars:         envVars,
-		ProbeLinks:             c.config.ProbeLinks,
-		LoadProbe:              c.config.LoadProbe,
-		ExecutableReporter:     c.config.ExecutableReporter,
-		BPFFSRoot:              c.config.BPFFSRoot,
-		OBIProcessCtx:          c.config.OBIProcessCtx,
+		TraceReporter:                c.reporter,
+		Intervals:                    intervals,
+		InterpretersConfig:           c.config.Interpreters,
+		FilterErrorFrames:            !c.config.SendErrorFrames,
+		FilterIdleFrames:             !c.config.SendIdleFrames,
+		SamplesPerSecond:             c.config.SamplesPerSecond,
+		MapScaleFactor:               int(c.config.MapScaleFactor),
+		FrameCacheSize:               uint32(c.config.FrameCacheSize),
+		KernelVersionCheck:           !c.config.NoKernelVersionCheck,
+		VerboseMode:                  c.config.VerboseMode,
+		BPFVerifierLogLevel:          uint32(c.config.BPFVerifierLogLevel),
+		ProbabilisticInterval:        c.config.ProbabilisticInterval,
+		ProbabilisticThreshold:       c.config.ProbabilisticThreshold,
+		OffCPUThreshold:              uint32(c.config.OffCPUThreshold * float64(math.MaxUint32)),
+		IncludeEnvVars:               envVars,
+		ProbeLinks:                   c.config.ProbeLinks,
+		LoadProbe:                    c.config.LoadProbe || len(c.config.CustomProbes) > 0,
+		DynamicProbeResourcePrefixes: customProbeResourcePrefixes(c.config.CustomProbes),
+		ExecutableReporter:           c.config.ExecutableReporter,
+		BPFFSRoot:                    c.config.BPFFSRoot,
+		OBIProcessCtx:                c.config.OBIProcessCtx,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to load eBPF tracer: %w", err)
@@ -160,7 +165,54 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start trace handling: %w", err)
 	}
 
+	if err := c.enableCustomProbes(trc); err != nil {
+		return fmt.Errorf("failed to enable custom probes: %w", err)
+	}
+
 	return nil
+}
+
+func customProbeResourcePrefixes(probes map[string]any) []string {
+	prefixes := make([]string, 0, len(probes))
+	for name := range probes {
+		prefixes = append(prefixes, name)
+	}
+	sort.Strings(prefixes)
+	return prefixes
+}
+
+func (c *Controller) enableCustomProbes(trc *tracer.Tracer) error {
+	if len(c.config.CustomProbes) == 0 {
+		return nil
+	}
+
+	for probeName, probeConfig := range c.config.CustomProbes {
+		probe, err := createCustomProbe(probeName, probeConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create custom probe %q: %w", probeName, err)
+		}
+
+		if err := trc.Enable(probe); err != nil {
+			return fmt.Errorf("failed to enable custom probe %q: %w", probeName, err)
+		}
+
+		log.Infof("Enabled custom probe %q", probeName)
+	}
+
+	return nil
+}
+
+func createCustomProbe(name string, cfg any) (tracer.Probe, error) {
+	switch name {
+	case "generic":
+		var gcfg generic.GenericConfig
+		if err := mapstructure.Decode(cfg, &gcfg); err != nil {
+			return nil, fmt.Errorf("decoding generic probe config: %w", err)
+		}
+		return generic.New(gcfg)
+	default:
+		return nil, fmt.Errorf("unknown custom probe: %q", name)
+	}
 }
 
 // Shutdown stops the controller

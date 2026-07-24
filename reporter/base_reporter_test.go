@@ -59,6 +59,38 @@ func createTestBaseReporter(t *testing.T, cfg *Config) *baseReporter {
 	}
 }
 
+func TestReportTraceEventSeparatesCustomLabels(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	meta := &samples.TraceEventMeta{
+		Timestamp:   libpf.UnixTime64(time.Now().UnixNano()),
+		ProfileType: profileTypeProbe,
+	}
+	readLabels := map[libpf.String]libpf.String{
+		libpf.Intern("io.operation"): libpf.Intern("R"),
+	}
+	writeLabels := map[libpf.String]libpf.String{
+		libpf.Intern("io.operation"): libpf.Intern("W"),
+	}
+
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: readLabels}, meta))
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: writeLabels}, meta))
+	require.NoError(t, reporter.ReportTraceEvent(&libpf.Trace{CustomLabels: readLabels}, meta))
+
+	eventsTree := reporter.traceEvents.RLock()
+	defer reporter.traceEvents.RUnlock(&eventsTree)
+	require.Len(t, *eventsTree, 1)
+	for _, profiles := range *eventsTree {
+		events := profiles.Events[profileTypeProbe]
+		require.Len(t, events, 2)
+		counts := make(map[string]int, 2)
+		for _, traceEvents := range events {
+			operation := traceEvents.Labels[libpf.Intern("io.operation")].String()
+			counts[operation] = len(traceEvents.Timestamps)
+		}
+		require.Equal(t, map[string]int{"R": 2, "W": 1}, counts)
+	}
+}
+
 // TestBaseReporterGenerate tests the Generate method and validates the output
 func TestBaseReporterGenerate(t *testing.T) {
 	reporter := createTestBaseReporter(t, nil)
