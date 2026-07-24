@@ -77,6 +77,8 @@ type SampleKey struct {
 	Comm libpf.Comm
 
 	Hash libpf.TraceHash
+	// LabelsHash prevents samples with equal stacks but different labels from merging.
+	LabelsHash libpf.TraceHash
 
 	TID int64
 	CPU int64
