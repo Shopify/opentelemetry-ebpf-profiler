@@ -13,7 +13,7 @@ go 1.25.0
 require (
 	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.25
-	github.com/aws/aws-sdk-go-v2/service/s3 v1.103.3
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.0
 	github.com/aws/smithy-go v1.27.1
 	github.com/cilium/ebpf v0.21.0
 	github.com/coreos/pkg v0.0.0-20240122114842-bbd7aa9bf6fb
@@ -24,13 +24,13 @@ require (
 	github.com/klauspost/compress v1.18.6
 	github.com/mdlayher/kobject v0.0.0-20200520190114-19ca17470d7d
 	github.com/minio/sha256-simd v1.0.1
-	github.com/moby/moby/api v1.54.2
+	github.com/moby/moby/api v1.55.0
 	github.com/open-telemetry/sig-profiling/profcheck v0.0.0-20260605055552-091960d5da90
 	github.com/parca-dev/oomprof v0.1.6
 	github.com/parca-dev/usdt v0.0.2
 	github.com/peterbourgon/ff/v3 v3.4.0
 	github.com/stretchr/testify v1.11.1
-	github.com/testcontainers/testcontainers-go v0.42.0
+	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/zeebo/xxh3 v1.1.0
 	go.opentelemetry.io/collector/component v1.60.0
 	go.opentelemetry.io/collector/component/componenttest v0.154.0
@@ -124,7 +124,7 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/shirou/gopsutil/v4 v4.26.3 // indirect
+	github.com/shirou/gopsutil/v4 v4.26.5 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
