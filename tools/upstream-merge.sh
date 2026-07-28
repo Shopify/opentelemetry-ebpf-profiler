@@ -20,9 +20,14 @@
 # Options:
 #   --no-fetch   Skip 'git fetch' (useful when you already fetched)
 #   --no-smoke   Skip the post-merge smoke test
+#   --fresh      Delete an existing upstream-merge branch and start over
 #   -h, --help   Show this help
 #
 # Defaults: upstream/main and origin/main.
+#
+# Iteration: if the upstream-merge branch already exists, the script picks
+# up from its tip so each run advances the same branch. Pass --fresh to
+# discard prior progress and restart from ORIGIN_REF.
 
 set -euo pipefail
 
@@ -40,13 +45,15 @@ UPSTREAM_REF="upstream/main"
 ORIGIN_REF="origin/main"
 DO_FETCH=true
 DO_SMOKE=true
+FORCE_FRESH=false
 
 args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-fetch)  DO_FETCH=false; shift ;;
         --no-smoke)  DO_SMOKE=false; shift ;;
-        -h|--help)   sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --fresh)     FORCE_FRESH=true; shift ;;
+        -h|--help)   sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)           args+=("$1"); shift ;;
     esac
 done
@@ -189,6 +196,17 @@ run_smoke() {
     done
 }
 
+# On terminal failure: reset the working branch to the pre-run tip. If we
+# created $BRANCH this run, also return to the original ref and delete it;
+# in continuing mode we stay on $BRANCH so prior merges are preserved.
+abort_to_start() {
+    git reset --hard "$ORIGIN_HEAD" >/dev/null 2>&1 || true
+    if ! $CONTINUING; then
+        git checkout "${ORIGINAL_REF#refs/heads/}" 2>/dev/null || git checkout "$ORIGINAL_REF"
+        git branch -D "$BRANCH"
+    fi
+}
+
 # Reset the branch to ORIGIN_HEAD and merge the given sha (with
 # auto-resolve if needed).  Returns 0 on success.  On failure the
 # branch is reset back to ORIGIN_HEAD.
@@ -230,6 +248,36 @@ if $DO_FETCH; then
     git fetch upstream
 fi
 
+# Save where we came from so we can get back on failure.
+ORIGINAL_REF=$(git symbolic-ref --quiet HEAD 2>/dev/null || git rev-parse HEAD)
+
+# Working branch. If it already exists, each invocation continues from its
+# tip — that's what makes the iterative "run, hand-resolve one commit, run
+# again" loop work without ceremony. --fresh forces a clean restart.
+BRANCH="upstream-merge"
+CONTINUING=false
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    if $FORCE_FRESH; then
+        log "Deleting existing branch $BRANCH (--fresh)"
+        if [[ "$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" == "$BRANCH" ]]; then
+            git checkout --detach >/dev/null
+        fi
+        git branch -D "$BRANCH"
+        git checkout -b "$BRANCH" "$ORIGIN_REF"
+    else
+        log "Continuing existing branch $BRANCH"
+        git checkout "$BRANCH"
+        # Compute remaining upstream commits relative to our progress tip,
+        # not the original ORIGIN_REF (which would revisit already-merged
+        # commits since they aren't yet in origin/main).
+        ORIGIN_REF="$BRANCH"
+        CONTINUING=true
+    fi
+else
+    git checkout -b "$BRANCH" "$ORIGIN_REF"
+fi
+log "Working on branch $BRANCH"
+
 BASE=$(git merge-base "$ORIGIN_REF" "$UPSTREAM_REF")
 log "Merge base: $(git log --oneline -1 "$BASE")"
 
@@ -240,14 +288,6 @@ if [[ $TOTAL -eq 0 ]]; then
     exit 0
 fi
 log "$TOTAL upstream commit(s) to consider"
-
-# Save where we came from so we can get back on failure.
-ORIGINAL_REF=$(git symbolic-ref --quiet HEAD 2>/dev/null || git rev-parse HEAD)
-
-# Create a working branch rooted at origin/main.
-BRANCH="upstream-merge"
-git checkout -b "$BRANCH" "$ORIGIN_REF"
-log "Working on branch $BRANCH"
 
 ORIGIN_HEAD=$(git rev-parse HEAD)
 
@@ -288,8 +328,7 @@ if [[ $LAST_CLEAN -lt 0 ]]; then
         done
         reset_merge_state
     fi
-    git checkout "${ORIGINAL_REF#refs/heads/}" 2>/dev/null || git checkout "$ORIGINAL_REF"
-    git branch -D "$BRANCH"
+    abort_to_start
     exit 1
 fi
 
@@ -321,9 +360,7 @@ if $DO_SMOKE; then
 
         if [[ $LAST_CLEAN -eq 0 ]]; then
             warn "Even the first upstream commit fails smoke; giving up"
-            git reset --hard "$ORIGIN_HEAD" >/dev/null 2>&1
-            git checkout "${ORIGINAL_REF#refs/heads/}" 2>/dev/null || git checkout "$ORIGINAL_REF"
-            git branch -D "$BRANCH"
+            abort_to_start
             exit 1
         fi
 
@@ -344,9 +381,7 @@ if $DO_SMOKE; then
 
         if [[ $smoke_good -lt 0 ]]; then
             warn "No upstream commits pass the smoke tests"
-            git reset --hard "$ORIGIN_HEAD" >/dev/null 2>&1
-            git checkout "${ORIGINAL_REF#refs/heads/}" 2>/dev/null || git checkout "$ORIGINAL_REF"
-            git branch -D "$BRANCH"
+            abort_to_start
             exit 1
         fi
 

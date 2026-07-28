@@ -19,13 +19,12 @@ Start in a clean worktree on `origin/main`:
 
 ```bash
 git fetch upstream
-git checkout -b <some-tmp-branch> origin/main
 tools/upstream-merge.sh --no-smoke
 ```
 
-The script creates `upstream-merge`, binary-searches the unmerged upstream
-commits, merges the maximal auto-resolvable prefix, and stops before the
-first conflict it can't handle. Stopping output looks like:
+The script creates `upstream-merge` off `origin/main`, binary-searches the
+unmerged upstream commits, merges the maximal auto-resolvable prefix, and
+stops before the first conflict it can't handle. Stopping output looks like:
 
 ```
 >>> Branch upstream-merge: merged 12 of 127 upstream commits
@@ -33,17 +32,19 @@ first conflict it can't handle. Stopping output looks like:
 !!! 115 commit(s) remain and need manual attention
 ```
 
-Resolve that one commit by hand (see the decision matrix below), commit, then
-drive the script forward by pointing `ORIGIN_REF` at the new HEAD:
+Resolve that one commit by hand (see the decision matrix below), commit on
+`upstream-merge`, then re-run:
 
 ```bash
-git branch -D progress 2>/dev/null
-git checkout -b progress
-git branch -D upstream-merge
-tools/upstream-merge.sh --no-fetch --no-smoke upstream/main progress
+tools/upstream-merge.sh --no-fetch --no-smoke
 ```
 
-Loop until `git log upstream/main ^HEAD` is empty.
+The script detects the existing branch, continues from its tip, and merges
+the next auto-resolvable prefix. Loop until it reports "Fully merged with
+upstream/main".
+
+Pass `--fresh` if you want to discard the branch and start over from
+`ORIGIN_REF` (e.g., after a botched iteration you'd rather redo).
 
 `--no-smoke` is recommended because the smoke test (`make test`) is slow and
 its failures usually point at Go-side breakage caused by an earlier merge that
@@ -197,3 +198,7 @@ A list of mistakes from prior cycles so future-you can recognize them:
 - **Running `git merge upstream/main` once and trying to resolve everything in
   one merge commit.** The script's batching produces a cleaner history and is
   way more debuggable when something breaks.
+- **Deleting and recreating `upstream-merge` between iterations.** Loses any
+  remote tracking config on the branch and is just ceremony. The script now
+  continues an existing branch by default; use `--fresh` only when you
+  actually want to restart.
