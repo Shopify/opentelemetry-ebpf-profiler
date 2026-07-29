@@ -2470,7 +2470,11 @@ func (d *v8Data) loadNodeClData(ef *pfelf.File, syms relevantSymbols) error {
 	return nil
 }
 
-func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
+func GetLoader(_ Config) interpreter.Loader {
+	return loader
+}
+
+func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
 	if !v8Regex.MatchString(info.FileName()) {
 		return nil, nil
 	}

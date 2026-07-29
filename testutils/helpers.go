@@ -74,7 +74,7 @@ func StartTracer(ctx context.Context, t *testing.T, et tracertypes.IncludedTrace
 	trc, err := tracer.NewTracer(ctx, &tracer.Config{
 		TraceReporter:          tr,
 		Intervals:              &MockIntervals{},
-		IncludeTracers:         et,
+		InterpretersConfig:     et.ToInterpretersConfig(),
 		SamplesPerSecond:       20,
 		ProbabilisticInterval:  100,
 		ProbabilisticThreshold: 100,

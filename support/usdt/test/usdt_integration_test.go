@@ -120,7 +120,7 @@ func setupTest(t *testing.T) *testSetup {
 
 	tr, err := tracer.NewTracer(ctx, &tracer.Config{
 		Intervals:              &mockIntervals{},
-		IncludeTracers:         enabledTracers,
+		InterpretersConfig:     enabledTracers.ToInterpretersConfig(),
 		FilterErrorFrames:      false,
 		SamplesPerSecond:       20,
 		MapScaleFactor:         0,
