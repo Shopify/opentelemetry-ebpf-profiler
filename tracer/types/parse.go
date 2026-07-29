@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/beam"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/dotnet"
@@ -21,7 +22,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/interpreter/php"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/python"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
-	"go.opentelemetry.io/ebpf-profiler/internal/log"
 )
 
 // tracerType values identify tracers, such as the native code tracer, or PHP tracer

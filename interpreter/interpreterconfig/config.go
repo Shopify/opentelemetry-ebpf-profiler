@@ -23,19 +23,19 @@ import (
 // Config holds configuration for all interpreters.
 // By default all interpreters are enabled.
 type Config struct {
-	Python  python.Config   `mapstructure:"python"`
-	Perl    perl.Config     `mapstructure:"perl"`
-	PHP     php.Config      `mapstructure:"php"`
-	Hotspot hotspot.Config  `mapstructure:"hotspot"`
-	Ruby    ruby.Config     `mapstructure:"ruby"`
-	V8      nodev8.Config   `mapstructure:"v8"`
-	Dotnet  dotnet.Config   `mapstructure:"dotnet"`
-	Go      golang.Config   `mapstructure:"go"`
-	Labels  golabels.Config `mapstructure:"labels"`
-	BEAM    beam.Config     `mapstructure:"beam"`
+	Python  python.Config   `mapstructure:"python" json:"python,omitempty"`
+	Perl    perl.Config     `mapstructure:"perl" json:"perl,omitempty"`
+	PHP     php.Config      `mapstructure:"php" json:"php,omitempty"`
+	Hotspot hotspot.Config  `mapstructure:"hotspot" json:"hotspot,omitempty"`
+	Ruby    ruby.Config     `mapstructure:"ruby" json:"ruby,omitempty"`
+	V8      nodev8.Config   `mapstructure:"v8" json:"v8,omitempty"`
+	Dotnet  dotnet.Config   `mapstructure:"dotnet" json:"dotnet,omitempty"`
+	Go      golang.Config   `mapstructure:"go" json:"go,omitempty"`
+	Labels  golabels.Config `mapstructure:"labels" json:"labels,omitempty"`
+	BEAM    beam.Config     `mapstructure:"beam" json:"beam,omitempty"`
 	// parca-only extensions
-	LuaJIT luajit.Config `mapstructure:"luajit"`
-	CUDA   gpu.Config    `mapstructure:"cuda"`
+	LuaJIT luajit.Config `mapstructure:"luajit" json:"luajit,omitempty"`
+	CUDA   gpu.Config    `mapstructure:"cuda" json:"cuda,omitempty"`
 }
 
 // AllInterpreters returns a Config with all interpreters enabled.
@@ -55,17 +55,19 @@ func (cfg *Config) IsMapEnabled(mapName string) bool {
 		return !cfg.Hotspot.IsDisabled()
 	case ruby.BPFMapName:
 		return !cfg.Ruby.IsDisabled()
-	case nodev8.BPFMapName:
-		return !cfg.V8.IsDisabled()
 	case dotnet.BPFMapName:
 		return !cfg.Dotnet.IsDisabled()
 	case beam.BPFMapName:
 		return !cfg.BEAM.IsDisabled()
 	case luajit.BPFMapName:
 		return !cfg.LuaJIT.IsDisabled()
-	case golabels.BPFMapName, apmint.BPFMapName:
-		// go_labels_procs and apm_int_procs are called from
-		// unwind_stop and therefore need to be available all the time.
+	case golabels.BPFMapName, apmint.BPFMapName, nodev8.BPFMapName:
+		// go_labels_procs, apm_int_procs and v8_procs are called from
+		// unwind_stop (or referenced by perf_unwind_stop) and therefore
+		// need to be available all the time. v8_procs is a parca fork
+		// addition to this list — the reference lives in a parca-side
+		// eBPF change to unwind_stop and would otherwise break the
+		// verifier when v8 is disabled.
 		return true
 	default:
 		return true // Not an interpreter map, so it should be loaded
