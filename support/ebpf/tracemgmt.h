@@ -392,6 +392,16 @@ static inline EBPF_INLINE bool unwinder_unwind_go_morestack(PerCPURecord *record
 
   DEBUG_PRINT("morestack: curg is %lx\n", curg_ptr_addr);
 
+  if (curg_ptr_addr == 0) {
+    // Terminal case: this m has no attached user goroutine (e.g. the m parked
+    // in newstack -> goschedImpl after handing off the g). There's no saved
+    // register state to unwind to; signal end-of-stack by zeroing PC so the
+    // caller (get_next_unwinder_after_native_frame) emits ERR_NATIVE_ZERO_PC.
+    // Upstream's nanotime coredump tests (#1502) validate this shape.
+    record->state.pc = 0;
+    return true;
+  }
+
   // Valid since go 1.25:
   // https://github.com/golang/go/blob/7b60d06739/src/runtime/runtime2.go#L303-L322
   // On previous versions, there was an extra "ret" value, so "bp" is one spot later.
