@@ -19,13 +19,12 @@ Start in a clean worktree on `origin/main`:
 
 ```bash
 git fetch upstream
-git checkout -b <some-tmp-branch> origin/main
 tools/upstream-merge.sh --no-smoke
 ```
 
-The script creates `upstream-merge`, binary-searches the unmerged upstream
-commits, merges the maximal auto-resolvable prefix, and stops before the
-first conflict it can't handle. Stopping output looks like:
+The script creates `upstream-merge` off `origin/main`, binary-searches the
+unmerged upstream commits, merges the maximal auto-resolvable prefix, and
+stops before the first conflict it can't handle. Stopping output looks like:
 
 ```
 >>> Branch upstream-merge: merged 12 of 127 upstream commits
@@ -33,17 +32,26 @@ first conflict it can't handle. Stopping output looks like:
 !!! 115 commit(s) remain and need manual attention
 ```
 
-Resolve that one commit by hand (see the decision matrix below), commit, then
-drive the script forward by pointing `ORIGIN_REF` at the new HEAD:
+Resolve that one commit by hand (see the decision matrix below), commit on
+`upstream-merge`, then re-run:
 
 ```bash
-git branch -D progress 2>/dev/null
-git checkout -b progress
-git branch -D upstream-merge
-tools/upstream-merge.sh --no-fetch --no-smoke upstream/main progress
+tools/upstream-merge.sh --no-fetch --no-smoke
 ```
 
-Loop until `git log upstream/main ^HEAD` is empty.
+The script detects the existing branch, continues from its tip, and merges
+the next auto-resolvable prefix. Loop until it reports "Fully merged with
+upstream/main".
+
+Pass `--fresh` if you want to discard the branch and start over from
+`ORIGIN_REF` (e.g., after a botched iteration you'd rather redo).
+
+Alternative to hand-doing `git merge` after each stop: pass
+`--leave-conflicted`. The script merges the clean prefix as usual, then
+attempts the next blocking commit itself, applies whatever auto-resolvers
+apply (BPF blobs, go.mod, metrics, errors.h), and leaves the remaining
+files unmerged in the working tree. Finish with `git add … && git commit`
+and re-run.
 
 `--no-smoke` is recommended because the smoke test (`make test`) is slow and
 its failures usually point at Go-side breakage caused by an earlier merge that
@@ -52,18 +60,38 @@ once at the end instead.
 
 ## What the script auto-resolves
 
-Three things, all listed in the BPF/go.mod regexes near the top of the script:
+Everything in this list is handled by `auto_resolve` inside the script; the
+regexes at the top define what counts as auto-resolvable and drive the probe
+decision. The playbook's decision matrix below is now mostly reference — the
+script does the mechanical work.
 
 - `support/ebpf/tracer.ebpf.{amd64,arm64}` — take `theirs`, then rebuild from
-  the merged C sources.
+  the merged C sources (`make -C support/ebpf amd64 && … arm64`).
+- `support/ebpf/errors.h` — regenerated from `errors.json` and clang-formatted
+  (also re-emitted after every BPF rebuild since the codegen output is
+  unformatted). Requires `clang-format-17` on `PATH` (override with
+  `CLANG_FORMAT=…`).
 - `go.mod` / `go.sum` — take `theirs`, then `go mod tidy`.
+- `internal/tools/go.mod` / `.sum` — take `theirs` verbatim (upstream's tools
+  module is a thin shell; parca's app deps live in the root module).
+- `metrics/metrics.json` — content-aware 3-way merge via `jq`: keep base
+  entries, append upstream's new entries first (their assigned IDs win),
+  append parca's new entries after (renumbered past upstream's max). Requires
+  `jq`.
+- `support/ebpf/types.h`, `support/types_def.go` — text conflicts resolved
+  "theirs first, ours after" via a small awk script (works for the metric-ID
+  and UnwindState-field cases; if you get anything weirder, land it by hand).
+- `metrics/ids.go`, `support/types.go` — regenerated from `metrics.json` /
+  `types_def.go` after those sources are merged. Never hand-edit either.
 - Anything else where rerere has cached a clean resolution from a prior run.
 
-The third one is why `rerere.enabled` and `rerere.autoUpdate` must both be on.
-The script sets them with `--local` during preflight, but it's worth knowing
-why: `autoUpdate=false` leaves rerere-resolved files in `UU` state, so
-`all_auto_resolvable` rejects them as non-auto-resolvable and the script bails
-on what would otherwise be a clean batch.
+The rerere path is why `rerere.enabled` and `rerere.autoUpdate` are set with
+`--local` during preflight: `autoUpdate=false` would leave rerere-resolved
+files in `UU` state, so `all_auto_resolvable` would reject them as
+non-auto-resolvable and the script would bail on what could have been a
+clean batch. Script-internal probes still override with
+`-c rerere.enabled=false` so probing stays deterministic; hand-resolves done
+between iterations still record.
 
 ## Per-stop checklist
 
@@ -112,27 +140,30 @@ upstream modifies the `.ebpf.c` body:
 
 ### `support/ebpf/types.h` — `UnwindState` register slots
 
-Parca keeps `r14` on x86_64 (LuaJIT DISPATCH register). When upstream
-adds/removes other slots (`rdi`/`r8` for vfork support, etc.), merge their
-additions but keep `r14`.
+Parca keeps `r14` on x86_64 (LuaJIT DISPATCH register). The script's
+"theirs first, ours after" swap-merge preserves both sides' field additions
+(upstream's new registers land before parca's), so `r14` survives
+automatically. If upstream ever *removes* a slot parca depends on, the swap
+merge won't catch that — you'd have to notice in review.
 
 ### `metrics/metrics.json` and `metrics/ids.go`
 
-Edit `metrics.json`; never hand-edit `ids.go`. Run `go generate ./metrics/...`
-to regenerate.
+Handled by the script (see "What the script auto-resolves"). Never hand-edit
+`ids.go`; if you need to edit `metrics.json` outside a merge, run
+`go generate ./metrics/...` afterwards.
 
-**Metric ID policy**: parca-only metric IDs always live past upstream's IDMax.
-When upstream lands new metrics that collide with parca's range, the upstream
-metrics keep their authoritative IDs and parca's get renumbered to come after
-them. Then `jq --indent 2 'sort_by(.id)' metrics/metrics.json` to keep the
-file in ID order. The BPF `metricID_*` C enum positions don't change in this
-swap — `MetricsTranslation` maps slot → Go symbol, not slot → Go value, so no
-BPF blob rebuild is needed.
+**Metric ID policy** (what the auto-resolver encodes): parca-only metric IDs
+always live past upstream's IDMax. Upstream keeps its assigned IDs; parca's
+are renumbered to come after. `MetricsTranslation` maps slot → Go symbol,
+not slot → Go value, so renumbering doesn't require a BPF blob rebuild.
 
 ### `support/types_def.go` ↔ `support/types.go`
 
-`types.go` is generated from `types_def.go` via cgo godefs. Edit
-`types_def.go` for any C-enum additions, then:
+`types.go` is generated from `types_def.go` via cgo godefs. The script
+handles the swap-merge of `types_def.go` and regenerates `types.go` (inlined,
+because `support/generate.sh` runs `go fmt` on a file that still has conflict
+markers). Only touch this by hand if the auto-resolver produced something
+weird — in which case edit `types_def.go`, then:
 
 ```bash
 (cd support && ./generate.sh)   # diffs generated vs current
@@ -197,3 +228,7 @@ A list of mistakes from prior cycles so future-you can recognize them:
 - **Running `git merge upstream/main` once and trying to resolve everything in
   one merge commit.** The script's batching produces a cleaner history and is
   way more debuggable when something breaks.
+- **Deleting and recreating `upstream-merge` between iterations.** Loses any
+  remote tracking config on the branch and is just ceremony. The script now
+  continues an existing branch by default; use `--fresh` only when you
+  actually want to restart.

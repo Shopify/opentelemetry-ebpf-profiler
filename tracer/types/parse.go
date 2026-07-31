@@ -8,6 +8,20 @@ import (
 	"strings"
 
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/interpreter"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/beam"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/dotnet"
+	golang "go.opentelemetry.io/ebpf-profiler/interpreter/go"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/golabels"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/gpu"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/hotspot"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/luajit"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/nodev8"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/perl"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/php"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/python"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 )
 
 // tracerType values identify tracers, such as the native code tracer, or PHP tracer
@@ -182,4 +196,28 @@ func AllTracers() IncludedTracers {
 	var result IncludedTracers
 	result.enableAll()
 	return result
+}
+
+// ToInterpretersConfig converts the legacy IncludedTracers bitset into the
+// upstream interpreterconfig.Config shape (each tracer absent from the bitset
+// gets Disabled=true). Tests still driven off tracertypes.Parse(...) use this
+// to populate tracer.Config.InterpretersConfig.
+func (t IncludedTracers) ToInterpretersConfig() interpreterconfig.Config {
+	dis := func(enabled bool) interpreter.BaseConfig {
+		return interpreter.BaseConfig{Disabled: !enabled}
+	}
+	return interpreterconfig.Config{
+		Python:  python.Config{BaseConfig: dis(t.Has(PythonTracer))},
+		Perl:    perl.Config{BaseConfig: dis(t.Has(PerlTracer))},
+		PHP:     php.Config{BaseConfig: dis(t.Has(PHPTracer))},
+		Hotspot: hotspot.Config{BaseConfig: dis(t.Has(HotspotTracer))},
+		Ruby:    ruby.Config{BaseConfig: dis(t.Has(RubyTracer))},
+		V8:      nodev8.Config{BaseConfig: dis(t.Has(V8Tracer))},
+		Dotnet:  dotnet.Config{BaseConfig: dis(t.Has(DotnetTracer))},
+		Go:      golang.Config{BaseConfig: dis(t.Has(GoTracer))},
+		Labels:  golabels.Config{BaseConfig: dis(t.Has(Labels))},
+		BEAM:    beam.Config{BaseConfig: dis(t.Has(BEAMTracer))},
+		LuaJIT:  luajit.Config{BaseConfig: dis(t.Has(LuaJITTracer))},
+		CUDA:    gpu.Config{BaseConfig: dis(t.Has(CUDATracer))},
+	}
 }

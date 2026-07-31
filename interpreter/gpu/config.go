@@ -4,7 +4,17 @@ import (
 	"sync"
 
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/interpreter"
 )
+
+// Config is the enable/disable knob wired into interpreterconfig.Config.
+// (Distinct from GpuConfig below, which is the per-process CUPTI sampling
+// parameters delivered at runtime by the gpu_config probe.)
+type Config struct {
+	interpreter.BaseConfig `mapstructure:",squash"`
+}
+
+var _ interpreter.Config = Config{}
 
 // GpuConfig holds the per-process parcagpu sampling parameters used to convert
 // PC sample counts to nanoseconds.
