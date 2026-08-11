@@ -5,13 +5,49 @@ package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 
 import (
 	"debug/elf"
+	"errors"
 	"testing"
+	"unsafe"
 
+	"go.opentelemetry.io/ebpf-profiler/host"
+	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/process"
+	"go.opentelemetry.io/ebpf-profiler/support"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+type rubyMappingFailureTestHandler struct {
+	interpreter.EbpfHandler
+	calls            []string
+	updateMappingErr error
+}
+
+func (h *rubyMappingFailureTestHandler) UpdateProcData(_ libpf.InterpreterType, _ libpf.PID,
+	_ unsafe.Pointer,
+) error {
+	h.calls = append(h.calls, "proc-data")
+	return nil
+}
+
+func (h *rubyMappingFailureTestHandler) UpdatePidInterpreterMapping(_ libpf.PID, _ lpm.Prefix,
+	_ uint8, _ host.FileID, _ uint64,
+) error {
+	h.calls = append(h.calls, "interpreter-mapping")
+	return h.updateMappingErr
+}
+
+type rubyMappingTestProcess struct {
+	process.Process
+	pid libpf.PID
+}
+
+func (p *rubyMappingTestProcess) PID() libpf.PID {
+	return p.pid
+}
 
 func TestRubyRegex(t *testing.T) {
 	tests := []struct {
@@ -411,4 +447,33 @@ func TestFindJITRegion(t *testing.T) {
 			assert.Equal(t, tt.wantEnd, end)
 		})
 	}
+}
+
+func TestSynchronizeMappingsReportsPartialPublicationAfterMappingFailure(t *testing.T) {
+	instance := &rubyInstance{
+		procInfo: &support.RubyProcInfo{},
+		prefixes: make(map[lpm.Prefix]uint32),
+	}
+	updateErr := errors.New("update interpreter mapping")
+	handler := &rubyMappingFailureTestHandler{updateMappingErr: updateErr}
+	pr := &rubyMappingTestProcess{pid: 123}
+	mappings := []process.RawMapping{{
+		Vaddr:  0x100000,
+		Length: 0x10000,
+		Flags:  elf.PF_R | elf.PF_X,
+	}}
+
+	err := instance.SynchronizeMappings(handler, nil, pr, mappings)
+	require.ErrorIs(t, err, updateErr)
+	assert.ErrorContains(t, err, "JIT proc data was already published")
+	assert.Equal(t, []string{"proc-data", "interpreter-mapping"}, handler.calls)
+	assert.Equal(t, uint64(0x100000), instance.procInfo.Jit_start)
+	assert.Equal(t, uint64(0x110000), instance.procInfo.Jit_end)
+	assert.Empty(t, instance.prefixes)
+
+	handler.calls = nil
+	handler.updateMappingErr = nil
+	require.NoError(t, instance.SynchronizeMappings(handler, nil, pr, mappings))
+	assert.Equal(t, []string{"interpreter-mapping"}, handler.calls)
+	assert.NotEmpty(t, instance.prefixes)
 }
