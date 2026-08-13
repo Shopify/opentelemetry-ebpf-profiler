@@ -190,7 +190,7 @@ func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 	// Derive how to step over the interpreter's C frame on the native handback
 	// from the interpreter region's own stack delta (correct per build/arch),
 	// rather than the hardcoded LUAJIT_CFRAME_SPACE which is wrong for tarantool.
-	if p, fp, ok := interpCframeUnwind(info.Deltas(), luaInterp.Start); ok {
+	if p, fp, ok := interpCframeUnwind(info.Intervals(), luaInterp.Start); ok {
 		ljd.cframeSizeInterp = p
 		ljd.interpFP = fp
 		logf("lj: interp cframe size %d fp %d", p, fp)
@@ -284,17 +284,29 @@ func extractInterpreterBounds(intervals *sdtypes.IntervalData, param int32,
 // as on arm64) vs stack-pointer based (CFA = sp + param, as on x86). This is
 // authoritative per build/arch, unlike the hardcoded LUAJIT_CFRAME_SPACE which
 // is wrong for tarantool (x86 wants 96 not 80; arm64 is fp-based +16 not 208).
-func interpCframeUnwind(deltas sdtypes.StackDeltaArray, interpStart uint64) (param, fp uint16, ok bool) {
-	for i := 0; i < len(deltas)-1; i++ {
-		if deltas[i].Address <= interpStart && interpStart < deltas[i+1].Address {
-			p := deltas[i].Info.Param
-			if p <= 0 || p > 0xffff {
+func interpCframeUnwind(intervals *sdtypes.IntervalData,
+	interpStart uint64) (param, fp uint16, ok bool) {
+	for _, block := range intervals.Blocks {
+		if interpStart < block.Start || interpStart >= block.End {
+			continue
+		}
+		for i := range block.Deltas {
+			start := block.Start + uint64(block.Deltas[i].Offset)
+			end := block.End
+			if i+1 < len(block.Deltas) {
+				end = block.Start + uint64(block.Deltas[i+1].Offset)
+			}
+			if start > interpStart || interpStart >= end {
+				continue
+			}
+			info := block.Deltas[i].Info
+			if info.Param <= 0 || info.Param > 0xffff {
 				return 0, 0, false
 			}
-			if deltas[i].Info.BaseReg == support.UnwindRegFp {
-				return uint16(p), 1, true
+			if info.BaseReg == support.UnwindRegFp {
+				return uint16(info.Param), 1, true
 			}
-			return uint16(p), 0, true
+			return uint16(info.Param), 0, true
 		}
 	}
 	return 0, 0, false
