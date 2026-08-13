@@ -62,7 +62,7 @@ const (
 const UnwindInfoMaxEntries = 0x4000
 
 const (
-	MetricIDBeginCumulative = 0x75
+	MetricIDBeginCumulative = 0x77
 )
 
 const (
@@ -325,6 +325,11 @@ type V8ProcInfo struct {
 	Codekind_baseline            uint8
 	Pad_cgo_0                    [2]byte
 }
+type LuaJITProcInfo struct {
+	G2dispatch      uint16
+	Cur_L_offset    uint16
+	Cframe_size_jit uint16
+}
 
 const (
 	Sizeof_StackDelta = 0x4
@@ -400,6 +405,15 @@ const (
 	RubyFrameTypeIseq     = 0x3
 	RubyFrameTypeGc       = 0x4
 	RubyFrameTypeJit      = 0x5
+)
+
+const (
+	LJFFIFunc        = 0xff1
+	LJFileId         = 0x2a
+	LJNormalFrame    = 0x0
+	LJGReport        = 0xff2
+	LJCframeSpaceX86 = 0x50
+	LJCframeSpaceArm = 0xd0
 )
 
 var MetricsTranslation = []metrics.MetricID{
@@ -504,10 +518,10 @@ var MetricsTranslation = []metrics.MetricID{
 	0x6c: metrics.IDUnwindNativeErrNonExecutableVMA,
 	0x6d: metrics.IDUnwindLuaJITAttempts,
 	0x6e: metrics.IDUnwindLuaJITErrNoProcInfo,
-	0x6f: metrics.IDSamplesSkippedProcessTooNew,
-	0x70: metrics.IDNumSyncsFromPrctl,
-	0x71: metrics.IDNumPriorityEventDeferred,
-	0x72: metrics.IDUnwindGoAsmcgocallAttempts,
-	0x73: metrics.IDUnwindGoAsmcgocallSuccess,
-	0x74: metrics.IDUnwindGoAsmcgocallUnwindFailure,
+	0x71: metrics.IDSamplesSkippedProcessTooNew,
+	0x72: metrics.IDNumSyncsFromPrctl,
+	0x73: metrics.IDNumPriorityEventDeferred,
+	0x74: metrics.IDUnwindGoAsmcgocallAttempts,
+	0x75: metrics.IDUnwindGoAsmcgocallSuccess,
+	0x76: metrics.IDUnwindGoAsmcgocallUnwindFailure,
 }
