@@ -66,6 +66,8 @@ BPF_RODATA_VAR(u64, target_pid_ns_dev, 0)
 BPF_RODATA_VAR(u16, origin_id_sampling, 0)
 // origin_id_hw_cpu_cycles is set during load time.
 BPF_RODATA_VAR(u16, origin_id_hw_cpu_cycles, 0)
+// origin_id_hw_instructions is set during load time.
+BPF_RODATA_VAR(u16, origin_id_hw_instructions, 0)
 // origin_id_amd_brs is set during load time.
 BPF_RODATA_VAR(u16, origin_id_amd_brs, 0)
 
@@ -223,6 +225,12 @@ SEC("perf_event/native_tracer_entry_hw_cpu_cycles")
 int native_tracer_entry_hw_cpu_cycles(struct bpf_perf_event_data *ctx)
 {
   return native_tracer_entry_impl(ctx, origin_id_hw_cpu_cycles, false);
+}
+
+SEC("perf_event/native_tracer_entry_hw_instructions")
+int native_tracer_entry_hw_instructions(struct bpf_perf_event_data *ctx)
+{
+  return native_tracer_entry_impl(ctx, origin_id_hw_instructions, false);
 }
 
 SEC("perf_event/native_tracer_entry_amd_brs")

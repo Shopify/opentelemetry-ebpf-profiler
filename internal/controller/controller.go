@@ -111,6 +111,7 @@ func (c *Controller) Start(ctx context.Context) error {
 		ProcessMetaEnrichers:    c.config.ProcessMetaEnrichers,
 		EnableSWCPUClock:        c.config.EnableSWCPUClock,
 		EnableHWCPUCycles:       c.config.EnableHWCPUCycles,
+		EnableHWInstructions:    c.config.EnableHWInstructions,
 		EnableBranchSampling:    c.config.EnableBranchSampling,
 	})
 	if err != nil {

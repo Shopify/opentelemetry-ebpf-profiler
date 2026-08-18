@@ -714,6 +714,17 @@ func setOriginIDs(coll *cebpf.CollectionSpec, cfg *Config, origins *originRegist
 		}
 	}
 
+	if cfg.EnableHWInstructions {
+		if err := register("origin_id_hw_instructions", &samples.TypeMetadata{
+			PeriodType: "cpu",
+			PeriodUnit: "instructions",
+			SampleType: "samples",
+			SampleUnit: "count",
+		}); err != nil {
+			return err
+		}
+	}
+
 	if cfg.EnableHWCPUCycles && cfg.EnableBranchSampling {
 		if err := register("origin_id_amd_brs", &samples.TypeMetadata{
 			SampleType: "branches",

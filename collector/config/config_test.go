@@ -85,9 +85,13 @@ func TestValidateSamplingEvents(t *testing.T) {
 
 	err := confmap.Validate(cfg)
 	require.EqualError(t, err,
-		"at least one perf event type must be enabled: use --enable-sw-cpu-clock and/or --enable-hw-cpu-cycles")
+		"at least one perf event type must be enabled: use --enable-sw-cpu-clock, --enable-hw-cpu-cycles, and/or --enable-hw-instructions")
 
 	cfg.EnableHWCPUCycles = true
+	require.NoError(t, confmap.Validate(cfg))
+
+	cfg.EnableHWCPUCycles = false
+	cfg.EnableHWInstructions = true
 	require.NoError(t, confmap.Validate(cfg))
 }
 

@@ -142,6 +142,9 @@ type Tracer struct {
 	// enableHWCPUCycles enables hardware cpu-cycles perf events for sampling.
 	enableHWCPUCycles bool
 
+	// enableHWInstructions enables hardware instructions perf events for sampling.
+	enableHWInstructions bool
+
 	// enableBranchSampling requests branch records for hardware cycle samples.
 	// Failure to enable branch sampling does not disable other event types.
 	enableBranchSampling bool
@@ -223,6 +226,8 @@ type Config struct {
 	EnableSWCPUClock bool
 	// EnableHWCPUCycles enables hardware cpu-cycles perf events for sampling.
 	EnableHWCPUCycles bool
+	// EnableHWInstructions enables hardware instructions perf events for sampling.
+	EnableHWInstructions bool
 	// EnableBranchSampling enables optional LBR/BRS capture for cycle samples.
 	EnableBranchSampling bool
 	// ProcessMetaEnrichers are optional hooks for enriching process metadata at
@@ -338,6 +343,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
 		enableSWCPUClock:       cfg.EnableSWCPUClock,
 		enableHWCPUCycles:      cfg.EnableHWCPUCycles,
+		enableHWInstructions:   cfg.EnableHWInstructions,
 		enableBranchSampling:   cfg.EnableBranchSampling,
 		done:                   make(chan libpf.Void),
 		origins:                origins,
@@ -518,7 +524,7 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *orig
 
 	if err = loadPerfUnwinders(coll, ebpfProgs, ebpfMaps["perf_progs"], tailCallProgs,
 		cfg.BPFVerifierLogLevel, cfg.EnableSWCPUClock, cfg.EnableHWCPUCycles,
-		cfg.EnableBranchSampling); err != nil {
+		cfg.EnableHWInstructions, cfg.EnableBranchSampling); err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to load perf eBPF programs: %v", err)
 	}
 
@@ -822,13 +828,13 @@ func schedTimesSize(threshold uint32) uint32 {
 func loadPerfUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.Program,
 	tailcallMap *cebpf.Map, tailCallProgs []ProgLoaderHelper,
 	bpfVerifierLogLevel uint32, enableSWCPUClock, enableHWCPUCycles,
-	enableBranchSampling bool,
+	enableHWInstructions, enableBranchSampling bool,
 ) error {
 	programOptions := cebpf.ProgramOptions{
 		LogLevel: cebpf.LogLevel(bpfVerifierLogLevel),
 	}
 
-	progs := make([]ProgLoaderHelper, 0, len(tailCallProgs)+5)
+	progs := make([]ProgLoaderHelper, 0, len(tailCallProgs)+6)
 	progs = append(progs, tailCallProgs...)
 
 	schedProcessFree := schedProcessFreeHookName(libpf.MapKeysToSet(coll.Programs))
@@ -852,6 +858,11 @@ func loadPerfUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.P
 			Name:             "native_tracer_entry_hw_cpu_cycles",
 			NoTailCallTarget: true,
 			Enable:           enableHWCPUCycles,
+		},
+		ProgLoaderHelper{
+			Name:             "native_tracer_entry_hw_instructions",
+			NoTailCallTarget: true,
+			Enable:           enableHWInstructions,
 		},
 		ProgLoaderHelper{
 			Name:             "native_tracer_entry_amd_brs",
@@ -1295,6 +1306,15 @@ func (t *Tracer) AttachTracer(targetCPUs []int) error {
 				attachErrs = append(attachErrs, wrapped)
 				log.Infof("Failed to attach %v; continuing without branch sampling", wrapped)
 			}
+		}
+	}
+
+	if t.enableHWInstructions {
+		if err := t.attachPerfEvents(events, targetCPUs,
+			"native_tracer_entry_hw_instructions", perf.Instructions); err != nil {
+			wrapped := fmt.Errorf("hardware instructions: %w", err)
+			attachErrs = append(attachErrs, wrapped)
+			log.Infof("Failed to attach %v; skipping", wrapped)
 		}
 	}
 

@@ -92,6 +92,9 @@ type Config struct {
 	// EnableHWCPUCycles enables hardware cpu-cycles perf events for sampling.
 	// When enabled with EnableSWCPUClock, both event types are collected concurrently.
 	EnableHWCPUCycles bool `mapstructure:"enable_hw_cpu_cycles"`
+	// EnableHWInstructions enables hardware instructions perf events for sampling.
+	// It can run independently or concurrently with the other sampling events.
+	EnableHWInstructions bool `mapstructure:"enable_hw_instructions"`
 	// EnableBranchSampling enables LBR for Intel/Zen 4+ or AMD BRS for older Zen.
 	// Branch sampling is optional and is only used with hardware cpu-cycles.
 	EnableBranchSampling bool `mapstructure:"enable_branch_sampling"`
@@ -154,10 +157,10 @@ func (cfg *Config) Validate() error {
 				"should be in the range [0..1]. 0 disables jitter")
 	}
 
-	if !cfg.EnableSWCPUClock && !cfg.EnableHWCPUCycles {
+	if !cfg.EnableSWCPUClock && !cfg.EnableHWCPUCycles && !cfg.EnableHWInstructions {
 		return errors.New(
 			"at least one perf event type must be enabled: " +
-				"use --enable-sw-cpu-clock and/or --enable-hw-cpu-cycles")
+				"use --enable-sw-cpu-clock, --enable-hw-cpu-cycles, and/or --enable-hw-instructions")
 	}
 
 	if cfg.EnableBranchSampling && !cfg.EnableHWCPUCycles {

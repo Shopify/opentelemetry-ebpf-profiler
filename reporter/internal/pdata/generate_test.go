@@ -243,6 +243,52 @@ func TestFunctionTableOrder(t *testing.T) {
 	}
 }
 
+func TestHardwareSamplingPeriodTypes(t *testing.T) {
+	cycles := &samples.TypeMetadata{
+		PeriodType: "cpu",
+		PeriodUnit: "cycles",
+		SampleType: "samples",
+		SampleUnit: "count",
+	}
+	instructions := &samples.TypeMetadata{
+		PeriodType: "cpu",
+		PeriodUnit: "instructions",
+		SampleType: "samples",
+		SampleUnit: "count",
+	}
+	tree := samples.TraceEventsTree{
+		{}: samples.ResourceToProfiles{Events: map[*samples.TypeMetadata]samples.SampleToEvents{
+			cycles: {
+				{}: {Timestamps: []uint64{1}},
+			},
+			instructions: {
+				{}: {Timestamps: []uint64{2}},
+			},
+		}},
+	}
+
+	d, err := New(100, nil)
+	require.NoError(t, err)
+	profiles, err := testGenerate(d, tree, t.Name(), "version")
+	require.NoError(t, err)
+
+	sp := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0)
+	require.Equal(t, 2, sp.Profiles().Len())
+	stringTable := profiles.Dictionary().StringTable()
+	got := make(map[string]string, 2)
+	for i := 0; i < sp.Profiles().Len(); i++ {
+		profile := sp.Profiles().At(i)
+		assert.Equal(t, int64(1e9/100), profile.Period())
+		periodType := stringTable.At(int(profile.PeriodType().TypeStrindex()))
+		periodUnit := stringTable.At(int(profile.PeriodType().UnitStrindex()))
+		got[periodUnit] = periodType
+	}
+	assert.Equal(t, map[string]string{
+		"cycles":       "cpu",
+		"instructions": "cpu",
+	}, got)
+}
+
 func TestProfileDuration(t *testing.T) {
 	mapping := libpf.NewFrameMapping(libpf.FrameMappingData{
 		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
