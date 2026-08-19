@@ -143,11 +143,6 @@ static EBPF_INLINE ErrorCode unwind_one_v8_frame(PerCPURecord *record, V8ProcInf
   unsigned long fp_function        = *(unsigned long *)(scratch->fp_ctx + vi->fp_function);
   unsigned long fp_bytecode_offset = *(unsigned long *)(scratch->fp_ctx + vi->fp_bytecode_offset);
   DEBUG_PRINT(
-    "v8 OFFSETS: marker: %x, func: %x, bytecode offset: %x",
-    vi->fp_marker,
-    vi->fp_function,
-    vi->fp_bytecode_offset);
-  DEBUG_PRINT(
     "v8 VALUES: marker: %lx, func: %lx, bytecode offset: %lx",
     fp_marker,
     fp_function,
@@ -421,6 +416,11 @@ static EBPF_INLINE int unwind_v8(struct pt_regs *ctx)
     increment_metric(metricID_UnwindV8ErrNoProcInfo);
     goto exit;
   }
+  DEBUG_PRINT(
+    "v8 OFFSETS: marker: %x, func: %x, bytecode offset: %x",
+    vi->fp_marker,
+    vi->fp_function,
+    vi->fp_bytecode_offset);
 
   increment_metric(metricID_UnwindV8Attempts);
 
