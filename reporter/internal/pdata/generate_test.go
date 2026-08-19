@@ -243,7 +243,13 @@ func TestFunctionTableOrder(t *testing.T) {
 	}
 }
 
-func TestHardwareSamplingPeriodTypes(t *testing.T) {
+func TestSamplingPeriodTypes(t *testing.T) {
+	clock := &samples.TypeMetadata{
+		PeriodType: "cpu",
+		PeriodUnit: "nanoseconds",
+		SampleType: "samples",
+		SampleUnit: "count",
+	}
 	cycles := &samples.TypeMetadata{
 		PeriodType: "cpu",
 		PeriodUnit: "cycles",
@@ -258,11 +264,14 @@ func TestHardwareSamplingPeriodTypes(t *testing.T) {
 	}
 	tree := samples.TraceEventsTree{
 		{}: samples.ResourceToProfiles{Events: map[*samples.TypeMetadata]samples.SampleToEvents{
-			cycles: {
+			clock: {
 				{}: {Timestamps: []uint64{1}},
 			},
-			instructions: {
+			cycles: {
 				{}: {Timestamps: []uint64{2}},
+			},
+			instructions: {
+				{}: {Timestamps: []uint64{3}},
 			},
 		}},
 	}
@@ -273,9 +282,9 @@ func TestHardwareSamplingPeriodTypes(t *testing.T) {
 	require.NoError(t, err)
 
 	sp := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0)
-	require.Equal(t, 2, sp.Profiles().Len())
+	require.Equal(t, 3, sp.Profiles().Len())
 	stringTable := profiles.Dictionary().StringTable()
-	got := make(map[string]string, 2)
+	got := make(map[string]string, 3)
 	for i := 0; i < sp.Profiles().Len(); i++ {
 		profile := sp.Profiles().At(i)
 		assert.Equal(t, int64(1e9/100), profile.Period())
@@ -284,6 +293,7 @@ func TestHardwareSamplingPeriodTypes(t *testing.T) {
 		got[periodUnit] = periodType
 	}
 	assert.Equal(t, map[string]string{
+		"nanoseconds":  "cpu",
 		"cycles":       "cpu",
 		"instructions": "cpu",
 	}, got)

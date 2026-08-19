@@ -9,11 +9,13 @@ import (
 	"os"
 	"runtime"
 	"testing"
+	"unsafe"
 
 	"github.com/cilium/ebpf/btf"
 	"github.com/stretchr/testify/require"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
@@ -97,4 +99,146 @@ func TestCalculateFieldOffsetFindsAnonymousCompositeMembers(t *testing.T) {
 	offset, err := calculateFieldOffset(vmArea, "vm_flags")
 	require.NoError(t, err)
 	require.Equal(t, uint(24), offset)
+}
+
+func TestSetOriginIDsSamplingEvents(t *testing.T) {
+	type source struct {
+		variable string
+		program  string
+		enabled  func(*Config) bool
+		metadata samples.TypeMetadata
+	}
+
+	sources := []source{
+		{
+			variable: "origin_id_sampling",
+			program:  "native_tracer_entry_sw_cpu_clock",
+			enabled:  func(cfg *Config) bool { return cfg.EnableSWCPUClock },
+			metadata: samples.TypeMetadata{
+				PeriodType: "cpu",
+				PeriodUnit: "nanoseconds",
+				SampleType: "samples",
+				SampleUnit: "count",
+			},
+		},
+		{
+			variable: "origin_id_hw_cpu_cycles",
+			program:  "native_tracer_entry_hw_cpu_cycles",
+			enabled:  func(cfg *Config) bool { return cfg.EnableHWCPUCycles },
+			metadata: samples.TypeMetadata{
+				PeriodType: "cpu",
+				PeriodUnit: "cycles",
+				SampleType: "samples",
+				SampleUnit: "count",
+			},
+		},
+		{
+			variable: "origin_id_hw_instructions",
+			program:  "native_tracer_entry_hw_instructions",
+			enabled:  func(cfg *Config) bool { return cfg.EnableHWInstructions },
+			metadata: samples.TypeMetadata{
+				PeriodType: "cpu",
+				PeriodUnit: "instructions",
+				SampleType: "samples",
+				SampleUnit: "count",
+			},
+		},
+	}
+
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{
+			name: "all sampling sources",
+			cfg: Config{
+				EnableSWCPUClock:     true,
+				EnableHWCPUCycles:    true,
+				EnableHWInstructions: true,
+			},
+		},
+		{
+			name: "cycles and instructions without software clock",
+			cfg: Config{
+				EnableHWCPUCycles:    true,
+				EnableHWInstructions: true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			coll, err := support.LoadCollectionSpec()
+			require.NoError(t, err)
+
+			origins := &originRegistry{}
+			reservedID, err := origins.Register(&samples.TypeMetadata{SampleType: "reserved"})
+			require.NoError(t, err)
+			require.Equal(t, uint16(1), reservedID)
+
+			require.NoError(t, setOriginIDs(coll, &tt.cfg, origins))
+			require.Nil(t, origins.lookup(0), "origin zero must remain unregistered")
+
+			seen := map[uint16]string{reservedID: "reserved"}
+			enabledCount := 0
+			for _, src := range sources {
+				variable := coll.Variables[src.variable]
+				require.NotNil(t, variable)
+				program := coll.Programs[src.program]
+				require.NotNil(t, program)
+				require.NotEmpty(t, program.Instructions)
+
+				// Each entry point's first instruction must load its origin from the
+				// corresponding RODATA slot. This prevents a fixed origin constant
+				// from bypassing the registry.
+				originLoad := program.Instructions[0]
+				require.Equal(t, variable.SectionName, originLoad.Reference())
+				require.Equal(t, uint64(variable.Offset), uint64(originLoad.Constant)>>32)
+
+				var origin uint16
+				require.NoError(t, variable.Get(&origin))
+				if !src.enabled(&tt.cfg) {
+					require.Zero(t, origin, "%s must remain unset when disabled", src.variable)
+					continue
+				}
+
+				enabledCount++
+				require.NotZero(t, origin)
+				require.NotContains(t, seen, origin,
+					"%s must have a distinct dynamic origin", src.variable)
+				seen[origin] = src.variable
+
+				metadata := origins.lookup(origin)
+				require.NotNil(t, metadata, "%s must use a registered origin", src.variable)
+				require.Equal(t, src.metadata, *metadata)
+			}
+			require.Equal(t, uint32(enabledCount+1), origins.lastID.Load())
+		})
+	}
+}
+
+func TestLoadBpfTraceRejectsUnregisteredOrigin(t *testing.T) {
+	origins := &originRegistry{}
+	registered, err := origins.Register(&samples.TypeMetadata{SampleType: "registered"})
+	require.NoError(t, err)
+
+	tracer := &Tracer{
+		origins:   origins,
+		tracePool: newTracePool(),
+	}
+	rawTrace := support.Trace{Origin: registered}
+	raw := unsafe.Slice(
+		(*byte)(unsafe.Pointer(&rawTrace)),
+		int(unsafe.Offsetof(rawTrace.Frame_data)),
+	)
+
+	parsed, err := tracer.loadBpfTrace(raw)
+	require.NoError(t, err)
+	require.Equal(t, registered, parsed.Origin)
+	tracer.tracePool.Put(parsed)
+
+	rawTrace.Origin = registered + 1 // Simulate a stale fixed origin ID.
+	parsed, err = tracer.loadBpfTrace(raw)
+	require.Nil(t, parsed)
+	require.ErrorIs(t, err, errOriginUnexpected)
 }
