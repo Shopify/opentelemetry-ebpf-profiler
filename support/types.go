@@ -64,7 +64,7 @@ const (
 const UnwindInfoMaxEntries = 0x4000
 
 const (
-	MetricIDBeginCumulative = 0x7a
+	MetricIDBeginCumulative = 0x7d
 )
 
 const (
@@ -552,5 +552,8 @@ var MetricsTranslation = []metrics.MetricID{
 	0x6e: metrics.IDUnwindGoLabelsAttempts,
 	0x6f: metrics.IDUnwindGoLabelsFailures,
 	0x78: metrics.IDBPFRingbufOutputErr,
-	0x79: metrics.IDCUPTIEventsRingbufFull,
+	0x79: metrics.IDUnwindNativeErrNoVMA,
+	0x7a: metrics.IDUnwindNativeErrUnsupportedAnonymousMapping,
+	0x7b: metrics.IDUnwindNativeErrNonExecutableVMA,
+	0x7c: metrics.IDCUPTIEventsRingbufFull,
 }
