@@ -11,6 +11,7 @@ import (
 	"testing"
 	"unsafe"
 
+	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
 	"github.com/stretchr/testify/require"
 
@@ -226,7 +227,11 @@ func TestLoadBpfTraceRejectsUnregisteredOrigin(t *testing.T) {
 		origins:   origins,
 		tracePool: newTracePool(),
 	}
-	rawTrace := support.Trace{Origin: registered}
+	rawTrace := support.Trace{
+		Origin:             registered,
+		Cycles_delta:       123456,
+		Instructions_delta: 654321,
+	}
 	raw := unsafe.Slice(
 		(*byte)(unsafe.Pointer(&rawTrace)),
 		int(unsafe.Offsetof(rawTrace.Frame_data)),
@@ -235,10 +240,65 @@ func TestLoadBpfTraceRejectsUnregisteredOrigin(t *testing.T) {
 	parsed, err := tracer.loadBpfTrace(raw)
 	require.NoError(t, err)
 	require.Equal(t, registered, parsed.Origin)
+	require.Equal(t, uint64(123456), parsed.CyclesDelta)
+	require.Equal(t, uint64(654321), parsed.InstructionsDelta)
 	tracer.tracePool.Put(parsed)
 
 	rawTrace.Origin = registered + 1 // Simulate a stale fixed origin ID.
 	parsed, err = tracer.loadBpfTrace(raw)
 	require.Nil(t, parsed)
 	require.ErrorIs(t, err, errOriginUnexpected)
+}
+
+func TestPerSampleCounterOriginMetadata(t *testing.T) {
+	coll, err := support.LoadCollectionSpec()
+	require.NoError(t, err)
+
+	origins := &originRegistry{}
+	cfg := &Config{EnableSWCPUClock: true, EnablePerSampleCounters: true}
+	require.NoError(t, setOriginIDs(coll, cfg, origins))
+	require.Equal(t, uint32(1), origins.lastID.Load(), "derived profiles must not consume BPF origins")
+
+	var origin uint16
+	require.NoError(t, coll.Variables["origin_id_sampling"].Get(&origin))
+	metadata := origins.lookup(origin)
+	require.NotNil(t, metadata)
+	require.Len(t, metadata.DerivedProfiles, 2)
+
+	cycles := metadata.DerivedProfiles[0]
+	require.Equal(t, samples.SampleValueSourceCyclesDelta, cycles.ValueSource)
+	require.Equal(t, &samples.TypeMetadata{
+		PeriodType:      "cpu",
+		PeriodUnit:      "nanoseconds",
+		SampleType:      "cycles",
+		SampleUnit:      "cycles",
+		ReportValues:    true,
+		AggregateValues: true,
+	}, cycles.ProfileType)
+
+	instructions := metadata.DerivedProfiles[1]
+	require.Equal(t, samples.SampleValueSourceInstructionsDelta, instructions.ValueSource)
+	require.Equal(t, "instructions", instructions.ProfileType.SampleType)
+	require.Equal(t, "instructions", instructions.ProfileType.SampleUnit)
+}
+
+func TestPerSampleCounterBPFMaps(t *testing.T) {
+	coll, err := support.LoadCollectionSpec()
+	require.NoError(t, err)
+
+	for _, name := range []string{perSampleCyclesMapName, perSampleInstructionsMapName} {
+		m := coll.Maps[name]
+		require.NotNil(t, m, name)
+		require.Equal(t, cebpf.PerfEventArray, m.Type, name)
+	}
+	state := coll.Maps["per_sample_counter_state"]
+	require.NotNil(t, state)
+	require.Equal(t, cebpf.PerCPUArray, state.Type)
+	require.Equal(t, uint32(1), state.MaxEntries)
+
+	flag := coll.Variables["enable_per_sample_counters"]
+	require.NotNil(t, flag)
+	var enabled bool
+	require.NoError(t, flag.Get(&enabled))
+	require.False(t, enabled)
 }

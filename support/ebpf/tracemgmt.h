@@ -452,7 +452,9 @@ static inline EBPF_INLINE PerCPURecord *get_pristine_per_cpu_record()
   trace->apm_trace_id.as_int.lo    = 0;
   trace->apm_transaction_id.as_int = 0;
 
-  trace->custom_labels.len = 0;
+  trace->custom_labels.len  = 0;
+  trace->cycles_delta       = 0;
+  trace->instructions_delta = 0;
 
   return record;
 }
@@ -1097,8 +1099,15 @@ get_usermode_regs(struct pt_regs *ctx, UnwindState *state, bool *has_usermode_re
 
 #endif // TESTING_COREDUMP
 
-static inline EBPF_INLINE int
-collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp, u64 value)
+static inline EBPF_INLINE int collect_trace(
+  struct pt_regs *ctx,
+  u16 origin,
+  u32 pid,
+  u32 tid,
+  u64 trace_timestamp,
+  u64 value,
+  u64 cycles_delta,
+  u64 instructions_delta)
 {
   // Only continue processing the trace with a valid origin.
   if (origin == 0) {
@@ -1117,12 +1126,14 @@ collect_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_times
     return -1;
   }
 
-  Trace *trace  = &record->trace;
-  trace->origin = origin;
-  trace->pid    = pid;
-  trace->tid    = tid;
-  trace->ktime  = trace_timestamp;
-  trace->value  = value;
+  Trace *trace              = &record->trace;
+  trace->origin             = origin;
+  trace->pid                = pid;
+  trace->tid                = tid;
+  trace->ktime              = trace_timestamp;
+  trace->value              = value;
+  trace->cycles_delta       = cycles_delta;
+  trace->instructions_delta = instructions_delta;
   if (bpf_get_current_comm(&(trace->comm), sizeof(trace->comm)) < 0) {
     increment_metric(metricID_ErrBPFCurrentComm);
   }
@@ -1175,20 +1186,21 @@ exit:
 // a Trace header (no call-stack unwinding) and tail-calls into unwind_stop, where
 // collect_lbr_stack() reads the branch records and send_trace() emits the trace.
 static inline EBPF_INLINE int
-collect_lbr_only_trace(
-  struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp)
+collect_lbr_only_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 trace_timestamp)
 {
   PerCPURecord *record = get_pristine_per_cpu_record();
   if (!record) {
     return -1;
   }
 
-  Trace *trace  = &record->trace;
-  trace->origin = origin;
-  trace->pid    = pid;
-  trace->tid    = tid;
-  trace->ktime  = trace_timestamp;
-  trace->value  = 0;
+  Trace *trace              = &record->trace;
+  trace->origin             = origin;
+  trace->pid                = pid;
+  trace->tid                = tid;
+  trace->ktime              = trace_timestamp;
+  trace->value              = 0;
+  trace->cycles_delta       = 0;
+  trace->instructions_delta = 0;
   if (bpf_get_current_comm(&(trace->comm), sizeof(trace->comm)) < 0) {
     increment_metric(metricID_ErrBPFCurrentComm);
   }

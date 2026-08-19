@@ -6,6 +6,7 @@ package reporter // import "go.opentelemetry.io/ebpf-profiler/reporter"
 import (
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -62,7 +63,15 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 		PID:            int64(meta.PID),
 		ExecutablePath: meta.ExecutablePath,
 	}
-	traceHash := traceutil.HashTrace(trace)
+	sampleKey := samples.SampleKey{
+		Hash:      traceutil.HashTrace(trace),
+		Comm:      meta.Comm,
+		TID:       int64(meta.TID),
+		CPU:       int64(meta.CPU),
+		SpanID:    meta.SpanID,
+		TraceID:   meta.TraceID,
+		ExtraMeta: extraMeta,
+	}
 
 	eventsTree := b.traceEvents.WLock()
 	defer b.traceEvents.WUnlock(&eventsTree)
@@ -75,30 +84,38 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 	}
 
 	rtp := (*eventsTree)[key]
-	if _, exists := rtp.Events[meta.ProfileType]; !exists {
-		rtp.Events[meta.ProfileType] = make(samples.SampleToEvents)
-	}
+	addTraceEvent(rtp.Events, meta.ProfileType, sampleKey, trace,
+		uint64(meta.Timestamp), meta.Value)
 
-	sampleKey := samples.SampleKey{
-		Hash:      traceHash,
-		Comm:      meta.Comm,
-		TID:       int64(meta.TID),
-		CPU:       int64(meta.CPU),
-		SpanID:    meta.SpanID,
-		TraceID:   meta.TraceID,
-		ExtraMeta: extraMeta,
-	}
-	if events, exists := rtp.Events[meta.ProfileType][sampleKey]; exists {
-		events.Timestamps = append(events.Timestamps, uint64(meta.Timestamp))
-		events.Values = append(events.Values, meta.Value)
-		return nil
-	}
-
-	rtp.Events[meta.ProfileType][sampleKey] = &samples.TraceEvents{
-		Frames:     trace.Frames,
-		Timestamps: []uint64{uint64(meta.Timestamp)},
-		Values:     []int64{meta.Value},
-		Labels:     trace.CustomLabels,
+	for _, derived := range meta.ProfileType.DerivedProfiles {
+		value := derived.Value(trace)
+		if value == 0 || derived.ProfileType == nil {
+			continue
+		}
+		addTraceEvent(rtp.Events, derived.ProfileType, sampleKey, trace,
+			uint64(meta.Timestamp), int64(min(value, uint64(math.MaxInt64))))
 	}
 	return nil
+}
+
+func addTraceEvent(eventsByType map[*samples.TypeMetadata]samples.SampleToEvents,
+	profileType *samples.TypeMetadata, sampleKey samples.SampleKey, trace *libpf.Trace,
+	timestamp uint64, value int64,
+) {
+	if _, exists := eventsByType[profileType]; !exists {
+		eventsByType[profileType] = make(samples.SampleToEvents)
+	}
+
+	if events, exists := eventsByType[profileType][sampleKey]; exists {
+		events.Timestamps = append(events.Timestamps, timestamp)
+		events.Values = append(events.Values, value)
+		return
+	}
+
+	eventsByType[profileType][sampleKey] = &samples.TraceEvents{
+		Frames:     trace.Frames,
+		Timestamps: []uint64{timestamp},
+		Values:     []int64{value},
+		Labels:     trace.CustomLabels,
+	}
 }

@@ -4,6 +4,7 @@
 package pdata // import "go.opentelemetry.io/ebpf-profiler/reporter/internal/pdata"
 
 import (
+	"math"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -179,9 +180,13 @@ func (p *Pdata) setProfile(
 	for sampleKey, traceInfo := range events {
 		sample := profile.Samples().AppendEmpty()
 
-		sample.TimestampsUnixNano().FromRaw(traceInfo.Timestamps)
-		if profileType.ReportValues {
-			sample.Values().Append(traceInfo.Values...)
+		if profileType.AggregateValues {
+			sample.Values().Append(sumValues(traceInfo.Values))
+		} else {
+			sample.TimestampsUnixNano().FromRaw(traceInfo.Timestamps)
+			if profileType.ReportValues {
+				sample.Values().Append(traceInfo.Values...)
+			}
 		}
 
 		if sampleKey.SpanID != libpf.InvalidAPMSpanID &&
@@ -301,6 +306,20 @@ func (p *Pdata) setProfile(
 	profile.SetTime(pcommon.Timestamp(collectionStartTime.UnixNano()))
 
 	return nil
+}
+
+func sumValues(values []int64) int64 {
+	var total int64
+	for _, value := range values {
+		if value > 0 && total > math.MaxInt64-value {
+			return math.MaxInt64
+		}
+		if value < 0 && total < math.MinInt64-value {
+			return math.MinInt64
+		}
+		total += value
+	}
+	return total
 }
 
 func setResourceAttributes(attrs pcommon.Map, resource samples.ResourceKey, envVars map[libpf.String]libpf.String) {

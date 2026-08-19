@@ -70,6 +70,33 @@ BPF_RODATA_VAR(u16, origin_id_hw_cpu_cycles, 0)
 BPF_RODATA_VAR(u16, origin_id_hw_instructions, 0)
 // origin_id_amd_brs is set during load time.
 BPF_RODATA_VAR(u16, origin_id_amd_brs, 0)
+// enable_per_sample_counters is set during load time. When false, the verifier
+// eliminates the perf counter read path from the software-clock entry program.
+BPF_RODATA_VAR(bool, enable_per_sample_counters, false)
+
+// Readable, non-sampling perf events installed by userspace, indexed by CPU.
+struct per_sample_cycles_t {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __type(key, u32);
+  __type(value, u32);
+  __uint(max_entries, 0);
+} per_sample_cycles SEC(".maps");
+
+struct per_sample_instructions_t {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __type(key, u32);
+  __type(value, u32);
+  __uint(max_entries, 0);
+} per_sample_instructions SEC(".maps");
+
+// One previous reading per CPU. Per-CPU storage avoids synchronization in the
+// sampling path and follows the CPU-wide scope of the perf events above.
+struct per_sample_counter_state_t {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, u32);
+  __type(value, PerSampleCounterState);
+  __uint(max_entries, 1);
+} per_sample_counter_state SEC(".maps");
 
 // Macro to create a map named exe_id_to_X_stack_deltas that is a nested maps with a fileID for the
 // outer map and an array as inner map that holds up to 2^X stack delta entries for the given
@@ -195,9 +222,89 @@ static EBPF_INLINE int unwind_native(struct pt_regs *ctx)
   return -1;
 }
 
-static inline int
-native_tracer_entry_impl(struct bpf_perf_event_data *ctx, u16 origin, bool is_amd_brs)
+// scale_counter_delta computes floor(raw * enabled / running). The fast path
+// preserves full precision. The overflow fallback divides first, saturates if
+// the integral term overflows, and conservatively omits an unsafe fractional
+// multiplication rather than wrapping the reported delta.
+static inline u64 scale_counter_delta(u64 raw, u64 enabled, u64 running)
 {
+  const u64 max_u64 = ~(u64)0;
+  if (!raw || !enabled || !running) {
+    return 0;
+  }
+
+  if (raw <= max_u64 / enabled) {
+    return raw * enabled / running;
+  }
+
+  u64 quotient  = raw / running;
+  u64 remainder = raw % running;
+  if (quotient > max_u64 / enabled) {
+    return max_u64;
+  }
+
+  u64 scaled = quotient * enabled;
+  if (remainder <= max_u64 / enabled) {
+    u64 fractional = remainder * enabled / running;
+    if (fractional > max_u64 - scaled) {
+      return max_u64;
+    }
+    scaled += fractional;
+  }
+  return scaled;
+}
+
+static inline u64 read_counter_delta(void *events, PerfCounterValue *previous, bool *previous_valid)
+{
+  PerfCounterValue current = {};
+  if (bpf_perf_event_read_value(events, BPF_F_CURRENT_CPU, &current, sizeof(current)) < 0) {
+    return 0;
+  }
+
+  u64 scaled = 0;
+  if (
+    *previous_valid && current.value >= previous->value && current.enabled >= previous->enabled &&
+    current.running >= previous->running) {
+    u64 raw_delta     = current.value - previous->value;
+    u64 enabled_delta = current.enabled - previous->enabled;
+    u64 running_delta = current.running - previous->running;
+    if (running_delta != 0) {
+      scaled = scale_counter_delta(raw_delta, enabled_delta, running_delta);
+    }
+  }
+
+  *previous       = current;
+  *previous_valid = true;
+  return scaled;
+}
+
+static inline void collect_per_sample_counters(u64 *cycles_delta, u64 *instructions_delta)
+{
+  *cycles_delta       = 0;
+  *instructions_delta = 0;
+  if (!enable_per_sample_counters) {
+    return;
+  }
+
+  u32 key                     = 0;
+  PerSampleCounterState *prev = bpf_map_lookup_elem(&per_sample_counter_state, &key);
+  if (!prev) {
+    return;
+  }
+
+  *cycles_delta = read_counter_delta(&per_sample_cycles, &prev->cycles, &prev->cycles_valid);
+  *instructions_delta =
+    read_counter_delta(&per_sample_instructions, &prev->instructions, &prev->instructions_valid);
+}
+
+static inline int native_tracer_entry_impl(
+  struct bpf_perf_event_data *ctx, u16 origin, bool is_amd_brs, bool read_counters)
+{
+  u64 cycles_delta       = 0;
+  u64 instructions_delta = 0;
+  if (read_counters) {
+    collect_per_sample_counters(&cycles_delta, &instructions_delta);
+  }
   u32 pid = 0;
   u32 tid = 0;
   if (!get_pid_tgid(&pid, &tid)) {
@@ -212,30 +319,31 @@ native_tracer_entry_impl(struct bpf_perf_event_data *ctx, u16 origin, bool is_am
   if (is_amd_brs) {
     return collect_lbr_only_trace((struct pt_regs *)&ctx->regs, origin, pid, tid, ts);
   }
-  return collect_trace((struct pt_regs *)&ctx->regs, origin, pid, tid, ts, 0);
+  return collect_trace(
+    (struct pt_regs *)&ctx->regs, origin, pid, tid, ts, 0, cycles_delta, instructions_delta);
 }
 
 SEC("perf_event/native_tracer_entry_sw_cpu_clock")
 int native_tracer_entry_sw_cpu_clock(struct bpf_perf_event_data *ctx)
 {
-  return native_tracer_entry_impl(ctx, origin_id_sampling, false);
+  return native_tracer_entry_impl(ctx, origin_id_sampling, false, true);
 }
 
 SEC("perf_event/native_tracer_entry_hw_cpu_cycles")
 int native_tracer_entry_hw_cpu_cycles(struct bpf_perf_event_data *ctx)
 {
-  return native_tracer_entry_impl(ctx, origin_id_hw_cpu_cycles, false);
+  return native_tracer_entry_impl(ctx, origin_id_hw_cpu_cycles, false, false);
 }
 
 SEC("perf_event/native_tracer_entry_hw_instructions")
 int native_tracer_entry_hw_instructions(struct bpf_perf_event_data *ctx)
 {
-  return native_tracer_entry_impl(ctx, origin_id_hw_instructions, false);
+  return native_tracer_entry_impl(ctx, origin_id_hw_instructions, false, false);
 }
 
 SEC("perf_event/native_tracer_entry_amd_brs")
 int native_tracer_entry_amd_brs(struct bpf_perf_event_data *ctx)
 {
-  return native_tracer_entry_impl(ctx, origin_id_amd_brs, true);
+  return native_tracer_entry_impl(ctx, origin_id_amd_brs, true, false);
 }
 MULTI_USE_FUNC(unwind_native)

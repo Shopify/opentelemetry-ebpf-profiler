@@ -95,6 +95,82 @@ func TestValidateSamplingEvents(t *testing.T) {
 	require.NoError(t, confmap.Validate(cfg))
 }
 
+func TestValidatePerSampleCountersMatrix(t *testing.T) {
+	tests := []struct {
+		name         string
+		sw, cycles   bool
+		instructions bool
+		perSample    bool
+		wantErr      string
+	}{
+		{name: "software clock only", sw: true},
+		{name: "per-sample mode", sw: true, perSample: true},
+		{
+			name:      "per-sample mode without any trigger",
+			perSample: true,
+			wantErr:   "per-sample counters require software cpu-clock sampling (--enable-sw-cpu-clock)",
+		},
+		{
+			name:      "cycles trigger without software clock",
+			cycles:    true,
+			perSample: true,
+			wantErr:   "per-sample counters require software cpu-clock sampling (--enable-sw-cpu-clock)",
+		},
+		{
+			name:         "instructions trigger without software clock",
+			instructions: true,
+			perSample:    true,
+			wantErr:      "per-sample counters require software cpu-clock sampling (--enable-sw-cpu-clock)",
+		},
+		{
+			name:         "both hardware triggers without software clock",
+			cycles:       true,
+			instructions: true,
+			perSample:    true,
+			wantErr:      "per-sample counters require software cpu-clock sampling (--enable-sw-cpu-clock)",
+		},
+		{
+			name:      "software clock plus cycles trigger",
+			sw:        true,
+			cycles:    true,
+			perSample: true,
+			wantErr:   "per-sample counters cannot be combined with --enable-hw-cpu-cycles or --enable-hw-instructions",
+		},
+		{
+			name:         "software clock plus instructions trigger",
+			sw:           true,
+			instructions: true,
+			perSample:    true,
+			wantErr:      "per-sample counters cannot be combined with --enable-hw-cpu-cycles or --enable-hw-instructions",
+		},
+		{
+			name:         "all triggers",
+			sw:           true,
+			cycles:       true,
+			instructions: true,
+			perSample:    true,
+			wantErr:      "per-sample counters cannot be combined with --enable-hw-cpu-cycles or --enable-hw-instructions",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.EnableSWCPUClock = tt.sw
+			cfg.EnableHWCPUCycles = tt.cycles
+			cfg.EnableHWInstructions = tt.instructions
+			cfg.EnablePerSampleCounters = tt.perSample
+
+			err := confmap.Validate(cfg)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
 func TestValidateBranchSamplingRequiresCycles(t *testing.T) {
 	cfg := validConfig()
 	cfg.EnableBranchSampling = true

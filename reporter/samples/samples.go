@@ -88,6 +88,34 @@ type SampleKey struct {
 	TraceID libpf.APMTraceID
 }
 
+// SampleValueSource identifies a value carried by a trace that should be
+// exported in a correlated sibling profile.
+type SampleValueSource uint8
+
+const (
+	SampleValueSourceCyclesDelta SampleValueSource = iota + 1
+	SampleValueSourceInstructionsDelta
+)
+
+// DerivedProfileMetadata describes an export-only sibling profile. It does not
+// have a BPF origin: its value is payload on the parent trace.
+type DerivedProfileMetadata struct {
+	ProfileType *TypeMetadata
+	ValueSource SampleValueSource
+}
+
+// Value returns the trace payload selected by this sibling profile.
+func (m DerivedProfileMetadata) Value(trace *libpf.Trace) uint64 {
+	switch m.ValueSource {
+	case SampleValueSourceCyclesDelta:
+		return trace.CyclesDelta
+	case SampleValueSourceInstructionsDelta:
+		return trace.InstructionsDelta
+	default:
+		return 0
+	}
+}
+
 // TypeMetadata describes how profiling events of a particular kind
 // should be interpreted and exported as an OTel profile.
 type TypeMetadata struct {
@@ -107,4 +135,12 @@ type TypeMetadata struct {
 	// ReportValues indicates whether a sample's value should be included
 	// in the exported sample (e.g. off-CPU durations).
 	ReportValues bool
+
+	// AggregateValues emits one summed value per sample identity and omits its
+	// per-observation timestamps. This is used for counter-delta siblings.
+	AggregateValues bool
+
+	// DerivedProfiles are correlated value profiles derived from payload carried
+	// by this profile's trace. They deliberately do not represent BPF origins.
+	DerivedProfiles []DerivedProfileMetadata
 }

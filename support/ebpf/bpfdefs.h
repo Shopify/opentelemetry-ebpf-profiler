@@ -121,6 +121,12 @@ bpf_read_branch_records(UNUSED void *ctx, UNUSED void *buf, UNUSED u32 size, UNU
   return -1;
 }
 
+static inline long
+bpf_perf_event_read_value(UNUSED void *map, UNUSED u64 flags, UNUSED void *buf, UNUSED u32 size)
+{
+  return -1;
+}
+
 #else // TESTING_COREDUMP
 
   // Native eBPF build
@@ -164,6 +170,8 @@ static long (*bpf_get_stack)(void *ctx, void *buf, u32 size, u64 flags) = (void 
   BPF_FUNC_get_stack;
 static long (*bpf_read_branch_records)(void *ctx, void *buf, u32 size, u64 flags) = (void *)
   BPF_FUNC_read_branch_records;
+static long (*bpf_perf_event_read_value)(void *map, u64 flags, void *buf, u32 size) = (void *)
+  BPF_FUNC_perf_event_read_value;
 static unsigned long long (*bpf_get_prandom_u32)(void) = (void *)BPF_FUNC_get_prandom_u32;
 
 __attribute__((format(printf, 1, 3))) static int (*bpf_trace_printk)(

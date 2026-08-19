@@ -278,3 +278,127 @@ func TestProcessMetaEnricherPipeline(t *testing.T) {
 	}
 	assert.True(t, found, "expected process.name=myapp in the attribute table")
 }
+
+func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
+	cyclesType := &samples.TypeMetadata{
+		PeriodType:      "cpu",
+		PeriodUnit:      "nanoseconds",
+		SampleType:      "cycles",
+		SampleUnit:      "cycles",
+		ReportValues:    true,
+		AggregateValues: true,
+	}
+	instructionsType := &samples.TypeMetadata{
+		PeriodType:      "cpu",
+		PeriodUnit:      "nanoseconds",
+		SampleType:      "instructions",
+		SampleUnit:      "instructions",
+		ReportValues:    true,
+		AggregateValues: true,
+	}
+	clockType := &samples.TypeMetadata{
+		PeriodType: "cpu",
+		PeriodUnit: "nanoseconds",
+		SampleType: "samples",
+		SampleUnit: "count",
+		DerivedProfiles: []samples.DerivedProfileMetadata{
+			{ProfileType: cyclesType, ValueSource: samples.SampleValueSourceCyclesDelta},
+			{ProfileType: instructionsType, ValueSource: samples.SampleValueSourceInstructionsDelta},
+		},
+	}
+
+	reporter := createTestBaseReporter(t, nil)
+	frames := make(libpf.Frames, 0, 1)
+	frames.Append(&libpf.Frame{
+		Type:            libpf.NativeFrame,
+		AddressOrLineno: 0x1234,
+		FunctionName:    libpf.Intern("work"),
+	})
+	trace := &libpf.Trace{
+		Frames:            frames,
+		CyclesDelta:       100,
+		InstructionsDelta: 40,
+	}
+	now := time.Now()
+	meta := &samples.TraceEventMeta{
+		Timestamp:   libpf.UnixTime64(now.UnixNano()),
+		Comm:        libpf.NewCommFromString("worker"),
+		PID:         42,
+		TID:         43,
+		CPU:         2,
+		ProfileType: clockType,
+	}
+	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
+
+	trace.CyclesDelta = 23
+	trace.InstructionsDelta = 0
+	meta.Timestamp = libpf.UnixTime64(now.Add(time.Millisecond).UnixNano())
+	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
+
+	// A different stack with zero counter deltas belongs only to the clock profile.
+	zeroFrames := make(libpf.Frames, 0, 1)
+	zeroFrames.Append(&libpf.Frame{
+		Type:            libpf.NativeFrame,
+		AddressOrLineno: 0x5678,
+		FunctionName:    libpf.Intern("idle"),
+	})
+	zeroTrace := &libpf.Trace{Frames: zeroFrames}
+	meta.Timestamp = libpf.UnixTime64(now.Add(2 * time.Millisecond).UnixNano())
+	require.NoError(t, reporter.ReportTraceEvent(zeroTrace, meta))
+
+	eventsTreePtr := reporter.traceEvents.RLock()
+	eventsTree := *eventsTreePtr
+	reporter.traceEvents.RUnlock(&eventsTreePtr)
+	profiles, err := reporter.pdata.Generate(eventsTree, reporter.name, reporter.version,
+		reporter.collectionStartTime, time.Now())
+	require.NoError(t, err)
+
+	sp := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0)
+	require.Equal(t, 3, sp.Profiles().Len())
+	strings := profiles.Dictionary().StringTable()
+	byType := make(map[string]pprofile.Profile, 3)
+	for i := 0; i < sp.Profiles().Len(); i++ {
+		profile := sp.Profiles().At(i)
+		byType[strings.At(int(profile.SampleType().TypeStrindex()))] = profile
+	}
+
+	clock := byType["samples"]
+	cycles := byType["cycles"]
+	instructions := byType["instructions"]
+	require.Equal(t, "cycles", strings.At(int(cycles.SampleType().UnitStrindex())))
+	require.Equal(t, "cpu", strings.At(int(cycles.PeriodType().TypeStrindex())))
+	require.Equal(t, "nanoseconds", strings.At(int(cycles.PeriodType().UnitStrindex())))
+	require.Equal(t, "instructions", strings.At(int(instructions.SampleType().UnitStrindex())))
+	require.Equal(t, "cpu", strings.At(int(instructions.PeriodType().TypeStrindex())))
+	require.Equal(t, "nanoseconds", strings.At(int(instructions.PeriodType().UnitStrindex())))
+	require.Equal(t, 2, clock.Samples().Len())
+	require.Equal(t, 1, cycles.Samples().Len(), "zero-cycle stack must be omitted")
+	require.Equal(t, 1, instructions.Samples().Len(), "zero-instruction stack must be omitted")
+
+	cyclesSample := cycles.Samples().At(0)
+	instructionsSample := instructions.Samples().At(0)
+	require.Equal(t, []int64{123}, cyclesSample.Values().AsRaw())
+	require.Equal(t, []int64{40}, instructionsSample.Values().AsRaw())
+	require.Empty(t, cyclesSample.TimestampsUnixNano().AsRaw(), "summed siblings use aggregate shape")
+	require.Empty(t, instructionsSample.TimestampsUnixNano().AsRaw(), "summed siblings use aggregate shape")
+	require.Equal(t, cyclesSample.StackIndex(), instructionsSample.StackIndex())
+
+	sharedStack := cyclesSample.StackIndex()
+	foundClockStack := false
+	var clockTimestamps []uint64
+	var clockValues []int64
+	for i := 0; i < clock.Samples().Len(); i++ {
+		candidate := clock.Samples().At(i)
+		if candidate.StackIndex() == sharedStack {
+			foundClockStack = true
+			clockTimestamps = candidate.TimestampsUnixNano().AsRaw()
+			clockValues = candidate.Values().AsRaw()
+			break
+		}
+	}
+	require.True(t, foundClockStack,
+		"clock and counter sibling samples must reference the exact same dictionary stack index")
+	require.Len(t, clockTimestamps, 2,
+		"the software-clock profile retains its per-observation timestamps")
+	require.Empty(t, clockValues, "the software-clock profile remains count-shaped")
+}

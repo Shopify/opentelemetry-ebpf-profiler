@@ -94,6 +94,8 @@ var (
 	enableHWInstructionsHelp = "Enable hardware instructions perf events for sampling. " +
 		"Hardware events may not be available in all environments (e.g., VMs without PMU passthrough). " +
 		"At least one of --enable-sw-cpu-clock, --enable-hw-cpu-cycles, or --enable-hw-instructions must be enabled."
+	enablePerSampleCountersHelp = "Read cycles and instructions counters at each software cpu-clock sample and export per-stack deltas. " +
+		"Requires --enable-sw-cpu-clock and cannot be combined with hardware sampling triggers."
 	enableBranchSamplingHelp = "Enable branch sampling for supported CPUs. Requires hardware cpu-cycles."
 	probeLinkHelper          = "Attach a probe to a symbol of an executable. " +
 		"Expected format: probe_type:target[:symbol]. probe_type can be kprobe, kretprobe, uprobe, or uretprobe."
@@ -184,6 +186,7 @@ func parseArgs() (*controller.Config, error) {
 	fs.BoolVar(&args.EnableSWCPUClock, "enable-sw-cpu-clock", true, enableSWCPUClockHelp)
 	fs.BoolVar(&args.EnableHWCPUCycles, "enable-hw-cpu-cycles", false, enableHWCPUCyclesHelp)
 	fs.BoolVar(&args.EnableHWInstructions, "enable-hw-instructions", false, enableHWInstructionsHelp)
+	fs.BoolVar(&args.EnablePerSampleCounters, "enable-per-sample-counters", false, enablePerSampleCountersHelp)
 	fs.BoolVar(&args.EnableBranchSampling, "enable-branch-sampling", false, enableBranchSamplingHelp)
 
 	fs.StringVar(&args.BPFFSRoot, "bpffs-root", defaultBPFFSRoot, bpffsHelp)

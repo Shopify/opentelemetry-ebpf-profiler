@@ -595,6 +595,10 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 		}
 	}
 
+	if err := coll.Variables["enable_per_sample_counters"].Set(cfg.EnablePerSampleCounters); err != nil {
+		return fmt.Errorf("failed to set enable_per_sample_counters: %v", err)
+	}
+
 	if err := setOriginIDs(coll, cfg, origins); err != nil {
 		return err
 	}
@@ -693,12 +697,39 @@ func setOriginIDs(coll *cebpf.CollectionSpec, cfg *Config, origins *originRegist
 	}
 
 	if cfg.EnableSWCPUClock {
-		if err := register("origin_id_sampling", &samples.TypeMetadata{
+		metadata := &samples.TypeMetadata{
 			PeriodType: "cpu",
 			PeriodUnit: "nanoseconds",
 			SampleType: "samples",
 			SampleUnit: "count",
-		}); err != nil {
+		}
+		if cfg.EnablePerSampleCounters {
+			metadata.DerivedProfiles = []samples.DerivedProfileMetadata{
+				{
+					ProfileType: &samples.TypeMetadata{
+						PeriodType:      "cpu",
+						PeriodUnit:      "nanoseconds",
+						SampleType:      "cycles",
+						SampleUnit:      "cycles",
+						ReportValues:    true,
+						AggregateValues: true,
+					},
+					ValueSource: samples.SampleValueSourceCyclesDelta,
+				},
+				{
+					ProfileType: &samples.TypeMetadata{
+						PeriodType:      "cpu",
+						PeriodUnit:      "nanoseconds",
+						SampleType:      "instructions",
+						SampleUnit:      "instructions",
+						ReportValues:    true,
+						AggregateValues: true,
+					},
+					ValueSource: samples.SampleValueSourceInstructionsDelta,
+				},
+			}
+		}
+		if err := register("origin_id_sampling", metadata); err != nil {
 			return err
 		}
 	}

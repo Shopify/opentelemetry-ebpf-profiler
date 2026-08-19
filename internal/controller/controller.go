@@ -112,6 +112,7 @@ func (c *Controller) Start(ctx context.Context) error {
 		EnableSWCPUClock:        c.config.EnableSWCPUClock,
 		EnableHWCPUCycles:       c.config.EnableHWCPUCycles,
 		EnableHWInstructions:    c.config.EnableHWInstructions,
+		EnablePerSampleCounters: c.config.EnablePerSampleCounters,
 		EnableBranchSampling:    c.config.EnableBranchSampling,
 	})
 	if err != nil {

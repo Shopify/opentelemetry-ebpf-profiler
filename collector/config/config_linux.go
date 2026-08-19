@@ -95,6 +95,9 @@ type Config struct {
 	// EnableHWInstructions enables hardware instructions perf events for sampling.
 	// It can run independently or concurrently with the other sampling events.
 	EnableHWInstructions bool `mapstructure:"enable_hw_instructions"`
+	// EnablePerSampleCounters reads non-sampling cycles and instructions counters
+	// on each software cpu-clock sample and exports their deltas as sibling profiles.
+	EnablePerSampleCounters bool `mapstructure:"enable_per_sample_counters"`
 	// EnableBranchSampling enables LBR for Intel/Zen 4+ or AMD BRS for older Zen.
 	// Branch sampling is optional and is only used with hardware cpu-cycles.
 	EnableBranchSampling bool `mapstructure:"enable_branch_sampling"`
@@ -155,6 +158,14 @@ func (cfg *Config) Validate() error {
 		return errors.New(
 			"invalid argument for reporter-jitter. The value " +
 				"should be in the range [0..1]. 0 disables jitter")
+	}
+
+	if cfg.EnablePerSampleCounters && !cfg.EnableSWCPUClock {
+		return errors.New("per-sample counters require software cpu-clock sampling (--enable-sw-cpu-clock)")
+	}
+
+	if cfg.EnablePerSampleCounters && (cfg.EnableHWCPUCycles || cfg.EnableHWInstructions) {
+		return errors.New("per-sample counters cannot be combined with --enable-hw-cpu-cycles or --enable-hw-instructions")
 	}
 
 	if !cfg.EnableSWCPUClock && !cfg.EnableHWCPUCycles && !cfg.EnableHWInstructions {

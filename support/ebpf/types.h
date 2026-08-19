@@ -668,6 +668,23 @@ _Static_assert(
   sizeof(LBREntry) == sizeof(struct perf_branch_entry),
   "LBREntry must match the kernel perf_branch_entry ABI size");
 
+// PerfCounterValue matches struct bpf_perf_event_value. The enabled/running
+// clocks are used to scale counters that the PMU multiplexes.
+typedef struct PerfCounterValue {
+  u64 value;
+  u64 enabled;
+  u64 running;
+} PerfCounterValue;
+
+// PerSampleCounterState is private per-CPU state used to turn cumulative perf
+// readings into deltas. A failed or first read emits no delta.
+typedef struct PerSampleCounterState {
+  PerfCounterValue cycles;
+  PerfCounterValue instructions;
+  bool cycles_valid;
+  bool instructions_valid;
+} PerSampleCounterState;
+
 // Container for a stack trace
 typedef struct Trace {
   // The process ID
@@ -701,6 +718,10 @@ typedef struct Trace {
   // value stores context-specific data that was collected with the stack.
   // e.g. time in nanoseconds for off-CPU traces
   u64 value;
+
+  // Multiplex-scaled hardware counter deltas captured on a software clock sample.
+  u64 cycles_delta;
+  u64 instructions_delta;
 
   // The CPU that captured this trace.
   u32 cpu_id;
