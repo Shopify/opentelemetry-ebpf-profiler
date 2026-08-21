@@ -14,9 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
-	"go.opentelemetry.io/ebpf-profiler/vc"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/metric"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
@@ -56,8 +54,7 @@ func (tr *traceReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.Trac
 
 func InitializeMetrics() {
 	// Initialize metrics
-	meter := otel.Meter("go.opentelemetry.io/ebpf-profiler",
-		metric.WithInstrumentationVersion(vc.Version()))
+	meter := otel.Meter("go.opentelemetry.io/ebpf-profiler")
 	metrics.Start(meter)
 
 }

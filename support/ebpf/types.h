@@ -377,6 +377,14 @@ enum {
   // number of bpf_ringbuf_output failures
   metricID_BPFRingbufOutputErr,
 
+  // number of times bpf_find_vma found no VMA for the current PC
+  metricID_UnwindNativeErrNoVMA,
+
+  // number of native-only anonymous executable VMA misses suppressed in eBPF
+  metricID_UnwindNativeErrUnsupportedAnonymousMapping,
+
+  // number of times the current PC was found in a non-executable VMA
+  metricID_UnwindNativeErrNonExecutableVMA,
   // number of cupti_events ringbuf reserve failures (GPU events dropped)
   metricID_CUPTIEventsRingbufFull,
 
@@ -994,6 +1002,9 @@ typedef struct PerCPURecord {
 
   // ratelimitAction determines the PID event rate limiting mode
   u8 ratelimitAction;
+  // usesAnonymousMappings is copied from the per-PID marker in
+  // pid_page_to_mapping_info during trace initialization.
+  bool usesAnonymousMappings;
 
   int initialUnwinder;
 } PerCPURecord;
@@ -1166,6 +1177,9 @@ typedef struct PIDPageMappingInfo {
   // bias can be negative.
   u64 bias_and_unwind_program;
 } PIDPageMappingInfo;
+
+// Stored in file_id for the per-PID dummy pid_page_to_mapping_info entry.
+#define PID_PAGE_MAPPING_INFO_FLAG_USES_ANONYMOUS_MAPPINGS (1ULL << 0)
 
 // UNKNOWN_FILE indicates for unknown files.
 #define UNKNOWN_FILE      0x0

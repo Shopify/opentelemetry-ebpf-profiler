@@ -347,5 +347,8 @@ var MetricsTranslation = []metrics.MetricID{
 	C.metricID_UnwindGoLabelsAttempts:                     metrics.IDUnwindGoLabelsAttempts,
 	C.metricID_UnwindGoLabelsFailures:                     metrics.IDUnwindGoLabelsFailures,
 	C.metricID_BPFRingbufOutputErr:                        metrics.IDBPFRingbufOutputErr,
+	C.metricID_UnwindNativeErrNoVMA:                       metrics.IDUnwindNativeErrNoVMA,
+	C.metricID_UnwindNativeErrUnsupportedAnonymousMapping: metrics.IDUnwindNativeErrUnsupportedAnonymousMapping,
+	C.metricID_UnwindNativeErrNonExecutableVMA:            metrics.IDUnwindNativeErrNonExecutableVMA,
 	C.metricID_CUPTIEventsRingbufFull:                     metrics.IDCUPTIEventsRingbufFull,
 }

@@ -56,6 +56,9 @@ func SetReporter(r MetricsReporter) {
 	reporterImpl = r
 }
 
+// Start initializes the OTel metric instruments for a predefined set of
+// metric definitions. It must be called before any goroutine begins
+// calling AddSlice or Add.
 func Start(meter metric.Meter) {
 	defs := GetDefinitions()
 	metricTypes = make(map[MetricID]MetricType, len(defs))

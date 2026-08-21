@@ -109,6 +109,14 @@ func (d *luajitData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, _ libpf
 
 func (d *luajitData) Unload(_ interpreter.EbpfHandler) {}
 
+// UsesAnonymousMappings reports that LuaJIT executes JIT-compiled traces from
+// anonymous memory. Upstream #1473 uses this to decide whether a VMA miss on an
+// anonymous mapping is a real error or an expected JIT region; without it the
+// unwinder aborts with native_no_pid_page_mapping.
+func (l *luajitInstance) UsesAnonymousMappings() bool {
+	return true
+}
+
 func (l *luajitInstance) Detach(ebpf interpreter.EbpfHandler, pid libpf.PID) error {
 	// Clear memory ranges
 	for _, prefixes := range l.prefixes {

@@ -665,75 +665,84 @@ const (
 	// Number of cache hits for the dotnet PE open/parse error LRU
 	IDDotnetPEInfoErrCacheHit = 292
 
-	// Number of successes adding native custom labels
-	IDUnwindNativeCustomLabelsAddSuccesses = 293
-
-	// Number of attempted LuaJIT unwinds
-	IDUnwindLuaJITAttempts = 294
-
-	// Number of times we didn't find an entry for this process in the LuaJIT process info array
-	IDUnwindLuaJITErrNoProcInfo = 295
-
-	// Number of attempts to read Node.js custom labels
-	IDUnwindNodeCustomLabelsAttempts = 296
-
-	// Number of successful reads of Node.js custom labels
-	IDUnwindNodeCustomLabelsSuccesses = 297
-
-	// Number of failed attempts to read Node.js custom labels
-	IDUnwindNodeCustomLabelsFailures = 298
-
-	// Number of times dlopen uprobe was fired
-	IDDlopenUprobeHits = 299
-
-	// Number of GPU timing events waiting for matching traces
-	IDCudaTimesAwaitingTraces = 300
-
-	// Number of GPU traces waiting for matching timing events
-	IDCudaTracesAwaitingTimes = 301
-
-	// Number of GPU timing entries cleared due to threshold
-	IDCudaTimesCleared = 302
-
-	// Number of GPU trace entries cleared due to threshold
-	IDCudaTracesCleared = 303
-
-	// Number of failures to read LuaJIT context pointer
-	IDUnwindLuaJITErrNoContext = 304
-
-	// Number of failures in context pointer validity check
-	IDUnwindLuaJITErrLMismatch = 305
-
 	// Number of Go custom labels dropped because the label name was empty or not valid UTF-8
-	IDGoLabelsDroppedInvalidName = 306
+	IDGoLabelsDroppedInvalidName = 293
 
 	// Number of Go custom labels dropped because the label value was not valid UTF-8
-	IDGoLabelsDroppedInvalidValue = 307
+	IDGoLabelsDroppedInvalidValue = 294
+
+	// Number of times bpf_find_vma found no VMA for the current PC
+	IDUnwindNativeErrNoVMA = 295
+
+	// Number of native-only anonymous executable VMA misses suppressed in eBPF
+	IDUnwindNativeErrUnsupportedAnonymousMapping = 296
+
+	// Number of times the current PC was found in a non-executable VMA
+	IDUnwindNativeErrNonExecutableVMA = 297
+
+	// Number of successes adding native custom labels
+	IDUnwindNativeCustomLabelsAddSuccesses = 298
+
+	// Number of attempted LuaJIT unwinds
+	IDUnwindLuaJITAttempts = 299
+
+	// Number of times we didn't find an entry for this process in the LuaJIT process info array
+	IDUnwindLuaJITErrNoProcInfo = 300
+
+	// Number of attempts to read Node.js custom labels
+	IDUnwindNodeCustomLabelsAttempts = 301
+
+	// Number of successful reads of Node.js custom labels
+	IDUnwindNodeCustomLabelsSuccesses = 302
+
+	// Number of failed attempts to read Node.js custom labels
+	IDUnwindNodeCustomLabelsFailures = 303
+
+	// Number of times dlopen uprobe was fired
+	IDDlopenUprobeHits = 304
+
+	// Number of GPU timing events waiting for matching traces
+	IDCudaTimesAwaitingTraces = 305
+
+	// Number of GPU traces waiting for matching timing events
+	IDCudaTracesAwaitingTimes = 306
+
+	// Number of GPU timing entries cleared due to threshold
+	IDCudaTimesCleared = 307
+
+	// Number of GPU trace entries cleared due to threshold
+	IDCudaTracesCleared = 308
+
+	// Number of failures to read LuaJIT context pointer
+	IDUnwindLuaJITErrNoContext = 309
+
+	// Number of failures in context pointer validity check
+	IDUnwindLuaJITErrLMismatch = 310
 
 	// Number of pending PC sample events dropped at retention-window eviction (correlation trace never arrived)
-	IDCudaPendingPCSamplesEvicted = 308
+	IDCudaPendingPCSamplesEvicted = 311
 
 	// Number of failures to get TSD base for native custom labels
-	IDUnwindNativeCustomLabelsErrReadTsdBase = 309
+	IDUnwindNativeCustomLabelsErrReadTsdBase = 312
 
 	// Number of failures to read native custom labels thread-local object
-	IDUnwindNativeCustomLabelsErrReadData = 310
+	IDUnwindNativeCustomLabelsErrReadData = 313
 
 	// Number of failures to read native custom labels key buffer
-	IDUnwindNativeCustomLabelsErrReadKey = 311
+	IDUnwindNativeCustomLabelsErrReadKey = 314
 
 	// Number of failures to read native custom labels value buffer
-	IDUnwindNativeCustomLabelsErrReadValue = 312
+	IDUnwindNativeCustomLabelsErrReadValue = 315
 
 	// Number of successful reads of native custom labels
-	IDUnwindNativeCustomLabelsReadSuccesses = 313
+	IDUnwindNativeCustomLabelsReadSuccesses = 316
 
 	// Total number of failures to add native custom labels
-	IDUnwindNativeCustomLabelsAddErrors = 314
+	IDUnwindNativeCustomLabelsAddErrors = 317
 
 	// Number of cupti_events ringbuf reserve failures (GPU events dropped)
-	IDCUPTIEventsRingbufFull = 315
+	IDCUPTIEventsRingbufFull = 318
 
 	// max number of ID values, keep this as *last entry*
-	IDMax = 316
+	IDMax = 319
 )
