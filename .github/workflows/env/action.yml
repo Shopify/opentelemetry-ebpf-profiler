@@ -8,11 +8,11 @@ runs:
       run: |
         echo "set man-db/auto-update false" | sudo debconf-communicate
         sudo dpkg-reconfigure man-db
+    - name: Configure apt
+      uses: ./.github/workflows/apt
     - name: Install build dependencies
       shell: bash
       run: |
-        # Skip translations to speed up apt-get update
-        echo 'Acquire::Languages "none";' | sudo tee /etc/apt/apt.conf.d/99no-translations > /dev/null
         # Makefile expects ARCH-linux-gnu-gcc; install if not available
         sudo apt-get update
         # systemtap-sdt-dev provides sys/sdt.h needed by support/usdt/test

@@ -1,0 +1,14 @@
+name: Configure apt for CI
+description: >
+  Skip translation index downloads. apt fetches Translation-* indexes for
+  every configured repository on each `apt-get update`; nothing in CI reads
+  them, and they are a large share of the index data each job pulls.
+
+runs:
+  using: composite
+  steps:
+    - name: Skip apt translation indexes
+      shell: bash
+      run: |
+        echo 'Acquire::Languages "none";' \
+          | sudo tee /etc/apt/apt.conf.d/99-ci-no-translations > /dev/null
