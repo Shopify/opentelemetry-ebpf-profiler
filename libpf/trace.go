@@ -127,10 +127,11 @@ func (frames *Frames) Append(frame *Frame) {
 type Trace struct {
 	CustomLabels map[String]String
 	Frames       Frames
-	// CyclesDelta and InstructionsDelta are multiplex-scaled hardware counter
-	// deltas captured on the software cpu-clock interrupt that produced this trace.
+	// Counter deltas are multiplex-scaled hardware values captured on the
+	// software cpu-clock interrupt that produced this trace.
 	CyclesDelta       uint64
 	InstructionsDelta uint64
+	BranchMissesDelta uint64
 }
 
 // EbpfTrace holds data sourced from eBPF.
@@ -146,6 +147,7 @@ type EbpfTrace struct {
 	Value             int64
 	CyclesDelta       uint64
 	InstructionsDelta uint64
+	BranchMissesDelta uint64
 	KTime             int64
 	CpuID             uint32
 	TID               PID

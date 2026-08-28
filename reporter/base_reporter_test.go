@@ -296,6 +296,14 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 		ReportValues:    true,
 		AggregateValues: true,
 	}
+	branchMissesType := &samples.TypeMetadata{
+		PeriodType:      "cpu",
+		PeriodUnit:      "nanoseconds",
+		SampleType:      "branch_misses",
+		SampleUnit:      "branch_misses",
+		ReportValues:    true,
+		AggregateValues: true,
+	}
 	clockType := &samples.TypeMetadata{
 		PeriodType: "cpu",
 		PeriodUnit: "nanoseconds",
@@ -304,6 +312,7 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 		DerivedProfiles: []samples.DerivedProfileMetadata{
 			{ProfileType: cyclesType, ValueSource: samples.SampleValueSourceCyclesDelta},
 			{ProfileType: instructionsType, ValueSource: samples.SampleValueSourceInstructionsDelta},
+			{ProfileType: branchMissesType, ValueSource: samples.SampleValueSourceBranchMissesDelta},
 		},
 	}
 
@@ -318,6 +327,7 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 		Frames:            frames,
 		CyclesDelta:       100,
 		InstructionsDelta: 40,
+		BranchMissesDelta: 7,
 	}
 	now := time.Now()
 	meta := &samples.TraceEventMeta{
@@ -332,6 +342,7 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 
 	trace.CyclesDelta = 23
 	trace.InstructionsDelta = 0
+	trace.BranchMissesDelta = 2
 	meta.Timestamp = libpf.UnixTime64(now.Add(time.Millisecond).UnixNano())
 	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
 
@@ -354,9 +365,9 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 	require.NoError(t, err)
 
 	sp := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0)
-	require.Equal(t, 3, sp.Profiles().Len())
+	require.Equal(t, 4, sp.Profiles().Len())
 	strings := profiles.Dictionary().StringTable()
-	byType := make(map[string]pprofile.Profile, 3)
+	byType := make(map[string]pprofile.Profile, 4)
 	for i := 0; i < sp.Profiles().Len(); i++ {
 		profile := sp.Profiles().At(i)
 		byType[strings.At(int(profile.SampleType().TypeStrindex()))] = profile
@@ -365,23 +376,32 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 	clock := byType["samples"]
 	cycles := byType["cycles"]
 	instructions := byType["instructions"]
+	branchMisses := byType["branch_misses"]
 	require.Equal(t, "cycles", strings.At(int(cycles.SampleType().UnitStrindex())))
 	require.Equal(t, "cpu", strings.At(int(cycles.PeriodType().TypeStrindex())))
 	require.Equal(t, "nanoseconds", strings.At(int(cycles.PeriodType().UnitStrindex())))
 	require.Equal(t, "instructions", strings.At(int(instructions.SampleType().UnitStrindex())))
 	require.Equal(t, "cpu", strings.At(int(instructions.PeriodType().TypeStrindex())))
 	require.Equal(t, "nanoseconds", strings.At(int(instructions.PeriodType().UnitStrindex())))
+	require.Equal(t, "branch_misses", strings.At(int(branchMisses.SampleType().UnitStrindex())))
+	require.Equal(t, "cpu", strings.At(int(branchMisses.PeriodType().TypeStrindex())))
+	require.Equal(t, "nanoseconds", strings.At(int(branchMisses.PeriodType().UnitStrindex())))
 	require.Equal(t, 2, clock.Samples().Len())
 	require.Equal(t, 1, cycles.Samples().Len(), "zero-cycle stack must be omitted")
 	require.Equal(t, 1, instructions.Samples().Len(), "zero-instruction stack must be omitted")
+	require.Equal(t, 1, branchMisses.Samples().Len(), "zero-branch-miss stack must be omitted")
 
 	cyclesSample := cycles.Samples().At(0)
 	instructionsSample := instructions.Samples().At(0)
+	branchMissesSample := branchMisses.Samples().At(0)
 	require.Equal(t, []int64{123}, cyclesSample.Values().AsRaw())
 	require.Equal(t, []int64{40}, instructionsSample.Values().AsRaw())
+	require.Equal(t, []int64{9}, branchMissesSample.Values().AsRaw())
 	require.Empty(t, cyclesSample.TimestampsUnixNano().AsRaw(), "summed siblings use aggregate shape")
 	require.Empty(t, instructionsSample.TimestampsUnixNano().AsRaw(), "summed siblings use aggregate shape")
+	require.Empty(t, branchMissesSample.TimestampsUnixNano().AsRaw(), "summed siblings use aggregate shape")
 	require.Equal(t, cyclesSample.StackIndex(), instructionsSample.StackIndex())
+	require.Equal(t, cyclesSample.StackIndex(), branchMissesSample.StackIndex())
 
 	sharedStack := cyclesSample.StackIndex()
 	foundClockStack := false

@@ -681,8 +681,10 @@ typedef struct PerfCounterValue {
 typedef struct PerSampleCounterState {
   PerfCounterValue cycles;
   PerfCounterValue instructions;
+  PerfCounterValue branch_misses;
   bool cycles_valid;
   bool instructions_valid;
+  bool branch_misses_valid;
 } PerSampleCounterState;
 
 // Container for a stack trace
@@ -722,6 +724,7 @@ typedef struct Trace {
   // Multiplex-scaled hardware counter deltas captured on a software clock sample.
   u64 cycles_delta;
   u64 instructions_delta;
+  u64 branch_misses_delta;
 
   // The CPU that captured this trace.
   u32 cpu_id;

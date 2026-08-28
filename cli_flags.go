@@ -96,8 +96,9 @@ var (
 		"At least one of --enable-sw-cpu-clock, --enable-hw-cpu-cycles, or --enable-hw-instructions must be enabled."
 	enablePerSampleCountersHelp = "Read cycles and instructions counters at each software cpu-clock sample and export per-stack deltas. " +
 		"Requires --enable-sw-cpu-clock and cannot be combined with hardware sampling triggers."
-	enableBranchSamplingHelp = "Enable branch sampling for supported CPUs. Requires hardware cpu-cycles."
-	probeLinkHelper          = "Attach a probe to a symbol of an executable. " +
+	perSampleExtraCountersHelp = "Comma-separated extra counters for --enable-per-sample-counters. Supported: branch-misses."
+	enableBranchSamplingHelp   = "Enable branch sampling for supported CPUs. Requires hardware cpu-cycles."
+	probeLinkHelper            = "Attach a probe to a symbol of an executable. " +
 		"Expected format: probe_type:target[:symbol]. probe_type can be kprobe, kretprobe, uprobe, or uretprobe."
 	bpffsHelp = fmt.Sprintf("Set the root BPF FS path for pinned maps. Only used for OBI span/trace ID communication. Default is %s",
 		defaultBPFFSRoot)
@@ -187,6 +188,7 @@ func parseArgs() (*controller.Config, error) {
 	fs.BoolVar(&args.EnableHWCPUCycles, "enable-hw-cpu-cycles", false, enableHWCPUCyclesHelp)
 	fs.BoolVar(&args.EnableHWInstructions, "enable-hw-instructions", false, enableHWInstructionsHelp)
 	fs.BoolVar(&args.EnablePerSampleCounters, "enable-per-sample-counters", false, enablePerSampleCountersHelp)
+	fs.StringVar(&args.PerSampleExtraCounters, "per-sample-extra-counters", "", perSampleExtraCountersHelp)
 	fs.BoolVar(&args.EnableBranchSampling, "enable-branch-sampling", false, enableBranchSamplingHelp)
 
 	fs.StringVar(&args.BPFFSRoot, "bpffs-root", defaultBPFFSRoot, bpffsHelp)

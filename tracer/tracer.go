@@ -154,6 +154,9 @@ type Tracer struct {
 	// cpu-clock samples without creating additional sampling interrupts.
 	enablePerSampleCounters bool
 
+	// enablePerSampleBranchMisses adds branch-miss deltas to per-sample counters.
+	enablePerSampleBranchMisses bool
+
 	// enableBranchSampling requests branch records for hardware cycle samples.
 	// Failure to enable branch sampling does not disable other event types.
 	enableBranchSampling bool
@@ -239,6 +242,8 @@ type Config struct {
 	EnableHWInstructions bool
 	// EnablePerSampleCounters reads cycles and instructions deltas on software cpu-clock samples.
 	EnablePerSampleCounters bool
+	// EnablePerSampleBranchMisses reads branch-miss deltas with per-sample counters.
+	EnablePerSampleBranchMisses bool
 	// EnableBranchSampling enables optional LBR/BRS capture for cycle samples.
 	EnableBranchSampling bool
 	// ProcessMetaEnrichers are optional hooks for enriching process metadata at
@@ -300,6 +305,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.EnablePerSampleCounters && (cfg.EnableHWCPUCycles || cfg.EnableHWInstructions) {
 		return errors.New("per-sample counters cannot be combined with --enable-hw-cpu-cycles or --enable-hw-instructions")
 	}
+	if cfg.EnablePerSampleBranchMisses && !cfg.EnablePerSampleCounters {
+		return errors.New("per-sample branch misses require per-sample counters")
+	}
 	if !cfg.EnableSWCPUClock && !cfg.EnableHWCPUCycles && !cfg.EnableHWInstructions {
 		return errors.New("at least one perf event type must be enabled: use --enable-sw-cpu-clock, --enable-hw-cpu-cycles, and/or --enable-hw-instructions")
 	}
@@ -358,28 +366,29 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 	perfEventList := []*perf.Event{}
 
 	tracer := &Tracer{
-		kernelSymbolizer:        kernelSymbolizer,
-		processManager:          processManager,
-		triggerPIDProcessing:    make(chan bool, 1),
-		tracePool:               newTracePool(),
-		pidEvents:               make(chan libpf.PIDTID, pidEventBufferSize),
-		ebpfMaps:                ebpfMaps,
-		ebpfProgs:               ebpfProgs,
-		hooks:                   xsync.NewRWMutex(hooksState{m: make(map[hookPoint]link.Link)}),
-		intervals:               cfg.Intervals,
-		perfEntrypoints:         xsync.NewRWMutex(perfEventList),
-		openPerfEvent:           perf.Open,
-		samplesPerSecond:        cfg.SamplesPerSecond,
-		probabilisticInterval:   cfg.ProbabilisticInterval,
-		probabilisticThreshold:  cfg.ProbabilisticThreshold,
-		enableSWCPUClock:        cfg.EnableSWCPUClock,
-		enableHWCPUCycles:       cfg.EnableHWCPUCycles,
-		enableHWInstructions:    cfg.EnableHWInstructions,
-		enablePerSampleCounters: cfg.EnablePerSampleCounters,
-		enableBranchSampling:    cfg.EnableBranchSampling,
-		done:                    make(chan libpf.Void),
-		origins:                 origins,
-		sysConfigVars:           sysConfigVars,
+		kernelSymbolizer:            kernelSymbolizer,
+		processManager:              processManager,
+		triggerPIDProcessing:        make(chan bool, 1),
+		tracePool:                   newTracePool(),
+		pidEvents:                   make(chan libpf.PIDTID, pidEventBufferSize),
+		ebpfMaps:                    ebpfMaps,
+		ebpfProgs:                   ebpfProgs,
+		hooks:                       xsync.NewRWMutex(hooksState{m: make(map[hookPoint]link.Link)}),
+		intervals:                   cfg.Intervals,
+		perfEntrypoints:             xsync.NewRWMutex(perfEventList),
+		openPerfEvent:               perf.Open,
+		samplesPerSecond:            cfg.SamplesPerSecond,
+		probabilisticInterval:       cfg.ProbabilisticInterval,
+		probabilisticThreshold:      cfg.ProbabilisticThreshold,
+		enableSWCPUClock:            cfg.EnableSWCPUClock,
+		enableHWCPUCycles:           cfg.EnableHWCPUCycles,
+		enableHWInstructions:        cfg.EnableHWInstructions,
+		enablePerSampleCounters:     cfg.EnablePerSampleCounters,
+		enablePerSampleBranchMisses: cfg.EnablePerSampleBranchMisses,
+		enableBranchSampling:        cfg.EnableBranchSampling,
+		done:                        make(chan libpf.Void),
+		origins:                     origins,
+		sysConfigVars:               sysConfigVars,
 	}
 
 	return tracer, nil
@@ -1174,6 +1183,7 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 		Value:             int64(ptr.Value),
 		CyclesDelta:       ptr.Cycles_delta,
 		InstructionsDelta: ptr.Instructions_delta,
+		BranchMissesDelta: ptr.Branch_misses_delta,
 		KTime:             int64(ptr.Ktime),
 		CpuID:             ptr.Cpu_id,
 	}
@@ -1407,16 +1417,36 @@ func (t *Tracer) attachPerfEvents(events *[]*perf.Event, cpuIDs []int,
 }
 
 const (
-	perSampleCyclesMapName       = "per_sample_cycles"
-	perSampleInstructionsMapName = "per_sample_instructions"
+	perSampleCyclesMapName         = "per_sample_cycles"
+	perSampleInstructionsMapName   = "per_sample_instructions"
+	perSampleBranchMissesMapName   = "per_sample_branch_misses"
+	perSampleCounterEnabledMapName = "per_sample_counter_enabled"
+
+	perSampleCounterBase         uint64 = 1 << 0
+	perSampleCounterBranchMisses uint64 = 1 << 1
 )
 
-// attachPerSampleCounters is intentionally best effort. Hardware PMUs are not
-// exposed on every node class; one warning is emitted for the whole attempt and
-// software-clock profiling continues with no counter siblings.
+type readableCounter struct {
+	name       string
+	configurer perfEventConfigurer
+	eventsMap  *cebpf.Map
+}
+
+type installedPerfMapEntry struct {
+	m   *cebpf.Map
+	cpu uint32
+}
+
+// attachPerSampleCounters is intentionally best effort. Base and extra counter
+// sets are independent so an unavailable opt-in event cannot remove IPC data.
 func (t *Tracer) attachPerSampleCounters(events *[]*perf.Event, cpuIDs []int) {
 	if err := t.openPerSampleCounters(events, cpuIDs); err != nil {
-		log.Warnf("Per-sample hardware counters unavailable: %v; continuing with software cpu-clock profiling", err)
+		log.Warnf("Per-sample cycles/instructions counters unavailable: %v; continuing with software cpu-clock profiling", err)
+	}
+	if t.enablePerSampleBranchMisses {
+		if err := t.openPerSampleBranchMisses(events, cpuIDs); err != nil {
+			log.Warnf("Per-sample branch-misses counter unavailable: %v; cycles/instructions and software cpu-clock profiling continue", err)
+		}
 	}
 }
 
@@ -1429,15 +1459,27 @@ func (t *Tracer) openPerSampleCounters(events *[]*perf.Event, cpuIDs []int) erro
 	if !ok {
 		return fmt.Errorf("eBPF map %q is not available", perSampleInstructionsMapName)
 	}
-
-	type readableCounter struct {
-		name       string
-		configurer perfEventConfigurer
-		eventsMap  *cebpf.Map
-	}
-	counters := [...]readableCounter{
+	return t.openPerSampleCounterSet(events, cpuIDs, "cycles and instructions", []readableCounter{
 		{name: "cpu-cycles", configurer: perf.CPUCycles, eventsMap: cyclesMap},
 		{name: "instructions", configurer: perf.Instructions, eventsMap: instructionsMap},
+	}, perSampleCounterBase)
+}
+
+func (t *Tracer) openPerSampleBranchMisses(events *[]*perf.Event, cpuIDs []int) error {
+	branchMissesMap, ok := t.ebpfMaps[perSampleBranchMissesMapName]
+	if !ok {
+		return fmt.Errorf("eBPF map %q is not available", perSampleBranchMissesMapName)
+	}
+	return t.openPerSampleCounterSet(events, cpuIDs, "branch-misses", []readableCounter{
+		{name: "branch-misses", configurer: perf.BranchMisses, eventsMap: branchMissesMap},
+	}, perSampleCounterBranchMisses)
+}
+
+func (t *Tracer) openPerSampleCounterSet(events *[]*perf.Event, cpuIDs []int, setName string,
+	counters []readableCounter, availability uint64) error {
+	enabledMap, ok := t.ebpfMaps[perSampleCounterEnabledMapName]
+	if !ok {
+		return fmt.Errorf("eBPF map %q is not available", perSampleCounterEnabledMapName)
 	}
 
 	opener := t.openPerfEvent
@@ -1446,11 +1488,7 @@ func (t *Tracer) openPerSampleCounters(events *[]*perf.Event, cpuIDs []int) erro
 	}
 
 	opened := make([]*perf.Event, 0, len(cpuIDs)*len(counters))
-	type installedEntry struct {
-		m   *cebpf.Map
-		cpu uint32
-	}
-	installed := make([]installedEntry, 0, cap(opened))
+	installed := make([]installedPerfMapEntry, 0, cap(opened))
 	cleanup := func() {
 		for _, entry := range installed {
 			_ = entry.m.Delete(entry.cpu)
@@ -1499,12 +1537,24 @@ func (t *Tracer) openPerSampleCounters(events *[]*perf.Event, cpuIDs []int) erro
 				cleanup()
 				return fmt.Errorf("install %s counter for CPU %d: %w", counter.name, cpuID, err)
 			}
-			installed = append(installed, installedEntry{m: counter.eventsMap, cpu: cpu})
+			installed = append(installed, installedPerfMapEntry{m: counter.eventsMap, cpu: cpu})
 		}
 	}
 
+	key := uint32(0)
+	var enabled uint64
+	if err := enabledMap.Lookup(key, &enabled); err != nil {
+		cleanup()
+		return fmt.Errorf("read enabled counter sets: %w", err)
+	}
+	enabled |= availability
+	if err := enabledMap.Update(key, enabled, cebpf.UpdateAny); err != nil {
+		cleanup()
+		return fmt.Errorf("enable %s BPF reads: %w", setName, err)
+	}
+
 	*events = append(*events, opened...)
-	log.Infof("Enabled per-sample cycles and instructions counters on %d CPUs", len(cpuIDs))
+	log.Infof("Enabled per-sample %s counters on %d CPUs", setName, len(cpuIDs))
 	return nil
 }
 

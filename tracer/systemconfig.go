@@ -598,6 +598,9 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 	if err := coll.Variables["enable_per_sample_counters"].Set(cfg.EnablePerSampleCounters); err != nil {
 		return fmt.Errorf("failed to set enable_per_sample_counters: %v", err)
 	}
+	if err := coll.Variables["enable_per_sample_branch_misses"].Set(cfg.EnablePerSampleBranchMisses); err != nil {
+		return fmt.Errorf("failed to set enable_per_sample_branch_misses: %v", err)
+	}
 
 	if err := setOriginIDs(coll, cfg, origins); err != nil {
 		return err
@@ -727,6 +730,19 @@ func setOriginIDs(coll *cebpf.CollectionSpec, cfg *Config, origins *originRegist
 					},
 					ValueSource: samples.SampleValueSourceInstructionsDelta,
 				},
+			}
+			if cfg.EnablePerSampleBranchMisses {
+				metadata.DerivedProfiles = append(metadata.DerivedProfiles, samples.DerivedProfileMetadata{
+					ProfileType: &samples.TypeMetadata{
+						PeriodType:      "cpu",
+						PeriodUnit:      "nanoseconds",
+						SampleType:      "branch_misses",
+						SampleUnit:      "branch_misses",
+						ReportValues:    true,
+						AggregateValues: true,
+					},
+					ValueSource: samples.SampleValueSourceBranchMissesDelta,
+				})
 			}
 		}
 		if err := register("origin_id_sampling", metadata); err != nil {

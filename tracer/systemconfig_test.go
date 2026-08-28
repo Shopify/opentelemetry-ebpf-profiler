@@ -228,9 +228,10 @@ func TestLoadBpfTraceRejectsUnregisteredOrigin(t *testing.T) {
 		tracePool: newTracePool(),
 	}
 	rawTrace := support.Trace{
-		Origin:             registered,
-		Cycles_delta:       123456,
-		Instructions_delta: 654321,
+		Origin:              registered,
+		Cycles_delta:        123456,
+		Instructions_delta:  654321,
+		Branch_misses_delta: 42,
 	}
 	raw := unsafe.Slice(
 		(*byte)(unsafe.Pointer(&rawTrace)),
@@ -242,6 +243,7 @@ func TestLoadBpfTraceRejectsUnregisteredOrigin(t *testing.T) {
 	require.Equal(t, registered, parsed.Origin)
 	require.Equal(t, uint64(123456), parsed.CyclesDelta)
 	require.Equal(t, uint64(654321), parsed.InstructionsDelta)
+	require.Equal(t, uint64(42), parsed.BranchMissesDelta)
 	tracer.tracePool.Put(parsed)
 
 	rawTrace.Origin = registered + 1 // Simulate a stale fixed origin ID.
@@ -255,7 +257,11 @@ func TestPerSampleCounterOriginMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	origins := &originRegistry{}
-	cfg := &Config{EnableSWCPUClock: true, EnablePerSampleCounters: true}
+	cfg := &Config{
+		EnableSWCPUClock:            true,
+		EnablePerSampleCounters:     true,
+		EnablePerSampleBranchMisses: true,
+	}
 	require.NoError(t, setOriginIDs(coll, cfg, origins))
 	require.Equal(t, uint32(1), origins.lastID.Load(), "derived profiles must not consume BPF origins")
 
@@ -263,7 +269,7 @@ func TestPerSampleCounterOriginMetadata(t *testing.T) {
 	require.NoError(t, coll.Variables["origin_id_sampling"].Get(&origin))
 	metadata := origins.lookup(origin)
 	require.NotNil(t, metadata)
-	require.Len(t, metadata.DerivedProfiles, 2)
+	require.Len(t, metadata.DerivedProfiles, 3)
 
 	cycles := metadata.DerivedProfiles[0]
 	require.Equal(t, samples.SampleValueSourceCyclesDelta, cycles.ValueSource)
@@ -280,13 +286,22 @@ func TestPerSampleCounterOriginMetadata(t *testing.T) {
 	require.Equal(t, samples.SampleValueSourceInstructionsDelta, instructions.ValueSource)
 	require.Equal(t, "instructions", instructions.ProfileType.SampleType)
 	require.Equal(t, "instructions", instructions.ProfileType.SampleUnit)
+
+	branchMisses := metadata.DerivedProfiles[2]
+	require.Equal(t, samples.SampleValueSourceBranchMissesDelta, branchMisses.ValueSource)
+	require.Equal(t, "branch_misses", branchMisses.ProfileType.SampleType)
+	require.Equal(t, "branch_misses", branchMisses.ProfileType.SampleUnit)
 }
 
 func TestPerSampleCounterBPFMaps(t *testing.T) {
 	coll, err := support.LoadCollectionSpec()
 	require.NoError(t, err)
 
-	for _, name := range []string{perSampleCyclesMapName, perSampleInstructionsMapName} {
+	for _, name := range []string{
+		perSampleCyclesMapName,
+		perSampleInstructionsMapName,
+		perSampleBranchMissesMapName,
+	} {
 		m := coll.Maps[name]
 		require.NotNil(t, m, name)
 		require.Equal(t, cebpf.PerfEventArray, m.Type, name)
@@ -296,9 +311,19 @@ func TestPerSampleCounterBPFMaps(t *testing.T) {
 	require.Equal(t, cebpf.PerCPUArray, state.Type)
 	require.Equal(t, uint32(1), state.MaxEntries)
 
+	enabledSets := coll.Maps[perSampleCounterEnabledMapName]
+	require.NotNil(t, enabledSets)
+	require.Equal(t, cebpf.Array, enabledSets.Type)
+	require.Equal(t, uint32(1), enabledSets.MaxEntries)
+
 	flag := coll.Variables["enable_per_sample_counters"]
 	require.NotNil(t, flag)
 	var enabled bool
 	require.NoError(t, flag.Get(&enabled))
+	require.False(t, enabled)
+
+	branchMissesFlag := coll.Variables["enable_per_sample_branch_misses"]
+	require.NotNil(t, branchMissesFlag)
+	require.NoError(t, branchMissesFlag.Get(&enabled))
 	require.False(t, enabled)
 }

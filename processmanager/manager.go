@@ -443,6 +443,7 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace, profileType *sa
 		CustomLabels:      bpfTrace.CustomLabels,
 		CyclesDelta:       bpfTrace.CyclesDelta,
 		InstructionsDelta: bpfTrace.InstructionsDelta,
+		BranchMissesDelta: bpfTrace.BranchMissesDelta,
 	}
 
 	cacheMiss := uint64(0)

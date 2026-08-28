@@ -168,6 +168,7 @@ type Trace struct {
 	Value               uint64
 	Cycles_delta        uint64
 	Instructions_delta  uint64
+	Branch_misses_delta uint64
 	Cpu_id              uint32
 	Nr_branch_records   uint32
 	Perf_branch_records [32]LBREntry
@@ -349,7 +350,7 @@ type LuaJITProcInfo struct {
 
 const (
 	Sizeof_StackDelta = 0x4
-	Sizeof_Trace      = 0x65e8
+	Sizeof_Trace      = 0x65f0
 
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4

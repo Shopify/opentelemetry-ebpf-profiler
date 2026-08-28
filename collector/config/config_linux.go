@@ -22,6 +22,8 @@ const (
 
 	minFrameCacheSize = 1024
 	maxFrameCacheSize = 1024 * 1024
+
+	perSampleExtraCounterBranchMisses = "branch-misses"
 )
 
 // ErrorMode controls how the profiler receiver handles startup errors.
@@ -98,6 +100,9 @@ type Config struct {
 	// EnablePerSampleCounters reads non-sampling cycles and instructions counters
 	// on each software cpu-clock sample and exports their deltas as sibling profiles.
 	EnablePerSampleCounters bool `mapstructure:"enable_per_sample_counters"`
+	// PerSampleExtraCounters is a comma-separated list of additional counters.
+	// Extras require EnablePerSampleCounters and degrade gracefully when unavailable.
+	PerSampleExtraCounters string `mapstructure:"per_sample_extra_counters"`
 	// EnableBranchSampling enables LBR for Intel/Zen 4+ or AMD BRS for older Zen.
 	// Branch sampling is optional and is only used with hardware cpu-cycles.
 	EnableBranchSampling bool `mapstructure:"enable_branch_sampling"`
@@ -168,6 +173,14 @@ func (cfg *Config) Validate() error {
 		return errors.New("per-sample counters cannot be combined with --enable-hw-cpu-cycles or --enable-hw-instructions")
 	}
 
+	extras, err := parsePerSampleExtraCounters(cfg.PerSampleExtraCounters)
+	if err != nil {
+		return err
+	}
+	if len(extras) != 0 && !cfg.EnablePerSampleCounters {
+		return errors.New("per-sample extra counters require --enable-per-sample-counters")
+	}
+
 	if !cfg.EnableSWCPUClock && !cfg.EnableHWCPUCycles && !cfg.EnableHWInstructions {
 		return errors.New(
 			"at least one perf event type must be enabled: " +
@@ -212,4 +225,27 @@ func (cfg *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func parsePerSampleExtraCounters(value string) (map[string]bool, error) {
+	counters := make(map[string]bool)
+	if strings.TrimSpace(value) == "" {
+		return counters, nil
+	}
+	for item := range strings.SplitSeq(value, ",") {
+		name := strings.TrimSpace(item)
+		switch name {
+		case perSampleExtraCounterBranchMisses:
+			counters[name] = true
+		default:
+			return nil, fmt.Errorf("unknown per-sample extra counter %q", name)
+		}
+	}
+	return counters, nil
+}
+
+// PerSampleBranchMissesEnabled reports whether branch misses were requested.
+func (cfg *Config) PerSampleBranchMissesEnabled() bool {
+	counters, err := parsePerSampleExtraCounters(cfg.PerSampleExtraCounters)
+	return err == nil && counters[perSampleExtraCounterBranchMisses]
 }

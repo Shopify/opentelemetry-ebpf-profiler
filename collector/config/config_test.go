@@ -171,6 +171,29 @@ func TestValidatePerSampleCountersMatrix(t *testing.T) {
 	}
 }
 
+func TestValidatePerSampleExtraCounters(t *testing.T) {
+	cfg := validConfig()
+	cfg.PerSampleExtraCounters = "   "
+	require.NoError(t, confmap.Validate(cfg))
+	require.False(t, cfg.PerSampleBranchMissesEnabled())
+
+	cfg.PerSampleExtraCounters = "branch-misses"
+	require.EqualError(t, confmap.Validate(cfg),
+		"per-sample extra counters require --enable-per-sample-counters")
+
+	cfg.EnablePerSampleCounters = true
+	require.NoError(t, confmap.Validate(cfg))
+	require.True(t, cfg.PerSampleBranchMissesEnabled())
+
+	cfg.PerSampleExtraCounters = " branch-misses,branch-misses "
+	require.NoError(t, confmap.Validate(cfg))
+	require.True(t, cfg.PerSampleBranchMissesEnabled())
+
+	cfg.PerSampleExtraCounters = "unknown"
+	require.EqualError(t, confmap.Validate(cfg),
+		"unknown per-sample extra counter \"unknown\"")
+}
+
 func TestValidateBranchSamplingRequiresCycles(t *testing.T) {
 	cfg := validConfig()
 	cfg.EnableBranchSampling = true

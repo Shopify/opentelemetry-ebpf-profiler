@@ -31,6 +31,14 @@ func TestValidatePerSampleCountersConfig(t *testing.T) {
 			},
 		},
 		{
+			name: "branch misses extra",
+			cfg: Config{
+				EnableSWCPUClock:            true,
+				EnablePerSampleCounters:     true,
+				EnablePerSampleBranchMisses: true,
+			},
+		},
+		{
 			name: "requires a software clock trigger",
 			cfg: Config{
 				EnablePerSampleCounters: true,
@@ -63,6 +71,14 @@ func TestValidatePerSampleCountersConfig(t *testing.T) {
 			},
 			wantErr: "per-sample counters cannot be combined with --enable-hw-cpu-cycles or --enable-hw-instructions",
 		},
+		{
+			name: "branch misses require per-sample counters",
+			cfg: Config{
+				EnableSWCPUClock:            true,
+				EnablePerSampleBranchMisses: true,
+			},
+			wantErr: "per-sample branch misses require per-sample counters",
+		},
 	}
 
 	for _, tt := range tests {
@@ -77,20 +93,21 @@ func TestValidatePerSampleCountersConfig(t *testing.T) {
 	}
 }
 
-func TestPerSampleCounterOpenFailureDegradesGracefully(t *testing.T) {
-	openCalls := 0
-	var openedAttr perf.Attr
-	var openedPID, openedCPU int
+func TestPerSampleCounterOpenFailuresDegradeIndependently(t *testing.T) {
+	var openedAttrs []perf.Attr
+	var openedPIDs, openedCPUs []int
 	tr := &Tracer{
 		ebpfMaps: map[string]*cebpf.Map{
-			perSampleCyclesMapName:       nil,
-			perSampleInstructionsMapName: nil,
+			perSampleCyclesMapName:         nil,
+			perSampleInstructionsMapName:   nil,
+			perSampleBranchMissesMapName:   nil,
+			perSampleCounterEnabledMapName: nil,
 		},
+		enablePerSampleBranchMisses: true,
 		openPerfEvent: func(attr *perf.Attr, pid, cpu int, _ *perf.Event) (*perf.Event, error) {
-			openCalls++
-			openedAttr = *attr
-			openedPID = pid
-			openedCPU = cpu
+			openedAttrs = append(openedAttrs, *attr)
+			openedPIDs = append(openedPIDs, pid)
+			openedCPUs = append(openedCPUs, cpu)
 			return nil, errors.New("PMU unavailable")
 		},
 	}
@@ -99,15 +116,28 @@ func TestPerSampleCounterOpenFailureDegradesGracefully(t *testing.T) {
 	events := []*perf.Event{softwareClockEvent}
 	tr.attachPerSampleCounters(&events, []int{0, 1})
 
-	require.Equal(t, 1, openCalls, "the first PMU failure should abort one aggregated attempt")
-	require.Equal(t, perf.HardwareEvent, openedAttr.Type)
-	require.Equal(t, uint64(perf.CPUCycles), openedAttr.Config)
-	require.Zero(t, openedAttr.Sample, "readable counters must not generate samples")
-	require.True(t, openedAttr.Options.Disabled)
-	require.True(t, openedAttr.CountFormat.Enabled)
-	require.True(t, openedAttr.CountFormat.Running)
-	require.Equal(t, perf.AllThreads, openedPID)
-	require.Zero(t, openedCPU)
+	require.Len(t, openedAttrs, 2, "base and opt-in counter sets should fail independently")
+	require.Equal(t, uint64(perf.CPUCycles), openedAttrs[0].Config)
+	require.Equal(t, uint64(perf.BranchMisses), openedAttrs[1].Config)
+	for _, attr := range openedAttrs {
+		require.Equal(t, perf.HardwareEvent, attr.Type)
+		require.Zero(t, attr.Sample, "readable counters must not generate samples")
+		require.True(t, attr.Options.Disabled)
+		require.True(t, attr.CountFormat.Enabled)
+		require.True(t, attr.CountFormat.Running)
+	}
+	require.Equal(t, []int{perf.AllThreads, perf.AllThreads}, openedPIDs)
+	require.Equal(t, []int{0, 0}, openedCPUs)
 	require.Equal(t, []*perf.Event{softwareClockEvent}, events,
 		"the already-attached software-clock event must remain available")
+}
+
+func TestPerSampleBranchMissesMissingMapPreservesExistingEvents(t *testing.T) {
+	tr := &Tracer{ebpfMaps: map[string]*cebpf.Map{}}
+	existing := new(perf.Event)
+	events := []*perf.Event{existing}
+
+	err := tr.openPerSampleBranchMisses(&events, []int{0})
+	require.EqualError(t, err, `eBPF map "per_sample_branch_misses" is not available`)
+	require.Equal(t, []*perf.Event{existing}, events)
 }
