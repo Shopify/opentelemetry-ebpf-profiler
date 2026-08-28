@@ -169,12 +169,16 @@ func (a *armExtractor) findG2JitBaseFromExitHandler(
 		}
 		if i.Op == arm64asm.STR {
 			mem, ok := i.Args[1].(arm64asm.MemImmediate)
-			imm, immOK := arm.DecodeImmediate(mem)
-			if ok && immOK && imm > 0 && i.Args[0] == arm64asm.XZR {
-				disp := libpf.Address(imm)
-				if disp > curLOffset && disp <= curLOffset+0x18 {
-					return disp, nil
-				}
+			if !ok || i.Args[0] != arm64asm.XZR {
+				continue
+			}
+			imm, ok := arm.DecodeImmediate(mem)
+			if !ok || imm <= 0 {
+				continue
+			}
+			disp := libpf.Address(imm)
+			if disp > curLOffset && disp <= curLOffset+0x18 {
+				return disp, nil
 			}
 		}
 	}

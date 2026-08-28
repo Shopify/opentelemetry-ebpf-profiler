@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	testcontainers "github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/testutils"
@@ -151,11 +152,14 @@ func TestIntegration(t *testing.T) {
 // Find lua traces and test that they are good
 func validateTrace(t *testing.T, trc *tracer.Tracer, trace *libpf.Trace,
 	st []string) bool {
+	t.Helper()
 
 	return validateFrames(t, trace.Frames, st)
 }
 
 func validateFrames(t *testing.T, frames libpf.Frames, st []string) bool {
+	t.Helper()
+
 	j := len(frames) - 1
 outer:
 	for _, s := range st {
@@ -184,6 +188,8 @@ outer:
 }
 
 func startContainer(ctx context.Context, t *testing.T, image string) testcontainers.Container {
+	t.Helper()
+
 	t.Log("starting", image)
 	// The offset tests load both platform images so docker gets confused if we don't specify
 	var platform string
@@ -220,6 +226,8 @@ func startContainer(ctx context.Context, t *testing.T, image string) testcontain
 
 func makeRequests(ctx context.Context, t *testing.T, wg *sync.WaitGroup,
 	res, h string, p network.Port) {
+	t.Helper()
+
 	wg.Add(1)
 	numRequests := 0
 	tick := time.NewTicker(5 * time.Second)
