@@ -154,25 +154,29 @@ type LBREntry struct {
 	Flags uint64
 }
 type Trace struct {
-	Pid                 uint32
-	Tid                 uint32
-	Ktime               uint64
-	Comm                [16]uint8
-	Apm_transaction_id  [8]byte
-	Apm_trace_id        [16]byte
-	Custom_labels       CustomLabelsArray
-	Frame_data_len      uint16
-	Num_frames          uint16
-	Num_kernel_frames   uint16
-	Origin              uint16
-	Value               uint64
-	Cycles_delta        uint64
-	Instructions_delta  uint64
-	Branch_misses_delta uint64
-	Cpu_id              uint32
-	Nr_branch_records   uint32
-	Perf_branch_records [32]LBREntry
-	Frame_data          [3072]uint64
+	Pid                    uint32
+	Tid                    uint32
+	Ktime                  uint64
+	Comm                   [16]uint8
+	Apm_transaction_id     [8]byte
+	Apm_trace_id           [16]byte
+	Custom_labels          CustomLabelsArray
+	Frame_data_len         uint16
+	Num_frames             uint16
+	Num_kernel_frames      uint16
+	Origin                 uint16
+	Value                  uint64
+	Cycles_delta           uint64
+	Instructions_delta     uint64
+	Branch_misses_delta    uint64
+	Topdown_retiring_delta uint64
+	Topdown_bad_spec_delta uint64
+	Topdown_fe_bound_delta uint64
+	Topdown_be_bound_delta uint64
+	Cpu_id                 uint32
+	Nr_branch_records      uint32
+	Perf_branch_records    [32]LBREntry
+	Frame_data             [3072]uint64
 }
 
 const MaxBranchRecords = 0x20
@@ -350,7 +354,7 @@ type LuaJITProcInfo struct {
 
 const (
 	Sizeof_StackDelta = 0x4
-	Sizeof_Trace      = 0x65f0
+	Sizeof_Trace      = 0x6610
 
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4

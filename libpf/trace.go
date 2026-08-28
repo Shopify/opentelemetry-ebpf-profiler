@@ -129,9 +129,13 @@ type Trace struct {
 	Frames       Frames
 	// Counter deltas are multiplex-scaled hardware values captured on the
 	// software cpu-clock interrupt that produced this trace.
-	CyclesDelta       uint64
-	InstructionsDelta uint64
-	BranchMissesDelta uint64
+	CyclesDelta          uint64
+	InstructionsDelta    uint64
+	BranchMissesDelta    uint64
+	TopdownRetiringDelta uint64
+	TopdownBadSpecDelta  uint64
+	TopdownFEBoundDelta  uint64
+	TopdownBEBoundDelta  uint64
 }
 
 // EbpfTrace holds data sourced from eBPF.
@@ -142,21 +146,25 @@ type EbpfTrace struct {
 	FrameDataBuf [3072]uint64
 	// LBR holds the branch records (Intel LBR / AMD LbrExtV2 / AMD BRS) captured
 	// for this trace, backed by LBRBuf. Empty for samples without branch sampling.
-	LBR               []support.LBREntry
-	LBRBuf            [support.MaxBranchRecords]support.LBREntry
-	Value             int64
-	CyclesDelta       uint64
-	InstructionsDelta uint64
-	BranchMissesDelta uint64
-	KTime             int64
-	CpuID             uint32
-	TID               PID
-	PID               PID
-	NumFrames         uint16
-	NumKernelFrames   uint16
-	Origin            uint16
-	APMTraceID        APMTraceID
-	APMTransactionID  APMTransactionID
+	LBR                  []support.LBREntry
+	LBRBuf               [support.MaxBranchRecords]support.LBREntry
+	Value                int64
+	CyclesDelta          uint64
+	InstructionsDelta    uint64
+	BranchMissesDelta    uint64
+	TopdownRetiringDelta uint64
+	TopdownBadSpecDelta  uint64
+	TopdownFEBoundDelta  uint64
+	TopdownBEBoundDelta  uint64
+	KTime                int64
+	CpuID                uint32
+	TID                  PID
+	PID                  PID
+	NumFrames            uint16
+	NumKernelFrames      uint16
+	Origin               uint16
+	APMTraceID           APMTraceID
+	APMTransactionID     APMTransactionID
 }
 
 type EbpfFrame []uint64

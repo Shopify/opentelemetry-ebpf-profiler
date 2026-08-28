@@ -280,30 +280,23 @@ func TestProcessMetaEnricherPipeline(t *testing.T) {
 }
 
 func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
-	cyclesType := &samples.TypeMetadata{
-		PeriodType:      "cpu",
-		PeriodUnit:      "nanoseconds",
-		SampleType:      "cycles",
-		SampleUnit:      "cycles",
-		ReportValues:    true,
-		AggregateValues: true,
+	counterType := func(name, unit string) *samples.TypeMetadata {
+		return &samples.TypeMetadata{
+			PeriodType:      "cpu",
+			PeriodUnit:      "nanoseconds",
+			SampleType:      name,
+			SampleUnit:      unit,
+			ReportValues:    true,
+			AggregateValues: true,
+		}
 	}
-	instructionsType := &samples.TypeMetadata{
-		PeriodType:      "cpu",
-		PeriodUnit:      "nanoseconds",
-		SampleType:      "instructions",
-		SampleUnit:      "instructions",
-		ReportValues:    true,
-		AggregateValues: true,
-	}
-	branchMissesType := &samples.TypeMetadata{
-		PeriodType:      "cpu",
-		PeriodUnit:      "nanoseconds",
-		SampleType:      "branch_misses",
-		SampleUnit:      "branch_misses",
-		ReportValues:    true,
-		AggregateValues: true,
-	}
+	cyclesType := counterType("cycles", "cycles")
+	instructionsType := counterType("instructions", "instructions")
+	branchMissesType := counterType("branch_misses", "branch_misses")
+	topdownRetiringType := counterType("topdown_retiring", "slots")
+	topdownBadSpecType := counterType("topdown_bad_spec", "slots")
+	topdownFEBoundType := counterType("topdown_fe_bound", "slots")
+	topdownBEBoundType := counterType("topdown_be_bound", "slots")
 	clockType := &samples.TypeMetadata{
 		PeriodType: "cpu",
 		PeriodUnit: "nanoseconds",
@@ -313,6 +306,10 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 			{ProfileType: cyclesType, ValueSource: samples.SampleValueSourceCyclesDelta},
 			{ProfileType: instructionsType, ValueSource: samples.SampleValueSourceInstructionsDelta},
 			{ProfileType: branchMissesType, ValueSource: samples.SampleValueSourceBranchMissesDelta},
+			{ProfileType: topdownRetiringType, ValueSource: samples.SampleValueSourceTopdownRetiringDelta},
+			{ProfileType: topdownBadSpecType, ValueSource: samples.SampleValueSourceTopdownBadSpecDelta},
+			{ProfileType: topdownFEBoundType, ValueSource: samples.SampleValueSourceTopdownFEBoundDelta},
+			{ProfileType: topdownBEBoundType, ValueSource: samples.SampleValueSourceTopdownBEBoundDelta},
 		},
 	}
 
@@ -324,10 +321,14 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 		FunctionName:    libpf.Intern("work"),
 	})
 	trace := &libpf.Trace{
-		Frames:            frames,
-		CyclesDelta:       100,
-		InstructionsDelta: 40,
-		BranchMissesDelta: 7,
+		Frames:               frames,
+		CyclesDelta:          100,
+		InstructionsDelta:    40,
+		BranchMissesDelta:    7,
+		TopdownRetiringDelta: 300,
+		TopdownBadSpecDelta:  100,
+		TopdownFEBoundDelta:  250,
+		TopdownBEBoundDelta:  350,
 	}
 	now := time.Now()
 	meta := &samples.TraceEventMeta{
@@ -343,6 +344,10 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 	trace.CyclesDelta = 23
 	trace.InstructionsDelta = 0
 	trace.BranchMissesDelta = 2
+	trace.TopdownRetiringDelta = 30
+	trace.TopdownBadSpecDelta = 20
+	trace.TopdownFEBoundDelta = 50
+	trace.TopdownBEBoundDelta = 100
 	meta.Timestamp = libpf.UnixTime64(now.Add(time.Millisecond).UnixNano())
 	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
 
@@ -365,9 +370,9 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 	require.NoError(t, err)
 
 	sp := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0)
-	require.Equal(t, 4, sp.Profiles().Len())
+	require.Equal(t, 8, sp.Profiles().Len())
 	strings := profiles.Dictionary().StringTable()
-	byType := make(map[string]pprofile.Profile, 4)
+	byType := make(map[string]pprofile.Profile, 8)
 	for i := 0; i < sp.Profiles().Len(); i++ {
 		profile := sp.Profiles().At(i)
 		byType[strings.At(int(profile.SampleType().TypeStrindex()))] = profile
@@ -402,6 +407,24 @@ func TestPerSampleCounterSiblingsShareStackAndSumDeltas(t *testing.T) {
 	require.Empty(t, branchMissesSample.TimestampsUnixNano().AsRaw(), "summed siblings use aggregate shape")
 	require.Equal(t, cyclesSample.StackIndex(), instructionsSample.StackIndex())
 	require.Equal(t, cyclesSample.StackIndex(), branchMissesSample.StackIndex())
+
+	for profileName, total := range map[string]int64{
+		"topdown_retiring": 330,
+		"topdown_bad_spec": 120,
+		"topdown_fe_bound": 300,
+		"topdown_be_bound": 450,
+	} {
+		profile, ok := byType[profileName]
+		require.True(t, ok, profileName)
+		require.Equal(t, "slots", strings.At(int(profile.SampleType().UnitStrindex())))
+		require.Equal(t, "cpu", strings.At(int(profile.PeriodType().TypeStrindex())))
+		require.Equal(t, "nanoseconds", strings.At(int(profile.PeriodType().UnitStrindex())))
+		require.Equal(t, 1, profile.Samples().Len(), profileName)
+		sample := profile.Samples().At(0)
+		require.Equal(t, []int64{total}, sample.Values().AsRaw(), profileName)
+		require.Empty(t, sample.TimestampsUnixNano().AsRaw(), profileName)
+		require.Equal(t, cyclesSample.StackIndex(), sample.StackIndex(), profileName)
+	}
 
 	sharedStack := cyclesSample.StackIndex()
 	foundClockStack := false

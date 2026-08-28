@@ -24,6 +24,7 @@ const (
 	maxFrameCacheSize = 1024 * 1024
 
 	perSampleExtraCounterBranchMisses = "branch-misses"
+	perSampleExtraCounterTopdown      = "topdown"
 )
 
 // ErrorMode controls how the profiler receiver handles startup errors.
@@ -235,7 +236,7 @@ func parsePerSampleExtraCounters(value string) (map[string]bool, error) {
 	for item := range strings.SplitSeq(value, ",") {
 		name := strings.TrimSpace(item)
 		switch name {
-		case perSampleExtraCounterBranchMisses:
+		case perSampleExtraCounterBranchMisses, perSampleExtraCounterTopdown:
 			counters[name] = true
 		default:
 			return nil, fmt.Errorf("unknown per-sample extra counter %q", name)
@@ -248,4 +249,10 @@ func parsePerSampleExtraCounters(value string) (map[string]bool, error) {
 func (cfg *Config) PerSampleBranchMissesEnabled() bool {
 	counters, err := parsePerSampleExtraCounters(cfg.PerSampleExtraCounters)
 	return err == nil && counters[perSampleExtraCounterBranchMisses]
+}
+
+// PerSampleTopdownEnabled reports whether Intel Top-Down counters were requested.
+func (cfg *Config) PerSampleTopdownEnabled() bool {
+	counters, err := parsePerSampleExtraCounters(cfg.PerSampleExtraCounters)
+	return err == nil && counters[perSampleExtraCounterTopdown]
 }

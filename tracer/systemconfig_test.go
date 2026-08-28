@@ -228,10 +228,14 @@ func TestLoadBpfTraceRejectsUnregisteredOrigin(t *testing.T) {
 		tracePool: newTracePool(),
 	}
 	rawTrace := support.Trace{
-		Origin:              registered,
-		Cycles_delta:        123456,
-		Instructions_delta:  654321,
-		Branch_misses_delta: 42,
+		Origin:                 registered,
+		Cycles_delta:           123456,
+		Instructions_delta:     654321,
+		Branch_misses_delta:    42,
+		Topdown_retiring_delta: 300,
+		Topdown_bad_spec_delta: 100,
+		Topdown_fe_bound_delta: 250,
+		Topdown_be_bound_delta: 350,
 	}
 	raw := unsafe.Slice(
 		(*byte)(unsafe.Pointer(&rawTrace)),
@@ -244,6 +248,10 @@ func TestLoadBpfTraceRejectsUnregisteredOrigin(t *testing.T) {
 	require.Equal(t, uint64(123456), parsed.CyclesDelta)
 	require.Equal(t, uint64(654321), parsed.InstructionsDelta)
 	require.Equal(t, uint64(42), parsed.BranchMissesDelta)
+	require.Equal(t, uint64(300), parsed.TopdownRetiringDelta)
+	require.Equal(t, uint64(100), parsed.TopdownBadSpecDelta)
+	require.Equal(t, uint64(250), parsed.TopdownFEBoundDelta)
+	require.Equal(t, uint64(350), parsed.TopdownBEBoundDelta)
 	tracer.tracePool.Put(parsed)
 
 	rawTrace.Origin = registered + 1 // Simulate a stale fixed origin ID.
@@ -261,6 +269,7 @@ func TestPerSampleCounterOriginMetadata(t *testing.T) {
 		EnableSWCPUClock:            true,
 		EnablePerSampleCounters:     true,
 		EnablePerSampleBranchMisses: true,
+		EnablePerSampleTopdown:      true,
 	}
 	require.NoError(t, setOriginIDs(coll, cfg, origins))
 	require.Equal(t, uint32(1), origins.lastID.Load(), "derived profiles must not consume BPF origins")
@@ -269,7 +278,7 @@ func TestPerSampleCounterOriginMetadata(t *testing.T) {
 	require.NoError(t, coll.Variables["origin_id_sampling"].Get(&origin))
 	metadata := origins.lookup(origin)
 	require.NotNil(t, metadata)
-	require.Len(t, metadata.DerivedProfiles, 3)
+	require.Len(t, metadata.DerivedProfiles, 7)
 
 	cycles := metadata.DerivedProfiles[0]
 	require.Equal(t, samples.SampleValueSourceCyclesDelta, cycles.ValueSource)
@@ -291,6 +300,39 @@ func TestPerSampleCounterOriginMetadata(t *testing.T) {
 	require.Equal(t, samples.SampleValueSourceBranchMissesDelta, branchMisses.ValueSource)
 	require.Equal(t, "branch_misses", branchMisses.ProfileType.SampleType)
 	require.Equal(t, "branch_misses", branchMisses.ProfileType.SampleUnit)
+
+	topdown := []struct {
+		name   string
+		source samples.SampleValueSource
+	}{
+		{name: "topdown_retiring", source: samples.SampleValueSourceTopdownRetiringDelta},
+		{name: "topdown_bad_spec", source: samples.SampleValueSourceTopdownBadSpecDelta},
+		{name: "topdown_fe_bound", source: samples.SampleValueSourceTopdownFEBoundDelta},
+		{name: "topdown_be_bound", source: samples.SampleValueSourceTopdownBEBoundDelta},
+	}
+	for index, expected := range topdown {
+		profile := metadata.DerivedProfiles[index+3]
+		require.Equal(t, expected.source, profile.ValueSource)
+		require.Equal(t, expected.name, profile.ProfileType.SampleType)
+		require.Equal(t, "slots", profile.ProfileType.SampleUnit)
+	}
+}
+
+func TestPerSampleCounterOriginMetadataDefaultsToIPC(t *testing.T) {
+	coll, err := support.LoadCollectionSpec()
+	require.NoError(t, err)
+
+	origins := &originRegistry{}
+	cfg := &Config{EnableSWCPUClock: true, EnablePerSampleCounters: true}
+	require.NoError(t, setOriginIDs(coll, cfg, origins))
+
+	var origin uint16
+	require.NoError(t, coll.Variables["origin_id_sampling"].Get(&origin))
+	metadata := origins.lookup(origin)
+	require.NotNil(t, metadata)
+	require.Len(t, metadata.DerivedProfiles, 2)
+	require.Equal(t, "cycles", metadata.DerivedProfiles[0].ProfileType.SampleType)
+	require.Equal(t, "instructions", metadata.DerivedProfiles[1].ProfileType.SampleType)
 }
 
 func TestPerSampleCounterBPFMaps(t *testing.T) {
@@ -301,6 +343,11 @@ func TestPerSampleCounterBPFMaps(t *testing.T) {
 		perSampleCyclesMapName,
 		perSampleInstructionsMapName,
 		perSampleBranchMissesMapName,
+		perSampleTopdownSlotsMapName,
+		perSampleTopdownRetiringMapName,
+		perSampleTopdownBadSpecMapName,
+		perSampleTopdownFEBoundMapName,
+		perSampleTopdownBEBoundMapName,
 	} {
 		m := coll.Maps[name]
 		require.NotNil(t, m, name)
@@ -316,6 +363,11 @@ func TestPerSampleCounterBPFMaps(t *testing.T) {
 	require.Equal(t, cebpf.Array, enabledSets.Type)
 	require.Equal(t, uint32(1), enabledSets.MaxEntries)
 
+	failures := coll.Maps[perSampleCounterFailuresMapName]
+	require.NotNil(t, failures)
+	require.Equal(t, cebpf.PerCPUArray, failures.Type)
+	require.Equal(t, uint32(1), failures.MaxEntries)
+
 	flag := coll.Variables["enable_per_sample_counters"]
 	require.NotNil(t, flag)
 	var enabled bool
@@ -325,5 +377,10 @@ func TestPerSampleCounterBPFMaps(t *testing.T) {
 	branchMissesFlag := coll.Variables["enable_per_sample_branch_misses"]
 	require.NotNil(t, branchMissesFlag)
 	require.NoError(t, branchMissesFlag.Get(&enabled))
+	require.False(t, enabled)
+
+	topdownFlag := coll.Variables["enable_per_sample_topdown"]
+	require.NotNil(t, topdownFlag)
+	require.NoError(t, topdownFlag.Get(&enabled))
 	require.False(t, enabled)
 }

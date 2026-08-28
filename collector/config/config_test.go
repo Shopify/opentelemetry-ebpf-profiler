@@ -176,6 +176,7 @@ func TestValidatePerSampleExtraCounters(t *testing.T) {
 	cfg.PerSampleExtraCounters = "   "
 	require.NoError(t, confmap.Validate(cfg))
 	require.False(t, cfg.PerSampleBranchMissesEnabled())
+	require.False(t, cfg.PerSampleTopdownEnabled())
 
 	cfg.PerSampleExtraCounters = "branch-misses"
 	require.EqualError(t, confmap.Validate(cfg),
@@ -185,9 +186,10 @@ func TestValidatePerSampleExtraCounters(t *testing.T) {
 	require.NoError(t, confmap.Validate(cfg))
 	require.True(t, cfg.PerSampleBranchMissesEnabled())
 
-	cfg.PerSampleExtraCounters = " branch-misses,branch-misses "
+	cfg.PerSampleExtraCounters = " branch-misses,topdown,branch-misses "
 	require.NoError(t, confmap.Validate(cfg))
 	require.True(t, cfg.PerSampleBranchMissesEnabled())
+	require.True(t, cfg.PerSampleTopdownEnabled())
 
 	cfg.PerSampleExtraCounters = "unknown"
 	require.EqualError(t, confmap.Validate(cfg),

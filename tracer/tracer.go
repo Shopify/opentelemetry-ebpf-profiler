@@ -157,6 +157,14 @@ type Tracer struct {
 	// enablePerSampleBranchMisses adds branch-miss deltas to per-sample counters.
 	enablePerSampleBranchMisses bool
 
+	// enablePerSampleTopdown adds Intel Top-Down slot/category deltas.
+	enablePerSampleTopdown bool
+
+	// perfEventSysfsRoot is replaceable by tests for PMU alias discovery.
+	perfEventSysfsRoot string
+
+	topdownReadFailureLogged atomic.Bool
+
 	// enableBranchSampling requests branch records for hardware cycle samples.
 	// Failure to enable branch sampling does not disable other event types.
 	enableBranchSampling bool
@@ -244,6 +252,8 @@ type Config struct {
 	EnablePerSampleCounters bool
 	// EnablePerSampleBranchMisses reads branch-miss deltas with per-sample counters.
 	EnablePerSampleBranchMisses bool
+	// EnablePerSampleTopdown reads Intel Top-Down slot/category deltas.
+	EnablePerSampleTopdown bool
 	// EnableBranchSampling enables optional LBR/BRS capture for cycle samples.
 	EnableBranchSampling bool
 	// ProcessMetaEnrichers are optional hooks for enriching process metadata at
@@ -307,6 +317,9 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.EnablePerSampleBranchMisses && !cfg.EnablePerSampleCounters {
 		return errors.New("per-sample branch misses require per-sample counters")
+	}
+	if cfg.EnablePerSampleTopdown && !cfg.EnablePerSampleCounters {
+		return errors.New("per-sample topdown counters require per-sample counters")
 	}
 	if !cfg.EnableSWCPUClock && !cfg.EnableHWCPUCycles && !cfg.EnableHWInstructions {
 		return errors.New("at least one perf event type must be enabled: use --enable-sw-cpu-clock, --enable-hw-cpu-cycles, and/or --enable-hw-instructions")
@@ -385,6 +398,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		enableHWInstructions:        cfg.EnableHWInstructions,
 		enablePerSampleCounters:     cfg.EnablePerSampleCounters,
 		enablePerSampleBranchMisses: cfg.EnablePerSampleBranchMisses,
+		enablePerSampleTopdown:      cfg.EnablePerSampleTopdown,
 		enableBranchSampling:        cfg.EnableBranchSampling,
 		done:                        make(chan libpf.Void),
 		origins:                     origins,
@@ -1148,6 +1162,27 @@ func (t *Tracer) eBPFMetricsCollector(
 	return metricsUpdates
 }
 
+func (t *Tracer) logPerSampleCounterReadFailures() {
+	failuresMap, ok := t.ebpfMaps[perSampleCounterFailuresMapName]
+	if !ok {
+		return
+	}
+	key := uint32(0)
+	var perCPU []uint64
+	if err := failuresMap.Lookup(key, &perCPU); err != nil {
+		log.Debugf("Failed to inspect per-sample counter read status: %v", err)
+		return
+	}
+	var failures uint64
+	for _, value := range perCPU {
+		failures |= value
+	}
+	if failures&perSampleFailureTopdown != 0 &&
+		t.topdownReadFailureLogged.CompareAndSwap(false, true) {
+		log.Warn("Per-sample Top-Down PERF_METRICS members are not readable from BPF; disabling Top-Down on affected CPUs while branch-misses and cycles/instructions continue")
+	}
+}
+
 // Various bpf trace handling related errors:
 var (
 	errRecordTooSmall       = errors.New("trace record too small")
@@ -1174,18 +1209,22 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 
 	trace := t.tracePool.Get().(*libpf.EbpfTrace)
 	*trace = libpf.EbpfTrace{
-		Comm:              libpf.NewComm(ptr.Comm),
-		APMTraceID:        *(*libpf.APMTraceID)(unsafe.Pointer(&ptr.Apm_trace_id)),
-		APMTransactionID:  *(*libpf.APMTransactionID)(unsafe.Pointer(&ptr.Apm_transaction_id)),
-		PID:               libpf.PID(ptr.Pid),
-		TID:               libpf.PID(ptr.Tid),
-		Origin:            ptr.Origin,
-		Value:             int64(ptr.Value),
-		CyclesDelta:       ptr.Cycles_delta,
-		InstructionsDelta: ptr.Instructions_delta,
-		BranchMissesDelta: ptr.Branch_misses_delta,
-		KTime:             int64(ptr.Ktime),
-		CpuID:             ptr.Cpu_id,
+		Comm:                 libpf.NewComm(ptr.Comm),
+		APMTraceID:           *(*libpf.APMTraceID)(unsafe.Pointer(&ptr.Apm_trace_id)),
+		APMTransactionID:     *(*libpf.APMTransactionID)(unsafe.Pointer(&ptr.Apm_transaction_id)),
+		PID:                  libpf.PID(ptr.Pid),
+		TID:                  libpf.PID(ptr.Tid),
+		Origin:               ptr.Origin,
+		Value:                int64(ptr.Value),
+		CyclesDelta:          ptr.Cycles_delta,
+		InstructionsDelta:    ptr.Instructions_delta,
+		BranchMissesDelta:    ptr.Branch_misses_delta,
+		TopdownRetiringDelta: ptr.Topdown_retiring_delta,
+		TopdownBadSpecDelta:  ptr.Topdown_bad_spec_delta,
+		TopdownFEBoundDelta:  ptr.Topdown_fe_bound_delta,
+		TopdownBEBoundDelta:  ptr.Topdown_be_bound_delta,
+		KTime:                int64(ptr.Ktime),
+		CpuID:                ptr.Cpu_id,
 	}
 
 	if t.origins.lookup(trace.Origin) == nil {
@@ -1287,6 +1326,7 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *libp
 		metrics.AddSlice(traceEventMetricCollector())
 		metrics.AddSlice(t.eBPFMetricsCollector(translateIDs, previousMetricValue))
 		metrics.AddSlice(t.customLabels.getAndResetMetrics())
+		t.logPerSampleCounterReadFailures()
 	})
 
 	return nil
@@ -1366,7 +1406,10 @@ func (t *Tracer) AttachTracer(targetCPUs []int) error {
 	}
 
 	if t.enablePerSampleCounters && swCPUClockAttached {
-		t.attachPerSampleCounters(events, targetCPUs)
+		var counterEvents []*perf.Event
+		t.attachPerSampleCounters(&counterEvents, targetCPUs)
+		// Enable readable counters before the software-clock interrupt source.
+		*events = append(counterEvents, *events...)
 	}
 
 	if len(*events) == 0 {
@@ -1417,13 +1460,22 @@ func (t *Tracer) attachPerfEvents(events *[]*perf.Event, cpuIDs []int,
 }
 
 const (
-	perSampleCyclesMapName         = "per_sample_cycles"
-	perSampleInstructionsMapName   = "per_sample_instructions"
-	perSampleBranchMissesMapName   = "per_sample_branch_misses"
-	perSampleCounterEnabledMapName = "per_sample_counter_enabled"
+	perSampleCyclesMapName          = "per_sample_cycles"
+	perSampleInstructionsMapName    = "per_sample_instructions"
+	perSampleBranchMissesMapName    = "per_sample_branch_misses"
+	perSampleTopdownSlotsMapName    = "per_sample_topdown_slots"
+	perSampleTopdownRetiringMapName = "per_sample_topdown_retiring"
+	perSampleTopdownBadSpecMapName  = "per_sample_topdown_bad_spec"
+	perSampleTopdownFEBoundMapName  = "per_sample_topdown_fe_bound"
+	perSampleTopdownBEBoundMapName  = "per_sample_topdown_be_bound"
+	perSampleCounterEnabledMapName  = "per_sample_counter_enabled"
+	perSampleCounterFailuresMapName = "per_sample_counter_failures"
 
 	perSampleCounterBase         uint64 = 1 << 0
 	perSampleCounterBranchMisses uint64 = 1 << 1
+	perSampleCounterTopdown      uint64 = 1 << 2
+
+	perSampleFailureTopdown uint64 = 1 << 0
 )
 
 type readableCounter struct {
@@ -1446,6 +1498,11 @@ func (t *Tracer) attachPerSampleCounters(events *[]*perf.Event, cpuIDs []int) {
 	if t.enablePerSampleBranchMisses {
 		if err := t.openPerSampleBranchMisses(events, cpuIDs); err != nil {
 			log.Warnf("Per-sample branch-misses counter unavailable: %v; cycles/instructions and software cpu-clock profiling continue", err)
+		}
+	}
+	if t.enablePerSampleTopdown {
+		if err := t.openPerSampleTopdown(events, cpuIDs); err != nil {
+			log.Warnf("Per-sample Top-Down counters unavailable: %v; other per-sample counters and software cpu-clock profiling continue", err)
 		}
 	}
 }
@@ -1473,6 +1530,153 @@ func (t *Tracer) openPerSampleBranchMisses(events *[]*perf.Event, cpuIDs []int) 
 	return t.openPerSampleCounterSet(events, cpuIDs, "branch-misses", []readableCounter{
 		{name: "branch-misses", configurer: perf.BranchMisses, eventsMap: branchMissesMap},
 	}, perSampleCounterBranchMisses)
+}
+
+var perSampleTopdownCounterMaps = [...]struct {
+	eventName string
+	mapName   string
+}{
+	{eventName: "slots", mapName: perSampleTopdownSlotsMapName},
+	{eventName: "topdown-retiring", mapName: perSampleTopdownRetiringMapName},
+	{eventName: "topdown-bad-spec", mapName: perSampleTopdownBadSpecMapName},
+	{eventName: "topdown-fe-bound", mapName: perSampleTopdownFEBoundMapName},
+	{eventName: "topdown-be-bound", mapName: perSampleTopdownBEBoundMapName},
+}
+
+func (t *Tracer) openPerSampleTopdown(events *[]*perf.Event, cpuIDs []int) error {
+	enabledMap, ok := t.ebpfMaps[perSampleCounterEnabledMapName]
+	if !ok {
+		return fmt.Errorf("eBPF map %q is not available", perSampleCounterEnabledMapName)
+	}
+
+	root := t.perfEventSysfsRoot
+	if root == "" {
+		root = defaultPerfEventSysfsRoot
+	}
+	type topdownCounter struct {
+		name      string
+		attr      *perf.Attr
+		eventsMap *cebpf.Map
+	}
+	counters := make([]topdownCounter, 0, len(perSampleTopdownCounterMaps))
+	for _, counter := range perSampleTopdownCounterMaps {
+		eventsMap, exists := t.ebpfMaps[counter.mapName]
+		if !exists {
+			return fmt.Errorf("eBPF map %q is not available", counter.mapName)
+		}
+		attr, err := readPerfEventAttr(root, counter.eventName)
+		if err != nil {
+			return err
+		}
+		counters = append(counters, topdownCounter{
+			name: counter.eventName, attr: attr, eventsMap: eventsMap,
+		})
+	}
+
+	opener := t.openPerfEvent
+	if opener == nil {
+		opener = perf.Open
+	}
+	allOpened := make([]*perf.Event, 0, len(cpuIDs)*len(counters))
+	lifecycleOrder := make([]*perf.Event, 0, cap(allOpened))
+	installed := make([]installedPerfMapEntry, 0, cap(allOpened))
+	cleanup := func() {
+		for _, entry := range installed {
+			_ = entry.m.Delete(entry.cpu)
+		}
+		terminatePerfEvents(allOpened)
+	}
+
+	for _, cpuID := range cpuIDs {
+		group := make([]*perf.Event, 0, len(counters))
+		var leader *perf.Event
+		for index, counter := range counters {
+			attr := *counter.attr
+			attr.Options.Disabled = true
+			attr.CountFormat.Enabled = true
+			attr.CountFormat.Running = true
+			if index > 0 {
+				// The kernel requires every PERF_METRICS pseudo event to use
+				// PERF_FORMAT_GROUP and SLOTS to be its group leader. A known
+				// prototype risk is that BPF may reject reading these member fds.
+				attr.CountFormat.Group = true
+			}
+			// Linux accumulates each PERF_METRICS fraction against SLOTS into
+			// that pseudo-event's software count, so its delta is a raw category
+			// slot count rather than an encoded ratio.
+			event, err := opener(&attr, perf.AllThreads, cpuID, leader)
+			if err != nil {
+				cleanup()
+				return fmt.Errorf("open %s counter on CPU %d: %w", counter.name, cpuID, err)
+			}
+			if leader == nil {
+				leader = event
+			}
+			group = append(group, event)
+			allOpened = append(allOpened, event)
+
+			fd, err := event.FD()
+			if err != nil {
+				cleanup()
+				return fmt.Errorf("get %s counter fd on CPU %d: %w", counter.name, cpuID, err)
+			}
+			cpu := uint32(cpuID)
+			if err := counter.eventsMap.Update(cpu, uint32(fd), cebpf.UpdateAny); err != nil {
+				cleanup()
+				return fmt.Errorf("install %s counter for CPU %d: %w", counter.name, cpuID, err)
+			}
+			installed = append(installed, installedPerfMapEntry{m: counter.eventsMap, cpu: cpu})
+		}
+
+		// Enable members before their disabled leader so the kernel validates
+		// the full constrained group together. Leave all events disabled until
+		// profiling starts.
+		for index := 1; index < len(group); index++ {
+			if err := group[index].Enable(); err != nil {
+				cleanup()
+				return fmt.Errorf("enable %s counter on CPU %d: %w", counters[index].name, cpuID, err)
+			}
+		}
+		if err := leader.Enable(); err != nil {
+			cleanup()
+			return fmt.Errorf("enable slots counter on CPU %d: %w", cpuID, err)
+		}
+		if err := leader.Disable(); err != nil {
+			cleanup()
+			return fmt.Errorf("disable slots counter on CPU %d: %w", cpuID, err)
+		}
+		for index := 1; index < len(group); index++ {
+			if err := group[index].Disable(); err != nil {
+				cleanup()
+				return fmt.Errorf("disable %s counter on CPU %d: %w", counters[index].name, cpuID, err)
+			}
+		}
+
+		// Members must be enabled before the leader when profiling starts.
+		lifecycleOrder = append(lifecycleOrder, group[1:]...)
+		lifecycleOrder = append(lifecycleOrder, leader)
+	}
+
+	key := uint32(0)
+	var enabled uint64
+	if err := enabledMap.Lookup(key, &enabled); err != nil {
+		cleanup()
+		return fmt.Errorf("read enabled counter sets: %w", err)
+	}
+	enabled |= perSampleCounterTopdown
+	if err := enabledMap.Update(key, enabled, cebpf.UpdateAny); err != nil {
+		cleanup()
+		return fmt.Errorf("enable Top-Down BPF reads: %w", err)
+	}
+
+	// If PERF_METRICS members prove unreadable from BPF, the fallback is a
+	// CPU-model-specific four-general-purpose-event approximation: collect
+	// retired slots, frontend starvation, speculative waste, and total slots,
+	// then derive backend bound as the residual. It costs four scarce GP events
+	// and belongs in a separate follow-up rather than silently changing meaning.
+	*events = append(*events, lifecycleOrder...)
+	log.Infof("Enabled per-sample Top-Down counters on %d CPUs", len(cpuIDs))
+	return nil
 }
 
 func (t *Tracer) openPerSampleCounterSet(events *[]*perf.Event, cpuIDs []int, setName string,

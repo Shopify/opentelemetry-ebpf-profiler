@@ -682,10 +682,31 @@ typedef struct PerSampleCounterState {
   PerfCounterValue cycles;
   PerfCounterValue instructions;
   PerfCounterValue branch_misses;
+  PerfCounterValue topdown_slots;
+  PerfCounterValue topdown_retiring;
+  PerfCounterValue topdown_bad_spec;
+  PerfCounterValue topdown_fe_bound;
+  PerfCounterValue topdown_be_bound;
   bool cycles_valid;
   bool instructions_valid;
   bool branch_misses_valid;
+  bool topdown_slots_valid;
+  bool topdown_retiring_valid;
+  bool topdown_bad_spec_valid;
+  bool topdown_fe_bound_valid;
+  bool topdown_be_bound_valid;
+  bool topdown_failed;
 } PerSampleCounterState;
+
+typedef struct PerSampleCounterDeltas {
+  u64 cycles;
+  u64 instructions;
+  u64 branch_misses;
+  u64 topdown_retiring;
+  u64 topdown_bad_spec;
+  u64 topdown_fe_bound;
+  u64 topdown_be_bound;
+} PerSampleCounterDeltas;
 
 // Container for a stack trace
 typedef struct Trace {
@@ -725,6 +746,10 @@ typedef struct Trace {
   u64 cycles_delta;
   u64 instructions_delta;
   u64 branch_misses_delta;
+  u64 topdown_retiring_delta;
+  u64 topdown_bad_spec_delta;
+  u64 topdown_fe_bound_delta;
+  u64 topdown_be_bound_delta;
 
   // The CPU that captured this trace.
   u32 cpu_id;

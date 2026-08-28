@@ -96,6 +96,10 @@ const (
 	SampleValueSourceCyclesDelta SampleValueSource = iota + 1
 	SampleValueSourceInstructionsDelta
 	SampleValueSourceBranchMissesDelta
+	SampleValueSourceTopdownRetiringDelta
+	SampleValueSourceTopdownBadSpecDelta
+	SampleValueSourceTopdownFEBoundDelta
+	SampleValueSourceTopdownBEBoundDelta
 )
 
 // DerivedProfileMetadata describes an export-only sibling profile. It does not
@@ -114,6 +118,14 @@ func (m DerivedProfileMetadata) Value(trace *libpf.Trace) uint64 {
 		return trace.InstructionsDelta
 	case SampleValueSourceBranchMissesDelta:
 		return trace.BranchMissesDelta
+	case SampleValueSourceTopdownRetiringDelta:
+		return trace.TopdownRetiringDelta
+	case SampleValueSourceTopdownBadSpecDelta:
+		return trace.TopdownBadSpecDelta
+	case SampleValueSourceTopdownFEBoundDelta:
+		return trace.TopdownFEBoundDelta
+	case SampleValueSourceTopdownBEBoundDelta:
+		return trace.TopdownBEBoundDelta
 	default:
 		return 0
 	}

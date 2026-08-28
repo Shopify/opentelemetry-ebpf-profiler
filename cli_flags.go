@@ -96,7 +96,7 @@ var (
 		"At least one of --enable-sw-cpu-clock, --enable-hw-cpu-cycles, or --enable-hw-instructions must be enabled."
 	enablePerSampleCountersHelp = "Read cycles and instructions counters at each software cpu-clock sample and export per-stack deltas. " +
 		"Requires --enable-sw-cpu-clock and cannot be combined with hardware sampling triggers."
-	perSampleExtraCountersHelp = "Comma-separated extra counters for --enable-per-sample-counters. Supported: branch-misses."
+	perSampleExtraCountersHelp = "Comma-separated extra counters for --enable-per-sample-counters. Supported: branch-misses, topdown."
 	enableBranchSamplingHelp   = "Enable branch sampling for supported CPUs. Requires hardware cpu-cycles."
 	probeLinkHelper            = "Attach a probe to a symbol of an executable. " +
 		"Expected format: probe_type:target[:symbol]. probe_type can be kprobe, kretprobe, uprobe, or uretprobe."

@@ -452,10 +452,14 @@ static inline EBPF_INLINE PerCPURecord *get_pristine_per_cpu_record()
   trace->apm_trace_id.as_int.lo    = 0;
   trace->apm_transaction_id.as_int = 0;
 
-  trace->custom_labels.len   = 0;
-  trace->cycles_delta        = 0;
-  trace->instructions_delta  = 0;
-  trace->branch_misses_delta = 0;
+  trace->custom_labels.len      = 0;
+  trace->cycles_delta           = 0;
+  trace->instructions_delta     = 0;
+  trace->branch_misses_delta    = 0;
+  trace->topdown_retiring_delta = 0;
+  trace->topdown_bad_spec_delta = 0;
+  trace->topdown_fe_bound_delta = 0;
+  trace->topdown_be_bound_delta = 0;
 
   return record;
 }
@@ -1107,9 +1111,7 @@ static inline EBPF_INLINE int collect_trace(
   u32 tid,
   u64 trace_timestamp,
   u64 value,
-  u64 cycles_delta,
-  u64 instructions_delta,
-  u64 branch_misses_delta)
+  const PerSampleCounterDeltas *counter_deltas)
 {
   // Only continue processing the trace with a valid origin.
   if (origin == 0) {
@@ -1128,15 +1130,21 @@ static inline EBPF_INLINE int collect_trace(
     return -1;
   }
 
-  Trace *trace               = &record->trace;
-  trace->origin              = origin;
-  trace->pid                 = pid;
-  trace->tid                 = tid;
-  trace->ktime               = trace_timestamp;
-  trace->value               = value;
-  trace->cycles_delta        = cycles_delta;
-  trace->instructions_delta  = instructions_delta;
-  trace->branch_misses_delta = branch_misses_delta;
+  Trace *trace  = &record->trace;
+  trace->origin = origin;
+  trace->pid    = pid;
+  trace->tid    = tid;
+  trace->ktime  = trace_timestamp;
+  trace->value  = value;
+  if (counter_deltas) {
+    trace->cycles_delta           = counter_deltas->cycles;
+    trace->instructions_delta     = counter_deltas->instructions;
+    trace->branch_misses_delta    = counter_deltas->branch_misses;
+    trace->topdown_retiring_delta = counter_deltas->topdown_retiring;
+    trace->topdown_bad_spec_delta = counter_deltas->topdown_bad_spec;
+    trace->topdown_fe_bound_delta = counter_deltas->topdown_fe_bound;
+    trace->topdown_be_bound_delta = counter_deltas->topdown_be_bound;
+  }
   if (bpf_get_current_comm(&(trace->comm), sizeof(trace->comm)) < 0) {
     increment_metric(metricID_ErrBPFCurrentComm);
   }
@@ -1196,15 +1204,19 @@ collect_lbr_only_trace(struct pt_regs *ctx, u16 origin, u32 pid, u32 tid, u64 tr
     return -1;
   }
 
-  Trace *trace               = &record->trace;
-  trace->origin              = origin;
-  trace->pid                 = pid;
-  trace->tid                 = tid;
-  trace->ktime               = trace_timestamp;
-  trace->value               = 0;
-  trace->cycles_delta        = 0;
-  trace->instructions_delta  = 0;
-  trace->branch_misses_delta = 0;
+  Trace *trace                  = &record->trace;
+  trace->origin                 = origin;
+  trace->pid                    = pid;
+  trace->tid                    = tid;
+  trace->ktime                  = trace_timestamp;
+  trace->value                  = 0;
+  trace->cycles_delta           = 0;
+  trace->instructions_delta     = 0;
+  trace->branch_misses_delta    = 0;
+  trace->topdown_retiring_delta = 0;
+  trace->topdown_bad_spec_delta = 0;
+  trace->topdown_fe_bound_delta = 0;
+  trace->topdown_be_bound_delta = 0;
   if (bpf_get_current_comm(&(trace->comm), sizeof(trace->comm)) < 0) {
     increment_metric(metricID_ErrBPFCurrentComm);
   }

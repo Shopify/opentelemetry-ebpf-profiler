@@ -114,6 +114,7 @@ func (c *Controller) Start(ctx context.Context) error {
 		EnableHWInstructions:        c.config.EnableHWInstructions,
 		EnablePerSampleCounters:     c.config.EnablePerSampleCounters,
 		EnablePerSampleBranchMisses: c.config.PerSampleBranchMissesEnabled(),
+		EnablePerSampleTopdown:      c.config.PerSampleTopdownEnabled(),
 		EnableBranchSampling:        c.config.EnableBranchSampling,
 	})
 	if err != nil {

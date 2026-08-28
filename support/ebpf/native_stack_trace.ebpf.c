@@ -75,9 +75,14 @@ BPF_RODATA_VAR(u16, origin_id_amd_brs, 0)
 BPF_RODATA_VAR(bool, enable_per_sample_counters, false)
 // enable_per_sample_branch_misses gates the additive branch-miss map read.
 BPF_RODATA_VAR(bool, enable_per_sample_branch_misses, false)
+// enable_per_sample_topdown gates the additive Intel Top-Down map reads.
+BPF_RODATA_VAR(bool, enable_per_sample_topdown, false)
 
 #define PER_SAMPLE_COUNTER_BASE          (1ULL << 0)
 #define PER_SAMPLE_COUNTER_BRANCH_MISSES (1ULL << 1)
+#define PER_SAMPLE_COUNTER_TOPDOWN       (1ULL << 2)
+
+#define PER_SAMPLE_FAILURE_TOPDOWN (1ULL << 0)
 
 // Readable, non-sampling perf events installed by userspace, indexed by CPU.
 struct per_sample_cycles_t {
@@ -101,6 +106,41 @@ struct per_sample_branch_misses_t {
   __uint(max_entries, 0);
 } per_sample_branch_misses SEC(".maps");
 
+struct per_sample_topdown_slots_t {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __type(key, u32);
+  __type(value, u32);
+  __uint(max_entries, 0);
+} per_sample_topdown_slots SEC(".maps");
+
+struct per_sample_topdown_retiring_t {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __type(key, u32);
+  __type(value, u32);
+  __uint(max_entries, 0);
+} per_sample_topdown_retiring SEC(".maps");
+
+struct per_sample_topdown_bad_spec_t {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __type(key, u32);
+  __type(value, u32);
+  __uint(max_entries, 0);
+} per_sample_topdown_bad_spec SEC(".maps");
+
+struct per_sample_topdown_fe_bound_t {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __type(key, u32);
+  __type(value, u32);
+  __uint(max_entries, 0);
+} per_sample_topdown_fe_bound SEC(".maps");
+
+struct per_sample_topdown_be_bound_t {
+  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+  __type(key, u32);
+  __type(value, u32);
+  __uint(max_entries, 0);
+} per_sample_topdown_be_bound SEC(".maps");
+
 // Userspace sets availability bits only after every CPU fd for a counter set
 // has been installed. This prevents repeated helper failures after fail-soft setup.
 struct per_sample_counter_enabled_t {
@@ -109,6 +149,15 @@ struct per_sample_counter_enabled_t {
   __type(value, u64);
   __uint(max_entries, 1);
 } per_sample_counter_enabled SEC(".maps");
+
+// A Top-Down helper failure is reported to userspace once and disables further
+// Top-Down reads on the affected CPU.
+struct per_sample_counter_failures_t {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, u32);
+  __type(value, u64);
+  __uint(max_entries, 1);
+} per_sample_counter_failures SEC(".maps");
 
 // One previous reading per CPU. Per-CPU storage avoids synchronization in the
 // sampling path and follows the CPU-wide scope of the perf events above.
@@ -275,16 +324,17 @@ static inline u64 scale_counter_delta(u64 raw, u64 enabled, u64 running)
   return scaled;
 }
 
-static inline u64 read_counter_delta(void *events, PerfCounterValue *previous, bool *previous_valid)
+static inline bool
+read_counter_delta(void *events, PerfCounterValue *previous, bool *previous_valid, u64 *delta)
 {
+  *delta                   = 0;
   PerfCounterValue current = {};
   if (bpf_perf_event_read_value(events, BPF_F_CURRENT_CPU, &current, sizeof(current)) < 0) {
     // Do not bridge a failed interval into the next sampled stack.
     *previous_valid = false;
-    return 0;
+    return false;
   }
 
-  u64 scaled = 0;
   if (
     *previous_valid && current.value >= previous->value && current.enabled >= previous->enabled &&
     current.running >= previous->running) {
@@ -292,21 +342,34 @@ static inline u64 read_counter_delta(void *events, PerfCounterValue *previous, b
     u64 enabled_delta = current.enabled - previous->enabled;
     u64 running_delta = current.running - previous->running;
     if (running_delta != 0) {
-      scaled = scale_counter_delta(raw_delta, enabled_delta, running_delta);
+      *delta = scale_counter_delta(raw_delta, enabled_delta, running_delta);
     }
   }
 
   *previous       = current;
   *previous_valid = true;
-  return scaled;
+  return true;
 }
 
-static inline void
-collect_per_sample_counters(u64 *cycles_delta, u64 *instructions_delta, u64 *branch_misses_delta)
+static inline void record_per_sample_counter_failure(u32 key, u64 failure)
 {
-  *cycles_delta        = 0;
-  *instructions_delta  = 0;
-  *branch_misses_delta = 0;
+  u64 *failures = bpf_map_lookup_elem(&per_sample_counter_failures, &key);
+  if (failures) {
+    *failures |= failure;
+  }
+}
+
+static inline void invalidate_topdown_baselines(PerSampleCounterState *prev)
+{
+  prev->topdown_slots_valid    = false;
+  prev->topdown_retiring_valid = false;
+  prev->topdown_bad_spec_valid = false;
+  prev->topdown_fe_bound_valid = false;
+  prev->topdown_be_bound_valid = false;
+}
+
+static inline void collect_per_sample_counters(PerSampleCounterDeltas *deltas)
+{
   if (!enable_per_sample_counters) {
     return;
   }
@@ -319,71 +382,105 @@ collect_per_sample_counters(u64 *cycles_delta, u64 *instructions_delta, u64 *bra
   }
 
   if (*enabled & PER_SAMPLE_COUNTER_BASE) {
-    *cycles_delta = read_counter_delta(&per_sample_cycles, &prev->cycles, &prev->cycles_valid);
-    *instructions_delta =
-      read_counter_delta(&per_sample_instructions, &prev->instructions, &prev->instructions_valid);
+    read_counter_delta(&per_sample_cycles, &prev->cycles, &prev->cycles_valid, &deltas->cycles);
+    read_counter_delta(
+      &per_sample_instructions,
+      &prev->instructions,
+      &prev->instructions_valid,
+      &deltas->instructions);
   }
+
   if (enable_per_sample_branch_misses && (*enabled & PER_SAMPLE_COUNTER_BRANCH_MISSES)) {
-    *branch_misses_delta = read_counter_delta(
-      &per_sample_branch_misses, &prev->branch_misses, &prev->branch_misses_valid);
+    read_counter_delta(
+      &per_sample_branch_misses,
+      &prev->branch_misses,
+      &prev->branch_misses_valid,
+      &deltas->branch_misses);
   }
 
-  static inline int native_tracer_entry_impl(
-    struct bpf_perf_event_data * ctx, u16 origin, bool is_amd_brs, bool read_counters)
-  {
-    u64 cycles_delta        = 0;
-    u64 instructions_delta  = 0;
-    u64 branch_misses_delta = 0;
-    if (read_counters) {
-      collect_per_sample_counters(&cycles_delta, &instructions_delta, &branch_misses_delta);
+  if (
+    enable_per_sample_topdown && (*enabled & PER_SAMPLE_COUNTER_TOPDOWN) && !prev->topdown_failed) {
+    u64 slots_delta = 0;
+    bool slots_ok   = read_counter_delta(
+      &per_sample_topdown_slots, &prev->topdown_slots, &prev->topdown_slots_valid, &slots_delta);
+    bool retiring_ok = read_counter_delta(
+      &per_sample_topdown_retiring,
+      &prev->topdown_retiring,
+      &prev->topdown_retiring_valid,
+      &deltas->topdown_retiring);
+    bool bad_spec_ok = read_counter_delta(
+      &per_sample_topdown_bad_spec,
+      &prev->topdown_bad_spec,
+      &prev->topdown_bad_spec_valid,
+      &deltas->topdown_bad_spec);
+    bool fe_bound_ok = read_counter_delta(
+      &per_sample_topdown_fe_bound,
+      &prev->topdown_fe_bound,
+      &prev->topdown_fe_bound_valid,
+      &deltas->topdown_fe_bound);
+    bool be_bound_ok = read_counter_delta(
+      &per_sample_topdown_be_bound,
+      &prev->topdown_be_bound,
+      &prev->topdown_be_bound_valid,
+      &deltas->topdown_be_bound);
+
+    if (!(slots_ok && retiring_ok && bad_spec_ok && fe_bound_ok && be_bound_ok)) {
+      deltas->topdown_retiring = 0;
+      deltas->topdown_bad_spec = 0;
+      deltas->topdown_fe_bound = 0;
+      deltas->topdown_be_bound = 0;
+      invalidate_topdown_baselines(prev);
+      prev->topdown_failed = true;
+      record_per_sample_counter_failure(key, PER_SAMPLE_FAILURE_TOPDOWN);
     }
-    u32 pid = 0;
-    u32 tid = 0;
-    if (!get_pid_tgid(&pid, &tid)) {
-      return 0;
-    }
+  }
+}
 
-    if (pid == 0 && filter_idle_frames) {
-      return 0;
-    }
-
-    u64 ts = bpf_ktime_get_ns();
-    if (is_amd_brs) {
-      return collect_lbr_only_trace((struct pt_regs *)&ctx->regs, origin, pid, tid, ts);
-    }
-    return collect_trace(
-      (struct pt_regs *)&ctx->regs,
-      origin,
-      pid,
-      tid,
-      ts,
-      0,
-      cycles_delta,
-      instructions_delta,
-      branch_misses_delta);
+static inline int native_tracer_entry_impl(
+  struct bpf_perf_event_data *ctx, u16 origin, bool is_amd_brs, bool read_counters)
+{
+  PerSampleCounterDeltas deltas = {};
+  if (read_counters) {
+    collect_per_sample_counters(&deltas);
+  }
+  u32 pid = 0;
+  u32 tid = 0;
+  if (!get_pid_tgid(&pid, &tid)) {
+    return 0;
   }
 
-  SEC("perf_event/native_tracer_entry_sw_cpu_clock")
-  int native_tracer_entry_sw_cpu_clock(struct bpf_perf_event_data * ctx)
-  {
-    return native_tracer_entry_impl(ctx, origin_id_sampling, false, true);
+  if (pid == 0 && filter_idle_frames) {
+    return 0;
   }
 
-  SEC("perf_event/native_tracer_entry_hw_cpu_cycles")
-  int native_tracer_entry_hw_cpu_cycles(struct bpf_perf_event_data * ctx)
-  {
-    return native_tracer_entry_impl(ctx, origin_id_hw_cpu_cycles, false, false);
+  u64 ts = bpf_ktime_get_ns();
+  if (is_amd_brs) {
+    return collect_lbr_only_trace((struct pt_regs *)&ctx->regs, origin, pid, tid, ts);
   }
+  return collect_trace((struct pt_regs *)&ctx->regs, origin, pid, tid, ts, 0, &deltas);
+}
 
-  SEC("perf_event/native_tracer_entry_hw_instructions")
-  int native_tracer_entry_hw_instructions(struct bpf_perf_event_data * ctx)
-  {
-    return native_tracer_entry_impl(ctx, origin_id_hw_instructions, false, false);
-  }
+SEC("perf_event/native_tracer_entry_sw_cpu_clock")
+int native_tracer_entry_sw_cpu_clock(struct bpf_perf_event_data *ctx)
+{
+  return native_tracer_entry_impl(ctx, origin_id_sampling, false, true);
+}
 
-  SEC("perf_event/native_tracer_entry_amd_brs")
-  int native_tracer_entry_amd_brs(struct bpf_perf_event_data * ctx)
-  {
-    return native_tracer_entry_impl(ctx, origin_id_amd_brs, true, false);
-  }
-  MULTI_USE_FUNC(unwind_native)
+SEC("perf_event/native_tracer_entry_hw_cpu_cycles")
+int native_tracer_entry_hw_cpu_cycles(struct bpf_perf_event_data *ctx)
+{
+  return native_tracer_entry_impl(ctx, origin_id_hw_cpu_cycles, false, false);
+}
+
+SEC("perf_event/native_tracer_entry_hw_instructions")
+int native_tracer_entry_hw_instructions(struct bpf_perf_event_data *ctx)
+{
+  return native_tracer_entry_impl(ctx, origin_id_hw_instructions, false, false);
+}
+
+SEC("perf_event/native_tracer_entry_amd_brs")
+int native_tracer_entry_amd_brs(struct bpf_perf_event_data *ctx)
+{
+  return native_tracer_entry_impl(ctx, origin_id_amd_brs, true, false);
+}
+MULTI_USE_FUNC(unwind_native)

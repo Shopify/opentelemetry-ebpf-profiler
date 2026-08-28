@@ -439,11 +439,15 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace, profileType *sa
 
 	pid := bpfTrace.PID
 	trace := &libpf.Trace{
-		Frames:            make(libpf.Frames, 0, int(bpfTrace.NumKernelFrames)+int(bpfTrace.NumFrames)),
-		CustomLabels:      bpfTrace.CustomLabels,
-		CyclesDelta:       bpfTrace.CyclesDelta,
-		InstructionsDelta: bpfTrace.InstructionsDelta,
-		BranchMissesDelta: bpfTrace.BranchMissesDelta,
+		Frames:               make(libpf.Frames, 0, int(bpfTrace.NumKernelFrames)+int(bpfTrace.NumFrames)),
+		CustomLabels:         bpfTrace.CustomLabels,
+		CyclesDelta:          bpfTrace.CyclesDelta,
+		InstructionsDelta:    bpfTrace.InstructionsDelta,
+		BranchMissesDelta:    bpfTrace.BranchMissesDelta,
+		TopdownRetiringDelta: bpfTrace.TopdownRetiringDelta,
+		TopdownBadSpecDelta:  bpfTrace.TopdownBadSpecDelta,
+		TopdownFEBoundDelta:  bpfTrace.TopdownFEBoundDelta,
+		TopdownBEBoundDelta:  bpfTrace.TopdownBEBoundDelta,
 	}
 
 	cacheMiss := uint64(0)

@@ -39,6 +39,14 @@ func TestValidatePerSampleCountersConfig(t *testing.T) {
 			},
 		},
 		{
+			name: "topdown extra",
+			cfg: Config{
+				EnableSWCPUClock:        true,
+				EnablePerSampleCounters: true,
+				EnablePerSampleTopdown:  true,
+			},
+		},
+		{
 			name: "requires a software clock trigger",
 			cfg: Config{
 				EnablePerSampleCounters: true,
@@ -78,6 +86,14 @@ func TestValidatePerSampleCountersConfig(t *testing.T) {
 				EnablePerSampleBranchMisses: true,
 			},
 			wantErr: "per-sample branch misses require per-sample counters",
+		},
+		{
+			name: "topdown requires per-sample counters",
+			cfg: Config{
+				EnableSWCPUClock:       true,
+				EnablePerSampleTopdown: true,
+			},
+			wantErr: "per-sample topdown counters require per-sample counters",
 		},
 	}
 
@@ -139,5 +155,19 @@ func TestPerSampleBranchMissesMissingMapPreservesExistingEvents(t *testing.T) {
 
 	err := tr.openPerSampleBranchMisses(&events, []int{0})
 	require.EqualError(t, err, `eBPF map "per_sample_branch_misses" is not available`)
+	require.Equal(t, []*perf.Event{existing}, events)
+}
+
+func TestPerSampleTopdownDiscoveryFailurePreservesExistingEvents(t *testing.T) {
+	maps := map[string]*cebpf.Map{perSampleCounterEnabledMapName: nil}
+	for _, counter := range perSampleTopdownCounterMaps {
+		maps[counter.mapName] = nil
+	}
+	tr := &Tracer{ebpfMaps: maps, perfEventSysfsRoot: t.TempDir()}
+	existing := new(perf.Event)
+	events := []*perf.Event{existing}
+
+	err := tr.openPerSampleTopdown(&events, []int{0})
+	require.ErrorContains(t, err, "read PMU type")
 	require.Equal(t, []*perf.Event{existing}, events)
 }

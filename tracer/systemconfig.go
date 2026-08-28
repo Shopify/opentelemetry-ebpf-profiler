@@ -601,6 +601,9 @@ func loadRodataVars(coll *cebpf.CollectionSpec, kmod *kallsyms.Module, cfg *Conf
 	if err := coll.Variables["enable_per_sample_branch_misses"].Set(cfg.EnablePerSampleBranchMisses); err != nil {
 		return fmt.Errorf("failed to set enable_per_sample_branch_misses: %v", err)
 	}
+	if err := coll.Variables["enable_per_sample_topdown"].Set(cfg.EnablePerSampleTopdown); err != nil {
+		return fmt.Errorf("failed to set enable_per_sample_topdown: %v", err)
+	}
 
 	if err := setOriginIDs(coll, cfg, origins); err != nil {
 		return err
@@ -743,6 +746,29 @@ func setOriginIDs(coll *cebpf.CollectionSpec, cfg *Config, origins *originRegist
 					},
 					ValueSource: samples.SampleValueSourceBranchMissesDelta,
 				})
+			}
+			if cfg.EnablePerSampleTopdown {
+				for _, profile := range []struct {
+					name   string
+					source samples.SampleValueSource
+				}{
+					{name: "topdown_retiring", source: samples.SampleValueSourceTopdownRetiringDelta},
+					{name: "topdown_bad_spec", source: samples.SampleValueSourceTopdownBadSpecDelta},
+					{name: "topdown_fe_bound", source: samples.SampleValueSourceTopdownFEBoundDelta},
+					{name: "topdown_be_bound", source: samples.SampleValueSourceTopdownBEBoundDelta},
+				} {
+					metadata.DerivedProfiles = append(metadata.DerivedProfiles, samples.DerivedProfileMetadata{
+						ProfileType: &samples.TypeMetadata{
+							PeriodType:      "cpu",
+							PeriodUnit:      "nanoseconds",
+							SampleType:      profile.name,
+							SampleUnit:      "slots",
+							ReportValues:    true,
+							AggregateValues: true,
+						},
+						ValueSource: profile.source,
+					})
+				}
 			}
 		}
 		if err := register("origin_id_sampling", metadata); err != nil {
