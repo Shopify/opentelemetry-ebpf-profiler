@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
@@ -52,6 +52,8 @@ func (tr *traceReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.Trac
 
 func StartTracer(ctx context.Context, t *testing.T, interpretersConfig interpreterconfig.Config,
 	printBpfLogs bool) (<-chan TraceEvent, *tracer.Tracer) {
+	t.Helper()
+
 	traceCh := make(chan TraceEvent)
 	tr := &traceReporter{
 		traceEventChan: traceCh,
