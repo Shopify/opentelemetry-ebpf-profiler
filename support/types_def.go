@@ -212,12 +212,10 @@ const (
 )
 
 const (
-	LJFFIFunc        = C.LUAJIT_FFI_FUNC
-	LJFileId         = C.LUAJIT_JIT_FILE_ID
-	LJNormalFrame    = C.LUAJIT_NORMAL_FRAME
-	LJGReport        = C.LUAJIT_G_REPORT
-	LJCframeSpaceX86 = C.LUAJIT_CFRAME_SPACE_X86_64
-	LJCframeSpaceArm = C.LUAJIT_CFRAME_SPACE_AARCH64
+	LJFFIFunc     = C.LUAJIT_FFI_FUNC
+	LJFileId      = C.LUAJIT_JIT_FILE_ID
+	LJNormalFrame = C.LUAJIT_NORMAL_FRAME
+	LJGReport     = C.LUAJIT_G_REPORT
 )
 
 var MetricsTranslation = []metrics.MetricID{

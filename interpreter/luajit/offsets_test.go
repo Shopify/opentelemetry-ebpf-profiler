@@ -49,10 +49,10 @@ func TestExtractInterpreterBoundsAnchor(t *testing.T) {
 			mk(asmBegin, support.UnwindRegSp, x86Param),
 			mk(asmBegin+bigGap, 0, 0),
 		)
-		h, err := extractInterpreterBounds(elf.EM_X86_64, data, x86Param, 0)
+		h, err := extractInterpreterBounds(elf.EM_X86_64, data, x86Param)
 		require.NoError(t, err)
 		require.Equal(t, uint64(0x1000), h.Start)
-		a, err := extractInterpreterBounds(elf.EM_X86_64, data, x86Param, asmBegin)
+		a, err := extractInterpreterBoundsAnchored(elf.EM_X86_64, data, x86Param, asmBegin)
 		require.NoError(t, err)
 		require.Equal(t, asmBegin, a.Start)
 		require.Equal(t, asmBegin+bigGap, a.End)
@@ -65,9 +65,9 @@ func TestExtractInterpreterBoundsAnchor(t *testing.T) {
 			mk(asmBegin, support.UnwindRegFp, 16),
 			mk(asmBegin+bigGap, 0, 0),
 		)
-		h, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam, 0)
+		h, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam)
 		require.NoError(t, err)
-		a, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam, asmBegin)
+		a, err := extractInterpreterBoundsAnchored(elf.EM_AARCH64, data, armParam, asmBegin)
 		require.NoError(t, err)
 		require.Equal(t, h, a)
 	})
@@ -77,9 +77,9 @@ func TestExtractInterpreterBoundsAnchor(t *testing.T) {
 			mk(asmBegin-4, support.UnwindRegFp, 16),
 			mk(asmBegin-4+bigGap, 0, 0),
 		)
-		h, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam, 0)
+		h, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam)
 		require.NoError(t, err)
-		a, err := extractInterpreterBounds(elf.EM_AARCH64, data, armParam, asmBegin)
+		a, err := extractInterpreterBoundsAnchored(elf.EM_AARCH64, data, armParam, asmBegin)
 		require.NoError(t, err)
 		require.Equal(t, asmBegin, a.Start)
 		require.Equal(t, h.End, a.End)
@@ -92,7 +92,7 @@ func TestExtractInterpreterBoundsAnchor(t *testing.T) {
 			mk(asmBegin+0x10000, support.UnwindRegSp, x86Param),
 			mk(asmBegin+0x10000+bigGap, 0, 0),
 		)
-		a, err := extractInterpreterBounds(elf.EM_X86_64, data, x86Param, asmBegin)
+		a, err := extractInterpreterBoundsAnchored(elf.EM_X86_64, data, x86Param, asmBegin)
 		require.NoError(t, err)
 		require.Equal(t, asmBegin+0x10000, a.Start)
 	})

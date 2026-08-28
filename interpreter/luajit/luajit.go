@@ -175,13 +175,14 @@ func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 	// exact start of the VM interpreter. Anchor the interpreter-range detection
 	// to it: the stack-delta heuristic alone can match an unrelated large gap.
 	// lj_vm_asm_begin is a hidden .symtab symbol; raw ef.LookupSymbol only finds
-	// dynamic symbols, so use scanSymbols, matching how extractOffsets resolves it.
+	// dynamic symbols, so use scanSymbols, matching the offset extraction path.
 	var asmBegin uint64
 	if sym, ok := scanSymbols(ef)[ljVMAsmBeginSym]; ok {
 		asmBegin = uint64(sym.Address)
 	}
 
-	luaInterp, err := extractInterpreterBounds(ef.Machine, *info.Intervals(), cframeSize, asmBegin)
+	luaInterp, err := extractInterpreterBoundsAnchored(
+		ef.Machine, *info.Intervals(), cframeSize, asmBegin)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +237,12 @@ const (
 // big and has a somewhat unique FDE we can pick out. We could tighten this up by looking for
 // direct jumps to the start of the interpreter (one can be found lj_dispatch_update) but we'd
 // still need to consult the stack deltas to get the end of the interpreter.
-func extractInterpreterBounds(machine elf.Machine, intervals sdtypes.IntervalData, param int32,
+func extractInterpreterBounds(machine elf.Machine, intervals sdtypes.IntervalData,
+	param int32) (util.Range, error) {
+	return extractInterpreterBoundsAnchored(machine, intervals, param, 0)
+}
+
+func extractInterpreterBoundsAnchored(machine elf.Machine, intervals sdtypes.IntervalData, param int32,
 	asmBegin uint64) (util.Range, error) {
 	var (
 		fallback      util.Range
@@ -635,7 +641,7 @@ func (l *luajitInstance) Symbolize(frame libpf.EbpfFrame, frames *libpf.Frames, 
 		}
 		return nil
 	default:
-		return fmt.Errorf("Unrecognized LuaJIT frame kind: %d", ljkind)
+		return fmt.Errorf("unrecognized LuaJIT frame kind: %d", ljkind)
 	}
 
 	return nil
