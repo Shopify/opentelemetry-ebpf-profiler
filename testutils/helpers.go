@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"math"
 	"os"
 	"strings"
 	"testing"
@@ -66,7 +65,6 @@ func StartTracer(ctx context.Context, t *testing.T, interpretersConfig interpret
 		SamplesPerSecond:       20,
 		ProbabilisticInterval:  100,
 		ProbabilisticThreshold: 100,
-		OffCPUThreshold:        uint32(math.MaxUint32 / 100),
 		VerboseMode:            true,
 	})
 	require.NoError(t, err)
