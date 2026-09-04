@@ -29,6 +29,16 @@ int kprobe__generic(struct pt_regs *ctx)
   return probe__generic(ctx, 0);
 }
 
+// perf_event__external serves as entry point for externally opened perf events
+// (hardware counters, software events, ...) whose program is attached directly by the
+// hosting probe. The sample period is reported as value so the sum over samples equals
+// the number of events attributed to a stack.
+SEC("perf_event/external")
+int perf_event__external(struct bpf_perf_event_data *ctx)
+{
+  return probe__generic((struct pt_regs *)&ctx->regs, ctx->sample_period);
+}
+
 // ext_probe_value enables externally hosted probes to forward values
 // related to the stack unwinding.
 struct external_probe_value_t {

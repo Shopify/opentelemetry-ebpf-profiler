@@ -7,6 +7,7 @@ package tracer_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"runtime"
 	"slices"
@@ -15,7 +16,9 @@ import (
 	"time"
 
 	cebpf "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
+	"github.com/elastic/go-perf"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,6 +28,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
@@ -43,6 +47,108 @@ func (mockIntervals) MonitorInterval() time.Duration       { return 1 * time.Sec
 func (mockIntervals) TracePollInterval() time.Duration     { return 250 * time.Millisecond }
 func (mockIntervals) PIDCleanupInterval() time.Duration    { return 1 * time.Second }
 func (mockIntervals) ExecutableUnloadDelay() time.Duration { return 1 * time.Second }
+
+type perfEventTrampolineProbe struct {
+	program *cebpf.Program
+	event   *perf.Event
+	origin  uint16
+}
+
+func (p *perfEventTrampolineProbe) Load(
+	_ context.Context, reg tracer.ProbeRegistrar, probeCtx *tracer.ProbeContext,
+) error {
+	previousOrigin, err := reg.Register(&samples.TypeMetadata{})
+	if err != nil {
+		return err
+	}
+	p.origin = previousOrigin + 1
+	p.program, err = probeCtx.RegisterPerfEventCollectTrampoline(&samples.TypeMetadata{
+		SampleType: "cpu-clock", SampleUnit: "count", ReportValues: true,
+	})
+	return err
+}
+
+func (p *perfEventTrampolineProbe) Unload() error {
+	var errs []error
+	if p.event != nil {
+		errs = append(errs, p.event.Disable(), p.event.Close())
+		p.event = nil
+	}
+	if p.program != nil {
+		errs = append(errs, p.program.Close())
+		p.program = nil
+	}
+	return errors.Join(errs...)
+}
+
+func TestPerfEventCollectTrampoline(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	if err := features.HaveProgramType(cebpf.PerfEvent); err != nil {
+		t.Skipf("perf event BPF programs unavailable: %v", err)
+	}
+
+	tr, err := tracer.NewTracer(t.Context(), &tracer.Config{
+		Intervals:          &mockIntervals{},
+		InterpretersConfig: interpreterconfig.AllInterpreters(),
+		SamplesPerSecond:   20,
+	})
+	require.NoError(t, err)
+	defer tr.Close()
+	// Unknown processes only produce PID events; the processor turns them into
+	// process mappings so that later samples yield traces.
+	tr.StartPIDEventProcessor(t.Context())
+
+	probe := new(perfEventTrampolineProbe)
+	require.NoError(t, tr.Enable(t.Context(), probe))
+	require.NotNil(t, probe.program)
+	defer func() { assert.NoError(t, probe.Unload()) }()
+
+	traceChan := make(chan *libpf.EbpfTrace, 16)
+	require.NoError(t, tr.StartMapMonitors(t.Context(), traceChan))
+
+	// Sample the calling thread on whatever CPU runs it, so the busy loop below
+	// is guaranteed to be the sampled task (a single idle CPU would only yield
+	// pid 0 samples, which probe__generic drops).
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	attr := new(perf.Attr)
+	attr.SetSampleFreq(200)
+	require.NoError(t, perf.CPUClock.Configure(attr))
+	probe.event, err = perf.Open(attr, perf.CallingThread, perf.AnyCPU, nil)
+	if err != nil {
+		t.Skipf("software perf events unavailable: %v", err)
+	}
+	require.NoError(t, probe.event.SetBPF(uint32(probe.program.FD())))
+	require.NoError(t, probe.event.Enable())
+
+	// Keep the sampled thread busy until a trace with the probe's origin shows up.
+	// The first samples of a process only trigger process discovery.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		spinUntil := time.Now().Add(100 * time.Millisecond)
+		for x := uint64(0); time.Now().Before(spinUntil); x++ {
+			_ = x * x
+		}
+		for {
+			select {
+			case <-tr.Done():
+				t.Fatal("tracer encountered an unrecoverable error")
+			case ebpfTrace := <-traceChan:
+				if ebpfTrace.Origin == probe.origin && ebpfTrace.Value > 0 {
+					require.NoError(t, probe.event.Disable())
+					return
+				}
+				continue
+			default:
+			}
+			break
+		}
+	}
+	t.Fatal("no trace received from perf_event collect trampoline")
+}
 
 // forceContextSwitch makes sure two Go threads are running concurrently
 // and that there will be a context switch between those two.
