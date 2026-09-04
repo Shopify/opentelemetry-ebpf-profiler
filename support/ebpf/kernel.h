@@ -114,9 +114,37 @@ struct pt_regs {
   #error "Unsupported architecture"
 #endif
 
+#if defined(__aarch64__)
+// uapi struct user_pt_regs: the user-visible prefix of pt_regs. The kernel's
+// bpf_perf_event_data.regs is this type on arm64 (uapi asm/bpf_perf_event.h).
+typedef struct {
+  u64 regs[31];
+  u64 sp;
+  u64 pc;
+  u64 pstate;
+} bpf_user_pt_regs_t;
+#else
+typedef struct pt_regs bpf_user_pt_regs_t;
+#endif
+
+// Mirrors uapi/linux/bpf_perf_event.h.
 struct bpf_perf_event_data {
-  struct pt_regs regs;
+  bpf_user_pt_regs_t regs;
+  u64 sample_period;
+  u64 addr;
 };
+
+#if defined(__aarch64__)
+_Static_assert(sizeof(bpf_user_pt_regs_t) == 272, "bad arm64 bpf_user_pt_regs_t size");
+_Static_assert(
+  __builtin_offsetof(struct bpf_perf_event_data, sample_period) == 272,
+  "bad arm64 bpf_perf_event_data.sample_period offset");
+#else
+_Static_assert(sizeof(bpf_user_pt_regs_t) == 168, "bad x86_64 bpf_user_pt_regs_t size");
+_Static_assert(
+  __builtin_offsetof(struct bpf_perf_event_data, sample_period) == 168,
+  "bad x86_64 bpf_perf_event_data.sample_period offset");
+#endif
 
 // The following works with clang and gcc.
 // Checked with

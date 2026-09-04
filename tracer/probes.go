@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
+	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
@@ -344,6 +345,71 @@ func (c *ProbeContext) RegisterCollectTrampoline(meta *samples.TypeMetadata) (*C
 		CtxMap:                ctxMap,
 		TailCallDestinationID: uint32(progID),
 	}, nil
+}
+
+// RegisterPerfEventCollectTrampoline registers meta as a new sample origin and
+// loads the perf_event-typed collect trampoline (perf_event__external). The
+// returned program is meant to be attached directly to perf events opened by
+// the caller (perf_event_open + PERF_EVENT_IOC_SET_BPF); each sample reports
+// the event's sample period as value, so the sum over a stack's samples equals
+// the number of events attributed to that stack.
+//
+// The caller owns the returned program and must close it from its Probe.Unload
+// implementation after detaching the perf events.
+func (c *ProbeContext) RegisterPerfEventCollectTrampoline(meta *samples.TypeMetadata) (*cebpf.Program, error) {
+	originID, err := c.reg.Register(meta)
+	if err != nil {
+		return nil, fmt.Errorf("registering perf event collect trampoline origin: %w", err)
+	}
+	coll, err := c.CollectionSpecWith(nil, []string{"perf_event__external"}, []string{"origin_id_probe"})
+	if err != nil {
+		return nil, err
+	}
+	v, ok := coll.Variables["origin_id_probe"]
+	if !ok {
+		return nil, fmt.Errorf("variable %q missing after CollectionSpecWith", "origin_id_probe")
+	}
+	if err := v.Set(originID); err != nil {
+		return nil, fmt.Errorf("set origin_id_probe: %w", err)
+	}
+	progSpec := coll.Programs["perf_event__external"]
+	if progSpec.Type != cebpf.PerfEvent {
+		return nil, fmt.Errorf("program %q has type %s, want %s",
+			"perf_event__external", progSpec.Type, cebpf.PerfEvent)
+	}
+	if err := c.RewriteMaps(coll, nil); err != nil {
+		return nil, err
+	}
+	if err := syncVariablesToMapSpecs(coll); err != nil {
+		return nil, err
+	}
+	// Kernels before 5.11 account BPF map memory against RLIMIT_MEMLOCK.
+	restoreRlimit, err := rlimit.MaximizeMemlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to adjust rlimit: %w", err)
+	}
+	defer restoreRlimit()
+	if rodataSpec, ok := coll.Maps[".rodata.var"]; ok {
+		rodataMap, err := cebpf.NewMap(rodataSpec)
+		if err != nil {
+			return nil, fmt.Errorf("creating .rodata.var: %w", err)
+		}
+		defer rodataMap.Close()
+		if err := rewriteMaps(coll, map[string]*cebpf.Map{".rodata.var": rodataMap}); err != nil {
+			return nil, err
+		}
+	}
+
+	ebpfProgs := make(map[string]*cebpf.Program)
+	// LoadProbeUnwinders is not used here: it rewrites perf_progs to kprobe_progs and
+	// per_cpu_records to per_cpu_records_kp for kprobe-typed programs. A perf_event
+	// program must tail-call into the tracer's own perf chain and can share its
+	// per-CPU record, as the kernel serializes perf_event BPF programs per CPU
+	// (bpf_prog_active).
+	if err := loadProgram(ebpfProgs, nil, 0, progSpec, cebpf.ProgramOptions{}, true); err != nil {
+		return nil, err
+	}
+	return ebpfProgs["perf_event__external"], nil
 }
 
 // AddAttacher registers a per-process attacher with the process manager.

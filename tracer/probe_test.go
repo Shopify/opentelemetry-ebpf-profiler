@@ -6,9 +6,23 @@ package tracer
 import (
 	"testing"
 
+	cebpf "github.com/cilium/ebpf"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPerfEventCollectTrampolineSpec(t *testing.T) {
+	ctx := &ProbeContext{}
+	coll, err := ctx.CollectionSpecWith(nil,
+		[]string{"perf_event__external"}, []string{"origin_id_probe"})
+	require.NoError(t, err)
+
+	prog, ok := coll.Programs["perf_event__external"]
+	require.True(t, ok)
+	assert.Equal(t, cebpf.PerfEvent, prog.Type)
+	assert.Contains(t, coll.Variables, "origin_id_probe")
+}
 
 func TestParseProbe(t *testing.T) {
 	tests := map[string]struct {
