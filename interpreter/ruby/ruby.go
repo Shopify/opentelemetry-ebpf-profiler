@@ -142,6 +142,9 @@ type rubyData struct {
 	// (from DTPMOD64 relocation, the actual module ID is written by the linker at load time)
 	tlsModuleIdOffset libpf.Address
 
+	// Address of rb_zjit_entry, read at sampling time because ZJIT can be enabled after attach.
+	zjitEntryAddr libpf.Address
+
 	// Address to global symbols, for id to string mappings
 	globalSymbolsAddr libpf.Address
 	// version of the currently used Ruby interpreter.
@@ -174,7 +177,7 @@ type rubyData struct {
 
 		// https://github.com/ruby/ruby/blob/v3_4_5/vm_core.h#L1108
 		thread_struct struct {
-			vm uint8
+			vm, ractor uint8
 		}
 
 		// https://github.com/ruby/ruby/blob/v3_4_5/vm_core.h#L666
@@ -261,7 +264,7 @@ type rubyData struct {
 		// rb_ractor_struct
 		// https://github.com/ruby/ruby/blob/5ce0d2aa354eb996cb3ca9bb944f880ff6acfd57/ractor_core.h#L82
 		rb_ractor_struct struct {
-			running_ec uint16
+			running_ec, objspace uint16
 		}
 
 		// rb_callable_method_entry_struct
@@ -350,9 +353,11 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		Size_of_control_frame_struct: r.vmStructs.control_frame_struct.size_of_control_frame_struct,
 		Thread_ptr:                   r.vmStructs.execution_context_struct.thread_ptr,
 
-		Thread_vm:    r.vmStructs.thread_struct.vm,
-		Has_objspace: r.hasObjspace,
-		Vm_objspace:  r.vmStructs.vm_struct.gc_objspace,
+		Thread_vm:       r.vmStructs.thread_struct.vm,
+		Thread_ractor:   r.vmStructs.thread_struct.ractor,
+		Has_objspace:    r.hasObjspace,
+		Vm_objspace:     r.vmStructs.vm_struct.gc_objspace,
+		Ractor_objspace: r.vmStructs.rb_ractor_struct.objspace,
 
 		Objspace_flags:         r.vmStructs.objspace.flags,
 		Objspace_size_of_flags: r.vmStructs.objspace.size_of_flags,
@@ -363,6 +368,9 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		Size_of_value: r.vmStructs.size_of_value,
 
 		Running_ec: r.vmStructs.rb_ractor_struct.running_ec,
+	}
+	if r.zjitEntryAddr != 0 {
+		cdata.Zjit_entry_addr = uint64(r.zjitEntryAddr + bias)
 	}
 
 	if err := ebpf.UpdateProcData(libpf.Ruby, pid, unsafe.Pointer(&cdata)); err != nil {
@@ -876,7 +884,11 @@ func (r *rubyInstance) readClassName(classAddr libpf.Address) (libpf.String, boo
 
 	// Read the rbasic + rclass_ext + classpath + value to buffer entire object + classpath pointer
 	// do one large, buffered read rather than many small reads.
-	dataBytes := make([]byte, r.r.vmStructs.rclass_and_rb_classext_t.classext+r.r.vmStructs.rb_classext_struct.classpath+r.r.vmStructs.size_of_value)
+	// Since Ruby 4.1 classpath precedes attached_object. Include both fields
+	// in the buffer, otherwise singleton classes silently lose their names.
+	lastField := max(r.r.vmStructs.rb_classext_struct.classpath,
+		r.r.vmStructs.rb_classext_struct.as_singleton_class_attached_object)
+	dataBytes := make([]byte, r.r.vmStructs.rclass_and_rb_classext_t.classext+lastField+r.r.vmStructs.size_of_value)
 	if err := r.rm.Read(classAddr, dataBytes); err != nil {
 		return classPath, singleton, err
 	}
@@ -941,6 +953,10 @@ func (r *rubyInstance) id2str(originalId uint64) (libpf.String, error) {
 		if serial > uint64(r.lastId) {
 			return libpf.NullString, fmt.Errorf("invalid serial %d, greater than last id %d", serial, r.lastId)
 		}
+	}
+
+	if r.r.version >= rubyVersion(4, 1, 0) {
+		return r.readRuby41IDString(serial)
 	}
 
 	ids := r.rm.Ptr(r.globalSymbolsAddr + libpf.Address(vms.rb_symbols_t.ids))
@@ -1015,18 +1031,32 @@ func (r *rubyInstance) readIseqBody(iseqBody, pc libpf.Address, frameAddrType ui
 		return &rubyIseq{}, err
 	}
 
-	iseqBaseLabelPtr := npsr.Ptr(dataBytes, uint(vms.iseq_location_struct.base_label))
+	// Body used for the qualified method label is indirect: iseq body -> local iseq -> iseq body
+	// https://github.com/ruby/ruby/blob/v3_4_5/vm_backtrace.c#L1943
+	// https://github.com/ruby/ruby/blob/v3_4_5/iseq.c#L1426
+	localIseqPtr := r.rm.Ptr(iseqBody + libpf.Address(vms.iseq_constant_body.local_iseq))
+	var iseqLocalBody libpf.Address
+	if localIseqPtr != 0 {
+		iseqLocalBody = r.rm.Ptr(localIseqPtr + libpf.Address(vms.iseq_struct.body))
+	}
+
+	// Ruby 4.1 removed location.base_label. Like rb_iseq_base_label(), use
+	// local_iseq->body->location.label instead (including for blocks).
+	baseLabelOffset := vms.iseq_location_struct.base_label
+	iseqBaseLabelPtr := npsr.Ptr(dataBytes, uint(baseLabelOffset))
+	if r.r.version >= rubyVersion(4, 1, 0) {
+		baseLabelOffset = vms.iseq_location_struct.label
+		iseqBaseLabelPtr = iseqLabelPtr
+		if localIseqPtr != 0 {
+			iseqBaseLabelPtr = r.rm.Ptr(iseqLocalBody +
+				libpf.Address(vms.iseq_constant_body.location+baseLabelOffset))
+		}
+	}
 	iseqBaseLabel, err := r.getStringCached(iseqBaseLabelPtr, r.readRubyString)
 	if err != nil {
 		log.Debugf("Failed to get source base label (iseq@0x%08x) %d, %v", iseqBody, frameAddrType, err)
 		return &rubyIseq{}, err
 	}
-
-	// Body used for for qualified method label is indirect, need to do: iseq body -> local iseq -> iseq body
-	// https://github.com/ruby/ruby/blob/v3_4_5/vm_backtrace.c#L1943
-	// https://github.com/ruby/ruby/blob/v3_4_5/iseq.c#L1426
-	localIseqPtr := r.rm.Ptr(iseqBody + libpf.Address(vms.iseq_constant_body.local_iseq))
-	iseqLocalBody := r.rm.Ptr(localIseqPtr + libpf.Address(vms.iseq_struct.body))
 
 	// Check iseq body type to see if it is a method before trying to read it
 	// https://github.com/ruby/ruby/blob/v3_4_5/iseq.c#L1428-L1430
@@ -1035,7 +1065,7 @@ func (r *rubyInstance) readIseqBody(iseqBody, pc libpf.Address, frameAddrType ui
 	var methodName libpf.String
 	if iseqType == iseqTypeMethod {
 		methodNamePtr := r.rm.Ptr(iseqLocalBody +
-			libpf.Address(vms.iseq_constant_body.location+vms.iseq_location_struct.base_label))
+			libpf.Address(vms.iseq_constant_body.location+baseLabelOffset))
 		methodName, err = r.getStringCached(methodNamePtr, r.readRubyString)
 		if err != nil {
 			log.Debugf("Unable to find local method name on iseq method (%d) (iseq@0x%08x) %v", iseqType, iseqBody, err)
@@ -1316,7 +1346,9 @@ func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
 	anonExecFound := false
 	for idx := range mappings {
 		m := &mappings[idx]
-		if !m.IsExecutable() || !m.IsAnonymous() {
+		// Coredumps can expose the x86 vsyscall page as unnamed executable
+		// memory. Kernel-half addresses cannot belong to a Ruby JIT reservation.
+		if !m.IsExecutable() || !m.IsAnonymous() || m.Vaddr >= 1<<63 {
 			continue
 		}
 
@@ -1494,7 +1526,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	}
 
 	var description string
-	if version == rubyVersion(4, 0, 5) {
+	if version == rubyVersion(4, 0, 5) || version == rubyVersion(4, 1, 0) {
 		if _, memory, descriptionErr := ef.SymbolData("ruby_description", 128); descriptionErr == nil {
 			description = strings.TrimRight(pfunsafe.ToString(memory), "\x00")
 		}
@@ -1507,11 +1539,18 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// Reason for lowest supported version:
 	// - Ruby 2.5 is still commonly used at time of writing this code.
 	//   https://www.jetbrains.com/lp/devecosystem-2020/ruby/
-	// Reason for maximum supported version 4.0.x:
-	// - Ruby 4.0 was released December 2025 with ZJIT and redesigned Ractor Port API
+	// Development versions do not imply a stable layout. Allow only the audited
+	// Ruby 4.1 revision; never treat arbitrary 4.1-dev builds as ABI-compatible.
+	var revision string
+	if version == rubyVersion(4, 1, 0) {
+		if _, memory, revisionErr := ef.SymbolData("ruby_revision", 64); revisionErr == nil {
+			revision = strings.TrimRight(pfunsafe.ToString(memory), "\x00")
+		}
+	}
+	usesRuby41Layout := rubyUses41Layout(version, revision, description)
 	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(4, 1, 0)
-	if version < minVer || version >= maxVer {
-		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and <= %d.%d.%d)",
+	if version < minVer || (version >= maxVer && !usesRuby41Layout) {
+		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and < %d.%d.%d, or an audited 4.1 revision)",
 			(version>>16)&0xff, (version>>8)&0xff, version&0xff,
 			(minVer>>16)&0xff, (minVer>>8)&0xff, minVer&0xff,
 			(maxVer>>16)&0xff, (maxVer>>8)&0xff, maxVer&0xff)
@@ -1928,6 +1967,15 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 			} else {
 				vms.rb_ractor_struct.running_ec = 0x218
 			}
+		}
+	}
+
+	if usesRuby41Layout {
+		applyRuby41Layout(rid, runtime.GOARCH)
+		// YJIT-only builds do not export rb_zjit_entry. A combined build does,
+		// even when ZJIT has not yet been enabled in the current process.
+		if symbol, symbolErr := ef.LookupSymbol("rb_zjit_entry"); symbolErr == nil {
+			rid.zjitEntryAddr = libpf.Address(symbol.Address)
 		}
 	}
 
