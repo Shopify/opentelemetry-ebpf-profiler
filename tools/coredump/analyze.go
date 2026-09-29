@@ -86,6 +86,7 @@ func (cmd *analyzeCmd) exec(context.Context, []string) (err error) {
 		log.SetLevel(slog.LevelDebug)
 	}
 
+	testCase := &CoredumpTestCase{}
 	var proc process.Process
 	switch {
 	case cmd.pid != 0:
@@ -94,7 +95,6 @@ func (cmd *analyzeCmd) exec(context.Context, []string) (err error) {
 			return fmt.Errorf("failed to open pid `%d`: %w", cmd.pid, err)
 		}
 	case cmd.casePath != "":
-		var testCase *CoredumpTestCase
 		testCase, err = readTestCase(cmd.casePath)
 		if err != nil {
 			return fmt.Errorf("failed to read test case: %w", err)
@@ -112,7 +112,8 @@ func (cmd *analyzeCmd) exec(context.Context, []string) (err error) {
 	}
 	defer proc.Close()
 
-	threads, err := ExtractTraces(context.Background(), proc, cmd.debugEbpf, lwpFilter, nil)
+	threads, err := ExtractTracesWithInterpreters(context.Background(), proc,
+		cmd.debugEbpf, lwpFilter, nil, testCase.interpretersConfig())
 	if err != nil {
 		return fmt.Errorf("failed to extract traces: %w", err)
 	}
