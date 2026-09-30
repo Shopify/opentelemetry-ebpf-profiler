@@ -1,0 +1,42 @@
+{
+  "testcases": [
+    "testdata/amd64/ruby-4.1.0-a68e42cf-gc.json",
+    "testdata/amd64/ruby-4.1.0-a68e42cf-interpreted-native-skip-native-resume.json",
+    "testdata/amd64/ruby-4.1.0-a68e42cf-yjit-loop-skip-native-resume.json",
+    "testdata/amd64/ruby-4.1.0-a68e42cf-yjit-loop.json",
+    "testdata/amd64/ruby-4.1.0-a68e42cf-yjit-native-skip-native-resume.json",
+    "testdata/amd64/ruby-4.1.0-a68e42cf-yjit-native.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-gc.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-interpreted-native-skip-native-resume.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-yjit-loop-skip-native-resume.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-yjit-loop.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-yjit-native-skip-native-resume.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-yjit-native.json"
+  ],
+  "objects": [
+    "08a342947a87501f289017655eb84942e5e05fb5e4ba11208dac6b00af3e63a9",
+    "0b8d53408a9e4fce3a5f4bee4f5bd5d340b14cc433d08d95982b52c94ca9a56b",
+    "0ccdfb6d6f5c039465f6d002cf7e4c072d48ac6a2cffc8dd6c748dec31592804",
+    "0f1905dc27dbc6715875c70527bc8da846a10084c9c483e9d8ff76dce8d69d0e",
+    "1502636e3be8232c9cf801dfb533694aea985d449904f3e1295db26d7b348946",
+    "34af362abf347cca97f05b13da61ef9d8c517ed1f998801d3f0bca9429cb51b6",
+    "390027e5f45f236bd1838bc54bf464c5ff01d260ab9f8b415ea8276641bce505",
+    "39b6701812ed7135f28df49352b3f6664c7a9f56880a3fe50c1b87cd7681db9b",
+    "3a15d66867d83762c7f2f1e37359cb8f6c5743edb369c65285cb0b1c4f7498bf",
+    "5e0391562de36de323fb9cb0f2c1b6bd6d034c840b1dac018499f5fe4ded1b4a",
+    "66c2e08531e3515d79317b8791f675542ad3c8bc4aaa0f881cbd84ffe9d497bf",
+    "7eefb80e87c3914409cf640530a0f92a4e45307f5d26de72c21f070d9620a7a4",
+    "86200da370f20476a2507e9097a789b5ef97269b4ca8d5e164ad82dab9d99892",
+    "9fa680339f12465d475f8ff87800661947e3934e256f1807a4a339b624bece7f",
+    "abe8d738cf3c5a953fe7d7dfd6fc3599f4225fe8f6ab6c7aa3d94662732a0bfb",
+    "b3da87abf764ad6e13dd585a0ead670436dcd6dec239528d5b4e04b37c251986",
+    "b41cebf0be70f869bf60228cb5761f875ced865b0f4016f544d82f7a9ded28b0",
+    "c20a2dc8917c755f02b94049356320fe1f62ac7d9f8994731f807d9df39302da",
+    "d93224d2b0dab4247598be683adca02f5cf00586f99c187579cd7e92058fb7cb",
+    "dc56adb49b1fd16d5ea586256d7d601ac9a28728f9514e652defd03ad6a6b1b4",
+    "e3bc90ee8cce46778c2f46c2a3e580d3b930f7b455910f25ea400a0b797fb9dc",
+    "e69a99bbfdce9931c0555d30ce13286789cf38548df549950443adbd2494c38c",
+    "f2d3ad2bf0b61f6bc944cc37d7b6ab7f88d2582b41ff989ca164803f56cc5f20",
+    "fce00b6f25f459cf4ae0b7fae4257909a1a8a86f9149e7c029a5d617baf1ccd0"
+  ]
+}

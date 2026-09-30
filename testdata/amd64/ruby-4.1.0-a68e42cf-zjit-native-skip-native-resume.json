@@ -1,0 +1,78 @@
+{
+  "coredump-ref": "87267b431e513b95e69162b117391630c6996cbddcc45a70c70f571ee9286bd7",
+  "threads": [
+    {
+      "lwp": 2274,
+      "frames": [
+        "libc.so.6+0x98e51",
+        "libc.so.6+0x9bd6d",
+        "ruby+0x3436a9",
+        "ruby+0x34940e",
+        "ruby+0x349dae",
+        "ruby+0x34c47e",
+        "ruby+0x3529d5",
+        "ruby+0x352942",
+        "ruby+0x352cbb",
+        "ruby+0x27a12c",
+        "<unknown jit code>+0 in <jitted code>:0",
+        "Kernel#sleep+0 in <cfunc>:0",
+        "Ruby41Fixture.inner+0 in /audit/fixtures/ruby41.rb:14",
+        "Ruby41Fixture.middle+0 in /audit/fixtures/ruby41.rb:8",
+        "Ruby41Fixture.outer+0 in /audit/fixtures/ruby41.rb:4",
+        "block in <main>+0 in /audit/fixtures/ruby41.rb:28",
+        "Kernel#loop+0 in <internal:kernel>:159",
+        "<main>+0 in /audit/fixtures/ruby41.rb:28"
+      ]
+    },
+    {
+      "lwp": 2278,
+      "frames": [
+        "libc.so.6+0x12a2d2",
+        "ruby+0x34736e",
+        "ruby+0x3476e5",
+        "ruby+0x34c2e4",
+        "libc.so.6+0x9cb83",
+        "libc.so.6+0x129ecb"
+      ]
+    }
+  ],
+  "modules": [
+    {
+      "ref": "0b8d53408a9e4fce3a5f4bee4f5bd5d340b14cc433d08d95982b52c94ca9a56b",
+      "local-path": "/audit/results/a68e42cf-yjit-zjit-x86_64/ruby"
+    },
+    {
+      "ref": "d93224d2b0dab4247598be683adca02f5cf00586f99c187579cd7e92058fb7cb",
+      "local-path": "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1"
+    },
+    {
+      "ref": "c20a2dc8917c755f02b94049356320fe1f62ac7d9f8994731f807d9df39302da",
+      "local-path": "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+    },
+    {
+      "ref": "3a15d66867d83762c7f2f1e37359cb8f6c5743edb369c65285cb0b1c4f7498bf",
+      "local-path": "/usr/lib/x86_64-linux-gnu/libc.so.6"
+    },
+    {
+      "ref": "fce00b6f25f459cf4ae0b7fae4257909a1a8a86f9149e7c029a5d617baf1ccd0",
+      "local-path": "/usr/lib/x86_64-linux-gnu/libm.so.6"
+    },
+    {
+      "ref": "1502636e3be8232c9cf801dfb533694aea985d449904f3e1295db26d7b348946",
+      "local-path": "/usr/lib/x86_64-linux-gnu/libcrypt.so.1.1.0"
+    },
+    {
+      "ref": "0ccdfb6d6f5c039465f6d002cf7e4c072d48ac6a2cffc8dd6c748dec31592804",
+      "local-path": "/usr/lib/x86_64-linux-gnu/libgmp.so.10.5.0"
+    },
+    {
+      "ref": "86200da370f20476a2507e9097a789b5ef97269b4ca8d5e164ad82dab9d99892",
+      "local-path": "/usr/lib/x86_64-linux-gnu/libz.so.1.3"
+    }
+  ],
+  "interpreters": {
+    "ruby": {
+      "skip_native_resume": true
+    }
+  }
+}

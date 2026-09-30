@@ -1,0 +1,34 @@
+{
+  "testcases": [
+    "testdata/amd64/ruby-4.1.0-a68e42cf-zjit-loop-skip-native-resume.json",
+    "testdata/amd64/ruby-4.1.0-a68e42cf-zjit-loop.json",
+    "testdata/amd64/ruby-4.1.0-a68e42cf-zjit-native-skip-native-resume.json",
+    "testdata/amd64/ruby-4.1.0-a68e42cf-zjit-native.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-zjit-loop-skip-native-resume.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-zjit-loop.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-zjit-native-skip-native-resume.json",
+    "testdata/arm64/ruby-4.1.0-a68e42cf-zjit-native.json"
+  ],
+  "objects": [
+    "0b8d53408a9e4fce3a5f4bee4f5bd5d340b14cc433d08d95982b52c94ca9a56b",
+    "0ccdfb6d6f5c039465f6d002cf7e4c072d48ac6a2cffc8dd6c748dec31592804",
+    "0f1905dc27dbc6715875c70527bc8da846a10084c9c483e9d8ff76dce8d69d0e",
+    "1502636e3be8232c9cf801dfb533694aea985d449904f3e1295db26d7b348946",
+    "240c04ce0e945bdf6f4bbc3d4c654137b336a38c4ded47bab079861b82ca4ed0",
+    "390027e5f45f236bd1838bc54bf464c5ff01d260ab9f8b415ea8276641bce505",
+    "39b6701812ed7135f28df49352b3f6664c7a9f56880a3fe50c1b87cd7681db9b",
+    "3a15d66867d83762c7f2f1e37359cb8f6c5743edb369c65285cb0b1c4f7498bf",
+    "5e0391562de36de323fb9cb0f2c1b6bd6d034c840b1dac018499f5fe4ded1b4a",
+    "66c2e08531e3515d79317b8791f675542ad3c8bc4aaa0f881cbd84ffe9d497bf",
+    "86200da370f20476a2507e9097a789b5ef97269b4ca8d5e164ad82dab9d99892",
+    "87267b431e513b95e69162b117391630c6996cbddcc45a70c70f571ee9286bd7",
+    "b41cebf0be70f869bf60228cb5761f875ced865b0f4016f544d82f7a9ded28b0",
+    "b8218da0431d16c547f164f47a5e1d684f58b30bf1f037f2ee2feb2fa1e71df6",
+    "c20a2dc8917c755f02b94049356320fe1f62ac7d9f8994731f807d9df39302da",
+    "d93224d2b0dab4247598be683adca02f5cf00586f99c187579cd7e92058fb7cb",
+    "e3bc90ee8cce46778c2f46c2a3e580d3b930f7b455910f25ea400a0b797fb9dc",
+    "e74bd357e1c762a798b43838ace85ac9e92acdaddc00333b58f9a1ba6d8aec57",
+    "f2d3ad2bf0b61f6bc944cc37d7b6ab7f88d2582b41ff989ca164803f56cc5f20",
+    "fce00b6f25f459cf4ae0b7fae4257909a1a8a86f9149e7c029a5d617baf1ccd0"
+  ]
+}
