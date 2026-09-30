@@ -1,0 +1,78 @@
+{
+  "coredump-ref": "240c04ce0e945bdf6f4bbc3d4c654137b336a38c4ded47bab079861b82ca4ed0",
+  "threads": [
+    {
+      "lwp": 78,
+      "frames": [
+        "libc.so.6+0x81d6c",
+        "libc.so.6+0x84d1f",
+        "ruby+0x3630cf",
+        "ruby+0x369833",
+        "ruby+0x36a217",
+        "ruby+0x36c91b",
+        "ruby+0x372ddb",
+        "ruby+0x372d43",
+        "ruby+0x373117",
+        "ruby+0x28705f",
+        "<unknown jit code>+0 in <jitted code>:0",
+        "Kernel#sleep+0 in <cfunc>:0",
+        "Ruby41Fixture.inner+0 in /audit/fixtures/ruby41.rb:14",
+        "Ruby41Fixture.middle+0 in /audit/fixtures/ruby41.rb:8",
+        "Ruby41Fixture.outer+0 in /audit/fixtures/ruby41.rb:4",
+        "block in <main>+0 in /audit/fixtures/ruby41.rb:28",
+        "Kernel#loop+0 in <internal:kernel>:159",
+        "<main>+0 in /audit/fixtures/ruby41.rb:28"
+      ]
+    },
+    {
+      "lwp": 81,
+      "frames": [
+        "libc.so.6+0xebe74",
+        "ruby+0x3674d7",
+        "ruby+0x3677cf",
+        "ruby+0x36c73f",
+        "libc.so.6+0x8582b",
+        "libc.so.6+0xebb4b"
+      ]
+    }
+  ],
+  "modules": [
+    {
+      "ref": "f2d3ad2bf0b61f6bc944cc37d7b6ab7f88d2582b41ff989ca164803f56cc5f20",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libgcc_s.so.1"
+    },
+    {
+      "ref": "5e0391562de36de323fb9cb0f2c1b6bd6d034c840b1dac018499f5fe4ded1b4a",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libm.so.6"
+    },
+    {
+      "ref": "39b6701812ed7135f28df49352b3f6664c7a9f56880a3fe50c1b87cd7681db9b",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libgmp.so.10.5.0"
+    },
+    {
+      "ref": "390027e5f45f236bd1838bc54bf464c5ff01d260ab9f8b415ea8276641bce505",
+      "local-path": "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+    },
+    {
+      "ref": "66c2e08531e3515d79317b8791f675542ad3c8bc4aaa0f881cbd84ffe9d497bf",
+      "local-path": "/audit/results/a68e42cf-yjit-zjit-aarch64/ruby"
+    },
+    {
+      "ref": "0f1905dc27dbc6715875c70527bc8da846a10084c9c483e9d8ff76dce8d69d0e",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libc.so.6"
+    },
+    {
+      "ref": "b41cebf0be70f869bf60228cb5761f875ced865b0f4016f544d82f7a9ded28b0",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libcrypt.so.1.1.0"
+    },
+    {
+      "ref": "e3bc90ee8cce46778c2f46c2a3e580d3b930f7b455910f25ea400a0b797fb9dc",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libz.so.1.3"
+    }
+  ],
+  "interpreters": {
+    "ruby": {
+      "skip_native_resume": true
+    }
+  }
+}
