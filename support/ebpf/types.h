@@ -532,10 +532,10 @@ typedef struct RubyProcInfo {
   u8 vm_stack, vm_stack_size, cfp, thread_ptr;
 
   // rb_thread_struct offsets
-  u8 thread_vm;
+  u8 thread_vm, thread_ractor;
 
-  // rb_vm_struct offsets
-  u16 vm_objspace;
+  // rb_vm_struct offsets (before 4.1) and rb_ractor_struct offsets (4.1+)
+  u16 vm_objspace, ractor_objspace;
 
   // rb_objspace offsets
   u8 objspace_flags, objspace_size_of_flags;
