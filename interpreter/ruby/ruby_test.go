@@ -732,3 +732,24 @@ func TestRuby41SingletonClassName(t *testing.T) {
 	assert.True(t, singleton)
 	assert.Equal(t, libpf.Intern("Fixture"), name)
 }
+
+func TestRuby41AttachZJIT(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		entry      libpf.Address
+		wantMapped uint64
+	}{
+		{name: "build without ZJIT"},
+		{name: "ZJIT build, entry rebased by bias", entry: 0x2000, wantMapped: 0x3000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := ruby41TestData()
+			r.zjitEntryAddr = tc.entry
+			handler := &rubyTestEbpfHandler{}
+			_, err := r.Attach(handler, 1, 0x1000, remotememory.RemoteMemory{})
+			require.NoError(t, err)
+			require.Len(t, handler.procDataUpdates, 1)
+			assert.Equal(t, tc.wantMapped, handler.procDataUpdates[0].Zjit_entry_addr)
+		})
+	}
+}
