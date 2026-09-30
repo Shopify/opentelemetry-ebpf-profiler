@@ -150,6 +150,10 @@ type rubyData struct {
 	// (from DTPMOD64 relocation, the actual module ID is written by the linker at load time)
 	tlsModuleIdOffset libpf.Address
 
+	// Address of rb_zjit_entry. The eBPF program reads it on every stack walk
+	// because ZJIT can be enabled after the profiler attached.
+	zjitEntryAddr libpf.Address
+
 	// Address to global symbols, for id to string mappings
 	globalSymbolsAddr libpf.Address
 	// version of the currently used Ruby interpreter.
@@ -395,6 +399,9 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		Size_of_value: r.vmStructs.size_of_value,
 
 		Running_ec: r.vmStructs.rb_ractor_struct.running_ec,
+	}
+	if r.zjitEntryAddr != 0 {
+		cdata.Zjit_entry_addr = uint64(r.zjitEntryAddr + bias)
 	}
 
 	if err := ebpf.UpdateProcData(libpf.Ruby, pid, unsafe.Pointer(&cdata)); err != nil {
@@ -2122,6 +2129,15 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 			} else {
 				vms.rb_ractor_struct.running_ec = 0x218
 			}
+		}
+	}
+
+	if version >= rubyVersion(4, 1, 0) {
+		// ZJIT-enabled builds export rb_zjit_entry; it is non-zero while ZJIT
+		// runs, and then CFP_PC/CFP_ISEQ read the JIT frame instead of the CFP.
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/zjit.h#L204
+		if symbol, symbolErr := ef.LookupSymbol("rb_zjit_entry"); symbolErr == nil {
+			rid.zjitEntryAddr = libpf.Address(symbol.Address)
 		}
 	}
 

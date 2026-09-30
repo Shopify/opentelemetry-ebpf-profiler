@@ -285,6 +285,7 @@ type RubyProcInfo struct {
 	Has_objspace                 bool
 	Jit_start                    uint64
 	Jit_end                      uint64
+	Zjit_entry_addr              uint64
 	Vm_stack                     uint8
 	Vm_stack_size                uint8
 	Cfp                          uint8
@@ -343,7 +344,7 @@ const (
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4
 	sizeof_PHPProcInfo    = 0x18
-	sizeof_RubyProcInfo   = 0x60
+	sizeof_RubyProcInfo   = 0x68
 )
 
 const (
