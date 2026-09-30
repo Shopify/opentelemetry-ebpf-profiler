@@ -344,6 +344,23 @@ func TestFindJITRegion(t *testing.T) {
 			wantFound: false,
 		},
 		{
+			name: "heuristic fallback ignores the x86 vsyscall page",
+			mappings: []process.RawMapping{
+				execAnon(0x7f1000000000, 0x2000),
+				execAnon(0xffffffffff600000, 0x1000),
+			},
+			wantStart: 0x7f1000000000,
+			wantEnd:   0x7f1000000000 + 0x2000,
+			wantFound: true,
+		},
+		{
+			name: "vsyscall page alone is not a JIT region",
+			mappings: []process.RawMapping{
+				execAnon(0xffffffffff600000, 0x1000),
+			},
+			wantFound: false,
+		},
+		{
 			name: "labeled JIT region (single mapping)",
 			mappings: []process.RawMapping{
 				fileBacked(0x400000, 0x1000, "/usr/bin/ruby"),

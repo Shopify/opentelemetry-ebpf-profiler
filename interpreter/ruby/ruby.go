@@ -1431,7 +1431,9 @@ func findJITRegion(mappings []process.RawMapping) (uint64, uint64, bool) {
 	anonExecFound := false
 	for idx := range mappings {
 		m := &mappings[idx]
-		if !m.IsExecutable() || !m.IsAnonymous() {
+		// Coredumps can expose the x86 vsyscall page as unnamed executable
+		// memory. Kernel-half addresses cannot belong to a Ruby JIT reservation.
+		if !m.IsExecutable() || !m.IsAnonymous() || m.Vaddr >= 1<<63 {
 			continue
 		}
 
