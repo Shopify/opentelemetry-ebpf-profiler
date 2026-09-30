@@ -526,6 +526,10 @@ typedef struct RubyProcInfo {
   // JIT regions, for detecting if a native PC was JIT
   u64 jit_start, jit_end;
 
+  // Address of rb_zjit_entry, or zero for builds without ZJIT.
+  // Its value can change after process attachment when ZJIT is enabled.
+  u64 zjit_entry_addr;
+
   // Offsets and sizes of Ruby internal structs
 
   // rb_execution_context_struct offsets:
