@@ -1040,7 +1040,7 @@ func (r *rubyInstance) id2str(originalId uint64) (libpf.String, error) {
 	return symbolName, err
 }
 
-// readTypedDataPtr returns the struct wrapped by a T_DATA object, honouring
+// readTypedDataPtr returns the struct wrapped by a T_DATA object, honoring
 // embedded TypedData like RTYPEDDATA_GET_DATA.
 // https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/include/ruby/internal/core/rtypeddata.h#L628
 func (r *rubyInstance) readTypedDataPtr(object libpf.Address) (libpf.Address, error) {
