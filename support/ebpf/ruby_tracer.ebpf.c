@@ -45,6 +45,9 @@ BPF_RODATA_VAR(bool, ruby_skip_native_resume, false)
 #define RUBY_FL_USHIFT      12
 // https://github.com/ruby/ruby/blob/523857bfcb0f0cdfd1ed7faa09b9c59a0266e7e2/internal/imemo.h#L18
 #define IMEMO_MASK          0x0f
+// Ruby 4.1 widened the imemo type to five bits.
+// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/internal/imemo.h#L18
+#define IMEMO_MASK_41       0x1f
 // https://github.com/ruby/ruby/blob/523857bfcb0f0cdfd1ed7faa09b9c59a0266e7e2/internal/imemo.h#L33-L37
 #define IMEMO_SVAR          2
 #define IMEMO_MENT          6
@@ -57,8 +60,10 @@ BPF_RODATA_VAR(bool, ruby_skip_native_resume, false)
 #define VM_FRAME_MAGIC_CFUNC 0x55550001
 
 // https://github.com/ruby/ruby/blob/v3_4_5/gc/default/default.c#L459-L464
-#define GC_MODE_MASK 0x00000003 // bits 0-1 (2 bits for mode)
-#define GC_DURING_GC (1 << 5)   // bit 5
+#define GC_MODE_MASK    0x00000003 // bits 0-1 (2 bits for mode)
+#define GC_DURING_GC    (1 << 5)   // bit 5
+// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/gc/default/default.c#L610
+#define GC_DURING_GC_41 (1 << 6) // bit 6 since Ruby 4.1
 
 // Save on read ops by reading the whole control frame struct
 // as technically this reads too much memory
@@ -87,20 +92,24 @@ static EBPF_INLINE ErrorCode
 gc_check(const RubyProcInfo *rubyinfo, const void *current_ctx_addr, bool *is_gc, u8 *gc_mode)
 {
   void *thread_ptr;
-  void *vm;
+  void *gc_owner;
   void *objspace;
   u32 gc_flags;
+  // Since Ruby 4.1 each ractor owns its objspace: thread->ractor->objspace.
+  bool per_ractor     = rubyinfo->version >= 0x40100;
+  u8 owner_offset     = per_ractor ? rubyinfo->thread_ractor : rubyinfo->thread_vm;
+  u16 objspace_offset = per_ractor ? rubyinfo->ractor_objspace : rubyinfo->vm_objspace;
 
   if (bpf_probe_read_user(
         &thread_ptr, sizeof(thread_ptr), (void *)(current_ctx_addr + rubyinfo->thread_ptr))) {
     return ERR_RUBY_READ_CURRENT_THREAD;
   }
 
-  if (bpf_probe_read_user(&vm, sizeof(vm), (void *)(thread_ptr + rubyinfo->thread_vm))) {
+  if (bpf_probe_read_user(&gc_owner, sizeof(gc_owner), (void *)(thread_ptr + owner_offset))) {
     return ERR_RUBY_READ_CURRENT_VM;
   }
 
-  if (bpf_probe_read_user(&objspace, sizeof(objspace), (void *)(vm + rubyinfo->vm_objspace))) {
+  if (bpf_probe_read_user(&objspace, sizeof(objspace), (void *)(gc_owner + objspace_offset))) {
     return ERR_RUBY_READ_OBJSPACE;
   }
 
@@ -109,7 +118,7 @@ gc_check(const RubyProcInfo *rubyinfo, const void *current_ctx_addr, bool *is_gc
     return ERR_RUBY_READ_OBJSPACE_FLAGS;
   }
 
-  if (gc_flags & GC_DURING_GC) {
+  if (gc_flags & (per_ractor ? GC_DURING_GC_41 : GC_DURING_GC)) {
     *is_gc   = true;
     *gc_mode = (u8)gc_flags & GC_MODE_MASK;
   } else {
@@ -143,23 +152,24 @@ push_ruby(UnwindState *state, Trace *trace, u8 frame_type, u64 file, u64 line, u
 static EBPF_INLINE ErrorCode read_ruby_frame(
   PerCPURecord *record, const RubyProcInfo *rubyinfo, void *stack_ptr, int *next_unwinder)
 {
-  Trace *trace     = &record->trace;
+  Trace *trace              = &record->trace;
   // Type of frame we found and are pushing
-  u8 frame_type    = RUBY_FRAME_TYPE_NONE;
+  u8 frame_type             = RUBY_FRAME_TYPE_NONE;
   // Actual frame address of the given type
-  u64 frame_addr   = 0;
+  u64 frame_addr            = 0;
   // Address of the cfp->iseq, used to get the line number using the pc
-  u64 iseq_addr    = 0;
-  u64 pc           = 0;
+  u64 iseq_addr             = 0;
+  u64 pc                    = 0;
   // The maximum number of environment pointers to walk to find a 'local' env
-  u64 ep_check     = 0;
-  u64 rbasic_flags = 0;
-  u64 imemo_mask   = 0;
-  u64 me_or_cref   = 0;
-  u64 svar_cref    = 0;
-  u64 frame_flags  = 0;
-  bool cfunc       = false;
-  void *current_ep = NULL;
+  u64 ep_check              = 0;
+  u64 rbasic_flags          = 0;
+  u64 imemo_mask            = 0;
+  const u64 imemo_type_mask = rubyinfo->version >= 0x40100 ? IMEMO_MASK_41 : IMEMO_MASK;
+  u64 me_or_cref            = 0;
+  u64 svar_cref             = 0;
+  u64 frame_flags           = 0;
+  bool cfunc                = false;
+  void *current_ep          = NULL;
 
   vm_env_t vm_env;
   rb_control_frame_t control_frame;
@@ -217,7 +227,7 @@ static EBPF_INLINE ErrorCode read_ruby_frame(
       }
 
       // https://github.com/ruby/ruby/blob/3361aa5c7df35b1d1daea578fefec3addf29c9a6/internal/imemo.h#L165-L169
-      imemo_mask = (rbasic_flags >> RUBY_FL_USHIFT) & IMEMO_MASK;
+      imemo_mask = (rbasic_flags >> RUBY_FL_USHIFT) & imemo_type_mask;
 
       // If the imemo is ever a method entry, we don't need to check further
       if (imemo_mask == IMEMO_MENT)
@@ -259,7 +269,7 @@ static EBPF_INLINE ErrorCode read_ruby_frame(
         increment_metric(metricID_UnwindRubyErrReadRbasicFlags);
         return ERR_RUBY_READ_RBASIC_FLAGS;
       }
-      imemo_mask = (rbasic_flags >> RUBY_FL_USHIFT) & IMEMO_MASK;
+      imemo_mask = (rbasic_flags >> RUBY_FL_USHIFT) & imemo_type_mask;
     }
   }
 
