@@ -1586,25 +1586,6 @@ func rubyUses406Layout(version uint32, description string) bool {
 		strings.Contains(description, " revision "+ruby405PShopifyRevision+")")
 }
 
-// ruby41Revision is the only Ruby 4.1 development revision whose VM layout has
-// been verified. 4.1 layouts still change between development snapshots, so the
-// 4.1.0 version string alone must not select them.
-const ruby41Revision = "a68e42cfad16857e146d27044c9116cd4bae950b"
-
-// rubyUses41Layout reports whether a binary is the verified Ruby 4.1 revision.
-// ruby_revision is a local symbol and may be stripped; the exported
-// ruby_description embeds the abbreviated revision.
-func rubyUses41Layout(version uint32, revision, description string) bool {
-	if version != rubyVersion(4, 1, 0) {
-		return false
-	}
-	if revision != "" {
-		return revision == ruby41Revision
-	}
-	return strings.HasPrefix(description, "ruby 4.1.0dev (") &&
-		strings.Contains(description, " shopify "+ruby41Revision[:10]+")")
-}
-
 func GetLoader(_ Config) interpreter.Loader {
 	return interpreter.NewLoader(loader, []interpreter.InterpreterResource{
 		{MapName: BPFMapName, ProgID: uint32(support.ProgUnwindRuby), ProgName: "unwind_ruby"},
@@ -1628,7 +1609,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	}
 
 	var description string
-	if version == rubyVersion(4, 0, 5) || version == rubyVersion(4, 1, 0) {
+	if version == rubyVersion(4, 0, 5) {
 		if _, memory, descriptionErr := ef.SymbolData("ruby_description", 128); descriptionErr == nil {
 			description = strings.TrimRight(pfunsafe.ToString(memory), "\x00")
 		}
@@ -1641,18 +1622,11 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// Reason for lowest supported version:
 	// - Ruby 2.5 is still commonly used at time of writing this code.
 	//   https://www.jetbrains.com/lp/devecosystem-2020/ruby/
-	// Reason for maximum supported version 4.0.x:
-	// - Ruby 4.0 was released December 2025 with ZJIT and redesigned Ractor Port API
-	// Ruby 4.1 is accepted only for verified development revisions.
-	var revision string
-	if version == rubyVersion(4, 1, 0) {
-		if _, memory, revisionErr := ef.SymbolData("ruby_revision", 64); revisionErr == nil {
-			revision = strings.TrimRight(pfunsafe.ToString(memory), "\x00")
-		}
-	}
-	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(4, 1, 0)
-	if version < minVer || (version >= maxVer && !rubyUses41Layout(version, revision, description)) {
-		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and < %d.%d.%d, or an audited 4.1 revision)",
+	// Reason for maximum supported version 4.1.x:
+	// - Ruby 4.1 layouts were measured on Shopify/ruby a68e42cf (4.1.0dev); 4.2 is unverified.
+	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(4, 2, 0)
+	if version < minVer || version >= maxVer {
+		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and < %d.%d.%d)",
 			(version>>16)&0xff, (version>>8)&0xff, version&0xff,
 			(minVer>>16)&0xff, (minVer>>8)&0xff, minVer&0xff,
 			(maxVer>>16)&0xff, (maxVer>>8)&0xff, maxVer&0xff)
