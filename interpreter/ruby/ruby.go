@@ -1853,13 +1853,23 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		} else {
 			vms.vm_struct.gc_objspace = 1152
 		}
+		if version >= rubyVersion(3, 2, 3) {
+			// Ruby 3.2.3 added loaded_features_realpath_map before objspace.
+			// https://github.com/ruby/ruby/commit/5baf94f9131fb45d50c8c408e007a138ced46606
+			vms.vm_struct.gc_objspace += 8
+		}
+		if version >= rubyVersion(3, 2, 4) {
+			// Ruby 3.2.4 made static_ext_inits unconditional, adding another pointer.
+			// https://github.com/ruby/ruby/commit/baa5bc16c17e3b4dac7b590ed5d6b7e705535e15
+			vms.vm_struct.gc_objspace += 8
+		}
 		vms.objspace.flags = 16
 	case version < rubyVersion(3, 4, 0):
 		rid.hasObjspace = true
 		if runtime.GOARCH == "amd64" {
 			vms.vm_struct.gc_objspace = 1304
 		} else {
-			vms.vm_struct.gc_objspace = 1320
+			vms.vm_struct.gc_objspace = 1328
 		}
 		vms.objspace.flags = 16
 	case version >= rubyVersion(4, 0, 0) && version < rubyVersion(4, 1, 0):
