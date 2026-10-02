@@ -285,12 +285,15 @@ type RubyProcInfo struct {
 	Has_objspace                 bool
 	Jit_start                    uint64
 	Jit_end                      uint64
+	Zjit_entry_addr              uint64
 	Vm_stack                     uint8
 	Vm_stack_size                uint8
 	Cfp                          uint8
 	Thread_ptr                   uint8
 	Thread_vm                    uint8
+	Thread_ractor                uint8
 	Vm_objspace                  uint16
+	Ractor_objspace              uint16
 	Objspace_flags               uint8
 	Objspace_size_of_flags       uint8
 	Pc                           uint8
@@ -301,7 +304,7 @@ type RubyProcInfo struct {
 	Cme_method_def               uint8
 	Size_of_value                uint8
 	Running_ec                   uint16
-	Pad_cgo_0                    [4]byte
+	Pad_cgo_0                    [2]byte
 }
 type V8ProcInfo struct {
 	Version                      uint32
@@ -341,7 +344,7 @@ const (
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4
 	sizeof_PHPProcInfo    = 0x18
-	sizeof_RubyProcInfo   = 0x60
+	sizeof_RubyProcInfo   = 0x68
 )
 
 const (

@@ -4,7 +4,9 @@
 package ruby // import "go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
 
 import (
+	"bytes"
 	"debug/elf"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"unsafe"
@@ -14,6 +16,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/lpm"
 	"go.opentelemetry.io/ebpf-profiler/process"
+	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/support"
 
 	"github.com/stretchr/testify/assert"
@@ -533,4 +536,220 @@ func TestSynchronizeMappingsRetriesProcDataAfterUpdateFailure(t *testing.T) {
 	require.NotEmpty(t, handler.calls)
 	assert.Equal(t, "proc-data", handler.calls[0])
 	assert.Positive(t, handler.mappingUpdates)
+}
+
+// ruby41TestData returns the Ruby 4.1 offsets that loader() selects and that
+// the symbolization tests below depend on.
+func ruby41TestData() *rubyData {
+	r := &rubyData{
+		version:         rubyVersion(4, 1, 0),
+		lastOpId:        174,
+		hasClassPath:    true,
+		hasObjspace:     true,
+		rubyFlSingleton: libpf.Address(RUBY_FL_USER1),
+	}
+	vms := &r.vmStructs
+	vms.iseq_struct.body = 8
+	vms.iseq_constant_body.location = 64
+	vms.iseq_constant_body.local_iseq = 160
+	vms.iseq_location_struct.label = 8
+	vms.iseq_location_struct.size_of_iseq_location_struct = 16
+	vms.rclass_and_rb_classext_t.classext = 24
+	vms.rb_classext_struct.classpath = 24
+	vms.rb_classext_struct.as_singleton_class_attached_object = 104
+	vms.size_of_value = 8
+	vms.rb_symbols_t.ids = 16
+	vms.rtypeddata_struct.data_type = 24
+	vms.rtypeddata_struct.data = 32
+	vms.rtypeddata_struct.size_of_rtypeddata = 40
+	vms.id_entry_dir_struct.entries = 8
+	vms.rb_darray_struct.data = 16
+	vms.sym_id_entry_struct.str = 8
+	vms.sym_id_entry_struct.size_of_sym_id_entry = 16
+	vms.thread_struct.ractor = 24
+	vms.rb_ractor_struct.objspace = 616
+	vms.objspace.flags = 76
+	return r
+}
+
+func attachRubyTest(t *testing.T, r *rubyData, memory []byte, strings map[libpf.Address]string,
+) (*rubyInstance, *rubyTestEbpfHandler) {
+	t.Helper()
+	handler := &rubyTestEbpfHandler{}
+	inst, err := r.Attach(handler, 1, 0, remotememory.RemoteMemory{ReaderAt: bytes.NewReader(memory)})
+	require.NoError(t, err)
+	ri := inst.(*rubyInstance)
+	for address, text := range strings {
+		ri.addrToString.Add(address, libpf.Intern(text))
+	}
+	return ri, handler
+}
+
+func TestRuby41AttachProcInfo(t *testing.T) {
+	_, handler := attachRubyTest(t, ruby41TestData(), make([]byte, 64), nil)
+	require.Len(t, handler.procDataUpdates, 1)
+	got := handler.procDataUpdates[0]
+	assert.True(t, got.Has_objspace)
+	assert.Equal(t, uint8(24), got.Thread_ractor)
+	assert.Equal(t, uint16(616), got.Ractor_objspace)
+	assert.Equal(t, uint8(76), got.Objspace_flags)
+	assert.Equal(t, uint8(8), got.Body)
+}
+
+func TestRuby41BaseLabels(t *testing.T) {
+	const iseq, parentIseq, body, parentBody = 0x180, 0x200, 0x400, 0x800
+	labels := map[libpf.Address]string{
+		0x1000: "fixture.rb", 0x1100: "block in outer", 0x1200: "outer",
+		0x1300: "old base", 0x1400: "old method",
+	}
+	for _, tc := range []struct {
+		name                 string
+		ruby40               bool
+		localIseq            uint64
+		localType            uint32
+		wantBase, wantMethod string
+	}{
+		{name: "block uses local iseq label", localIseq: parentIseq, localType: iseqTypeMethod,
+			wantBase: "outer", wantMethod: "outer"},
+		{name: "local iseq is itself", localIseq: iseq, localType: iseqTypeMethod,
+			wantBase: "block in outer", wantMethod: "block in outer"},
+		{name: "no local iseq", wantBase: "block in outer"},
+		{name: "local iseq is not a method", localIseq: parentIseq, wantBase: "outer"},
+		{name: "ruby 4.0 reads stored base_label", ruby40: true, localIseq: parentIseq,
+			localType: iseqTypeMethod, wantBase: "old base", wantMethod: "old method"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := ruby41TestData()
+			vms := &r.vmStructs
+			if tc.ruby40 {
+				r.version = rubyVersion(4, 0, 7)
+				vms.iseq_struct.body = 16
+				vms.iseq_constant_body.local_iseq = 176
+				vms.iseq_location_struct.base_label = 8
+				vms.iseq_location_struct.label = 16
+				vms.iseq_location_struct.size_of_iseq_location_struct = 24
+			}
+			memory := make([]byte, 0x2000)
+			put := func(at, value uint64) { binary.LittleEndian.PutUint64(memory[at:], value) }
+			location := uint64(vms.iseq_constant_body.location)
+			put(iseq+uint64(vms.iseq_struct.body), body)
+			put(parentIseq+uint64(vms.iseq_struct.body), parentBody)
+			put(body+uint64(vms.iseq_constant_body.local_iseq), tc.localIseq)
+			put(body+location, 0x1000) // pathobj
+			put(body+location+uint64(vms.iseq_location_struct.label), 0x1100)
+			put(parentBody+location+uint64(vms.iseq_location_struct.label), 0x1200)
+			if tc.ruby40 {
+				put(body+location+8, 0x1300)
+				put(parentBody+location+8, 0x1400)
+			}
+			localBody := uint64(parentBody)
+			if tc.localIseq == iseq {
+				localBody = body
+			}
+			binary.LittleEndian.PutUint32(memory[localBody:], tc.localType)
+
+			ri, _ := attachRubyTest(t, r, memory, labels)
+			got, err := ri.readIseqBody(body, 0, 0)
+			require.NoError(t, err)
+			assert.Equal(t, libpf.Intern("block in outer"), got.label)
+			assert.Equal(t, libpf.Intern(tc.wantBase), got.baseLabel)
+			assert.Equal(t, libpf.Intern(tc.wantMethod), got.methodName)
+			assert.Equal(t, libpf.Intern("fixture.rb"), got.sourceFileName)
+		})
+	}
+}
+
+func TestRuby41SymbolDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		serial, capacity, size uint64
+		embedded, emptyBucket  bool
+		wantErr                bool
+	}{
+		{name: "operator", serial: 43, capacity: 2, size: 512},
+		{name: "dynamic symbol", serial: 519, capacity: 2, size: 512},
+		{name: "last bucket entry", serial: 1023, capacity: 2, size: 512},
+		{name: "embedded TypedData", serial: 519, capacity: 2, size: 512, embedded: true},
+		{name: "beyond directory", serial: 512, capacity: 1, size: 512, wantErr: true},
+		{name: "beyond bucket", serial: 519, capacity: 2, size: 7, wantErr: true},
+		{name: "empty bucket", serial: 519, capacity: 2, size: 512, emptyBucket: true, wantErr: true},
+		{name: "zero serial", capacity: 2, size: 512, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := ruby41TestData()
+			r.globalSymbolsAddr = 0x100
+			memory := make([]byte, 0x6000)
+			put := func(at, value uint64) { binary.LittleEndian.PutUint64(memory[at:], value) }
+			put(0x100, 2048)  // ruby_global_symbols.next_id
+			put(0x110, 0x200) // ruby_global_symbols.ids
+			dir, bucket := uint64(0x300), uint64(0x800)
+			put(0x200, rubyTData)
+			put(0x500, rubyTData)
+			if tc.embedded {
+				dir, bucket = 0x220, 0x520
+				put(0x218, typedDataEmbedded)
+				put(0x518, typedDataEmbedded)
+			} else {
+				put(0x220, dir)
+				put(0x520, bucket)
+			}
+			put(dir, tc.capacity)
+			put(dir+8, 0x400) // entries
+			if !tc.emptyBucket {
+				put(0x400+(tc.serial/512)*8, 0x500)
+			}
+			put(bucket, tc.size)
+			// struct sym_id_entry is {sym, str}.
+			put(bucket+16+(tc.serial%512)*16, 0xdead)
+			put(bucket+16+(tc.serial%512)*16+8, 0x5000)
+
+			ri, _ := attachRubyTest(t, r, memory, map[libpf.Address]string{0x5000: "sleep"})
+			id := tc.serial
+			if id > r.lastOpId {
+				id <<= rubyIdScopeShift
+			}
+			got, err := ri.id2str(id)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, libpf.Intern("sleep"), got)
+		})
+	}
+}
+
+func TestRuby41SingletonClassName(t *testing.T) {
+	r := ruby41TestData()
+	memory := make([]byte, 0x6000)
+	put := func(at, value uint64) { binary.LittleEndian.PutUint64(memory[at:], value) }
+	put(0x100, 2|uint64(r.rubyFlSingleton)) // singleton T_CLASS
+	put(0x100+24+104, 0x300)                // attached_object sits after classpath
+	put(0x300+24+24, 0x5000)                // attached class's classpath
+	ri, _ := attachRubyTest(t, r, memory, map[libpf.Address]string{0x5000: "Fixture"})
+	name, singleton, err := ri.readClassName(0x100)
+	require.NoError(t, err)
+	assert.True(t, singleton)
+	assert.Equal(t, libpf.Intern("Fixture"), name)
+}
+
+func TestRuby41AttachZJIT(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		entry      libpf.Address
+		wantMapped uint64
+	}{
+		{name: "build without ZJIT"},
+		{name: "ZJIT build, entry rebased by bias", entry: 0x2000, wantMapped: 0x3000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := ruby41TestData()
+			r.zjitEntryAddr = tc.entry
+			handler := &rubyTestEbpfHandler{}
+			_, err := r.Attach(handler, 1, 0x1000, remotememory.RemoteMemory{})
+			require.NoError(t, err)
+			require.Len(t, handler.procDataUpdates, 1)
+			assert.Equal(t, tc.wantMapped, handler.procDataUpdates[0].Zjit_entry_addr)
+		})
+	}
 }
