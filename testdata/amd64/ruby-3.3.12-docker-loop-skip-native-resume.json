@@ -1,0 +1,99 @@
+{
+  "coredump-ref": "b2edf48bbcba9e415d7c00dc3be86852f7c1bfff2c44509918911ca78517721e",
+  "interpreters": {
+    "python": {},
+    "perl": {},
+    "php": {},
+    "hotspot": {},
+    "ruby": {
+      "skip_native_resume": true
+    },
+    "v8": {},
+    "dotnet": {},
+    "go": {
+      "labels": {},
+      "symbolization": {}
+    },
+    "beam": {},
+    "luajit": {}
+  },
+  "threads": [
+    {
+      "lwp": 3124,
+      "frames": [
+        "libruby.so.3.3.12+0x217070",
+        "libruby.so.3.3.12+0x30939a",
+        "libruby.so.3.3.12+0x31b3ef",
+        "Process.clock_gettime+0 in <cfunc>:0",
+        "Object#ruby_hot_loop+0 in /fixtures/hot.rb:2",
+        "Object#ruby_mid+0 in /fixtures/hot.rb:7",
+        "Object#ruby_outer+0 in /fixtures/hot.rb:8",
+        "block in <main>+0 in /fixtures/hot.rb:10",
+        "Kernel#loop+0 in <internal:kernel>:187",
+        "<main>+0 in /fixtures/hot.rb:10"
+      ]
+    },
+    {
+      "lwp": 3125,
+      "frames": [
+        "libc.so.6+0x9a72e",
+        "libc.so.6+0x8f387",
+        "libc.so.6+0x8f3cc",
+        "libc.so.6+0x1107ec",
+        "libruby.so.3.3.12+0x2c84b6",
+        "libc.so.6+0x928ba",
+        "libc.so.6+0x110537"
+      ]
+    }
+  ],
+  "modules": [
+    {
+      "ref": "5e9b0dee716dc9b9d38ca33cb78d44ad700a27d8abfead4aabe66ddb8bb330d6",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/local/lib/ruby/3.3.0/x86_64-linux/enc/trans/transdb.so"
+    },
+    {
+      "ref": "9792e3cbb541c8f44c7acf5f14f4022ea62998ecc787d326bed4d8b6547dfd92",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/lib/x86_64-linux-gnu/libc.so.6"
+    },
+    {
+      "ref": "6b075a5c55e343af52d0d3321e2aebc03049ea85c604d90edb1c64fbb85fd2b7",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/local/lib/libruby.so.3.3.12"
+    },
+    {
+      "ref": "436788729ab71d794a66954d62e930c723e624587f39beb2f4f86ff1000b1d29",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/lib/x86_64-linux-gnu/libcrypt.so.1.1.0"
+    },
+    {
+      "ref": "d15e1585c6c267296459570c8ac217ca9123044bcd4e896d2f686b32333445d2",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/lib/x86_64-linux-gnu/libgmp.so.10.5.0"
+    },
+    {
+      "ref": "85590dd58edf5445e18bc7193e5ebc01ac5841f1ae187e97705a662e90c6421e",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/lib/x86_64-linux-gnu/libz.so.1.3.1"
+    },
+    {
+      "ref": "96ebc7d6766a3c3b568a8a7f3fc5b3f618daffb742d13f3ee2b57a6bfafc76f4",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/local/bin/ruby"
+    },
+    {
+      "ref": "fbd7bf26cbde032be5a5194d8ca18e8d4bd8e4c29588ca2500be933b9d63d4f4",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/local/lib/ruby/3.3.0/x86_64-linux/monitor.so"
+    },
+    {
+      "ref": "6d567d53e895273ca14a1f9dc164fc6c8d39aed2f60aa46a733c2784228915f3",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/lib/x86_64-linux-gnu/libm.so.6"
+    },
+    {
+      "ref": "0ea580af587037b80c9e8bc867133733b6818f7dafafe43a420e9c0457bbda24",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/local/lib/ruby/3.3.0/x86_64-linux/enc/encdb.so"
+    },
+    {
+      "ref": "30c61ab012a4241bed033725a09b61f5fdd3bb7df95ee852d0b096520524c7af",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/lib/x86_64-linux-gnu/libgcc_s.so.1"
+    },
+    {
+      "ref": "c8438e4fde1934e61c88311633f00949ff645d5c04cdb8671fa3d78164d2f307",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.3.12/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+    }
+  ]
+}

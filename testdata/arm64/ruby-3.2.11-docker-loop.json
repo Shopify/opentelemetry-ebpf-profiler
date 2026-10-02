@@ -1,0 +1,82 @@
+{
+  "coredump-ref": "28159fc2c2612aa9bd82a80180e4da6ca910b88ab1a5e57fc5da3d4351dac610",
+  "threads": [
+    {
+      "lwp": 38252,
+      "frames": [
+        "libruby.so.3.2.11+0x225dec",
+        "libruby.so.3.2.11+0x30879b",
+        "libruby.so.3.2.11+0x317ebb",
+        "libruby.so.3.2.11+0x31da33",
+        "libruby.so.3.2.11+0x31ee83",
+        "libruby.so.3.2.11+0x135e9b",
+        "libruby.so.3.2.11+0x1360cb",
+        "libruby.so.3.2.11+0x30879b",
+        "libruby.so.3.2.11+0x30e603",
+        "libruby.so.3.2.11+0x3189d7",
+        "clock_gettime+0 in <cfunc>:0",
+        "ruby_hot_loop+0 in /fixtures/hot.rb:2",
+        "ruby_mid+0 in /fixtures/hot.rb:7",
+        "ruby_outer+0 in /fixtures/hot.rb:8",
+        "block in <main>+0 in /fixtures/hot.rb:10",
+        "libruby.so.3.2.11+0x31da33",
+        "libruby.so.3.2.11+0x1318a7",
+        "libruby.so.3.2.11+0x1380ff",
+        "ruby+0xbaf",
+        "libc.so.6+0x2225b",
+        "libc.so.6+0x2233b",
+        "ruby+0xc2f"
+      ]
+    }
+  ],
+  "modules": [
+    {
+      "ref": "5a42ec4ba014ba72d7a820cfe12056924ac1a4a66f99eb89ae650c2bf26d6857",
+      "local-path": "/usr/local/lib/libruby.so.3.2.11"
+    },
+    {
+      "ref": "6028a51da4070c0e18977b5580656c7678cc916d04ea94c7be0e09709cb8093a",
+      "local-path": "/usr/local/lib/ruby/3.2.0/aarch64-linux/enc/encdb.so"
+    },
+    {
+      "ref": "9a146967dc38c3820c5dc21c3209812655f66b6551264072b187bd0e787947e0",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libgcc_s.so.1"
+    },
+    {
+      "ref": "a8afb2d1f4a0c5e14c0fc82f794ec839eafe29738907aa92895410f57630bbe2",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libm.so.6"
+    },
+    {
+      "ref": "8858b931d041b74a8ce9dcb16d9912eb431c4f55b97ca2e58646a1c1bd991852",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libgmp.so.10.5.0"
+    },
+    {
+      "ref": "6fe00acadf8119ff245855e5dcc7f26c6c0ffaf4bfa2baa88feab58f23727d65",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libz.so.1.3.1"
+    },
+    {
+      "ref": "52a8dc3663b1068c45fb325ad32134a11764973785eee99cb2ee84aa62b7b0f1",
+      "local-path": "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+    },
+    {
+      "ref": "6e9493cfd9804eaea72e08fd88033048ee99947909efaeb72eb4d20e1742a06c",
+      "local-path": "/usr/local/bin/ruby"
+    },
+    {
+      "ref": "6ba8868a6926f39890d3a84f9ca8a898aece497d253de758225c924790888c21",
+      "local-path": "/usr/local/lib/ruby/3.2.0/aarch64-linux/monitor.so"
+    },
+    {
+      "ref": "d0a21e2ba2d3ee061c353504e8f738b6e46e1ad4feac926c55266f49e1d67949",
+      "local-path": "/usr/local/lib/ruby/3.2.0/aarch64-linux/enc/trans/transdb.so"
+    },
+    {
+      "ref": "53ccedf551e22a6935fab85293ed22590b3c0d0d413c6f73878eb3acc7b08eff",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libc.so.6"
+    },
+    {
+      "ref": "fc0165e3cbff299baa266b5531ac9054fff35786bf3ffa46f6eae5650d9bd8c8",
+      "local-path": "/usr/lib/aarch64-linux-gnu/libcrypt.so.1.1.0"
+    }
+  ]
+}

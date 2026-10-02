@@ -1,0 +1,12 @@
+{
+  "scanned_unique_raw_objects": 99,
+  "raw_bytes": 4026515600,
+  "patterns": [
+    "private-key-header",
+    "credential-format",
+    "private-identity-or-host",
+    "credential-environment"
+  ],
+  "findings": [],
+  "environment_check": "All targets contain exactly PATH, HOME=/root, LANG=C.UTF-8; no inherited host credentials."
+}

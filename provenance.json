@@ -1,0 +1,494 @@
+{
+  "captured_on": "2026-10-02",
+  "source_fix_commit": "f7eecf8e6482124b65017e1baf8f16cb4d893c75",
+  "upstream_validation_base": "988adbe7441e988b9a684f3ac60abca3565874c0",
+  "issue": "https://github.com/open-telemetry/opentelemetry-ebpf-profiler/issues/1934",
+  "reporter_followup": "https://github.com/open-telemetry/opentelemetry-ebpf-profiler/issues/1934#issuecomment-5959988616",
+  "captures": {
+    "568e8e7e2847bda426aa8952534e5eade2661f42751e7c9792b10f55cefad24d": {
+      "architecture": "arm64",
+      "version": "3.2.11",
+      "mode": "gc",
+      "image": {
+        "version": "3.2.11",
+        "index": "ruby:3.2-slim@sha256:84184c9e2c368885a1d0c93ad1953c33d81081058d274b87b4aa6f3e209e5d16",
+        "child": "ruby@sha256:cde33c190fa2a80810c0be7ebe3c419138307983b44175fd7972d08373bfe529",
+        "image_id": "sha256:b368766d5213e1d623e80df8078d1c30d21d8675845f9ea5d9074d8133df6ee9",
+        "architecture": "arm64",
+        "repo_digests": [
+          "ruby@sha256:84184c9e2c368885a1d0c93ad1953c33d81081058d274b87b4aa6f3e209e5d16",
+          "ruby@sha256:cde33c190fa2a80810c0be7ebe3c419138307983b44175fd7972d08373bfe529"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.11",
+        "objspace_offset": 1168,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_roots"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "568e8e7e2847bda426aa8952534e5eade2661f42751e7c9792b10f55cefad24d",
+      "execution": "native arm64 Docker container"
+    },
+    "28159fc2c2612aa9bd82a80180e4da6ca910b88ab1a5e57fc5da3d4351dac610": {
+      "architecture": "arm64",
+      "version": "3.2.11",
+      "mode": "loop",
+      "image": {
+        "version": "3.2.11",
+        "index": "ruby:3.2-slim@sha256:84184c9e2c368885a1d0c93ad1953c33d81081058d274b87b4aa6f3e209e5d16",
+        "child": "ruby@sha256:cde33c190fa2a80810c0be7ebe3c419138307983b44175fd7972d08373bfe529",
+        "image_id": "sha256:b368766d5213e1d623e80df8078d1c30d21d8675845f9ea5d9074d8133df6ee9",
+        "architecture": "arm64",
+        "repo_digests": [
+          "ruby@sha256:84184c9e2c368885a1d0c93ad1953c33d81081058d274b87b4aa6f3e209e5d16",
+          "ruby@sha256:cde33c190fa2a80810c0be7ebe3c419138307983b44175fd7972d08373bfe529"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.11",
+        "objspace_offset": 1168,
+        "during_gc": 0,
+        "mode": 0,
+        "flags": "{mode = 0, immediate_sweep = 0, dont_gc = 0, dont_incremental = 0, during_gc = 0, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 1, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "rb_clock_gettime"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "28159fc2c2612aa9bd82a80180e4da6ca910b88ab1a5e57fc5da3d4351dac610",
+      "execution": "native arm64 Docker container"
+    },
+    "ffd008d5808c9746ef89d1e1ca9f5e725778a242f04c9ee95c90dd902af77f26": {
+      "architecture": "arm64",
+      "version": "3.2.2",
+      "mode": "gc",
+      "image": {
+        "version": "3.2.2",
+        "index": "ruby:3.2.2-slim",
+        "child": "ruby@sha256:a1b6cb00522bdf2eaf0835a992c78cbb125a07ea8fd588a950dc51fc73b75b3a",
+        "image_id": "sha256:3f9b8aa15178bdeb4ab124139fc9f6b07816ccabaa877e979855621603fde476",
+        "architecture": "arm64",
+        "repo_digests": [
+          "ruby@sha256:a1b6cb00522bdf2eaf0835a992c78cbb125a07ea8fd588a950dc51fc73b75b3a"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.2",
+        "objspace_offset": 1152,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_stacked_objects"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "ffd008d5808c9746ef89d1e1ca9f5e725778a242f04c9ee95c90dd902af77f26",
+      "execution": "native arm64 Docker container"
+    },
+    "38458ad52463942f095f71568771067b557c6f20a340f869c54f6aa0b2c4d771": {
+      "architecture": "arm64",
+      "version": "3.2.3",
+      "mode": "gc",
+      "image": {
+        "version": "3.2.3",
+        "index": "ruby:3.2.3-slim@sha256:0d7326044980c6c4707af9a4de7c441df38794d35ca8e69eebc84983c578646b",
+        "child": "ruby@sha256:c50271f39b5b3494fa027d18e63a09f5708749e0cf106bdfe8a076a0655dc638",
+        "image_id": "sha256:cb0a229152a49c54959b88bab3c25fa826f0b7e67c96ebf2ee7bff0f5038682a",
+        "architecture": "arm64",
+        "repo_digests": [
+          "ruby@sha256:c50271f39b5b3494fa027d18e63a09f5708749e0cf106bdfe8a076a0655dc638"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.3",
+        "objspace_offset": 1160,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_stacked_objects"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "38458ad52463942f095f71568771067b557c6f20a340f869c54f6aa0b2c4d771",
+      "execution": "native arm64 Docker container"
+    },
+    "b72b3b8e49f3addf0f9fb3b326652037d7352dae8900fbda16d8d6d5a36dba7e": {
+      "architecture": "arm64",
+      "version": "3.2.4",
+      "mode": "gc",
+      "image": {
+        "version": "3.2.4",
+        "index": "ruby:3.2.4-slim@sha256:3e345863daec63492301440639ee6ad5554ad2edf20c6de4eb1c8b1d0d4459d6",
+        "child": "ruby@sha256:1215121352ff23b2dabb7a46b2a620c750e70ec637262fbb5efe3175298e895e",
+        "image_id": "sha256:5045c4e2b597fda76b46d0a321508191f8177839bd9fc616f5764da3c037f7cd",
+        "architecture": "arm64",
+        "repo_digests": [
+          "ruby@sha256:1215121352ff23b2dabb7a46b2a620c750e70ec637262fbb5efe3175298e895e"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.4",
+        "objspace_offset": 1168,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_stacked_objects"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "b72b3b8e49f3addf0f9fb3b326652037d7352dae8900fbda16d8d6d5a36dba7e",
+      "execution": "native arm64 Docker container"
+    },
+    "344655c009d6442894b07dbb83cd5858cf0916d79105d822aef04f7547d5b1db": {
+      "architecture": "arm64",
+      "version": "3.3.12",
+      "mode": "gc",
+      "image": {
+        "version": "3.3.12",
+        "index": "ruby:3.3-slim@sha256:2bbd17947b9c898f46aedb91924fff8f4246ba39beaf51a726bad6ddae1d3094",
+        "child": "ruby@sha256:e2cd1313aebd6fe2bf71595fe59973c16e706ddfe24747db3ad7acb73ac4a3a6",
+        "image_id": "sha256:396c461f0ba05872e650c89bd19905295bc5a621a7e3c6b6762f388b4a4f368d",
+        "architecture": "arm64",
+        "repo_digests": [
+          "ruby@sha256:2bbd17947b9c898f46aedb91924fff8f4246ba39beaf51a726bad6ddae1d3094",
+          "ruby@sha256:e2cd1313aebd6fe2bf71595fe59973c16e706ddfe24747db3ad7acb73ac4a3a6"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.3.12",
+        "objspace_offset": 1328,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, during_reference_updating = 0, gc_stressful = 0, has_newobj_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_roots"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "344655c009d6442894b07dbb83cd5858cf0916d79105d822aef04f7547d5b1db",
+      "execution": "native arm64 Docker container"
+    },
+    "7778732b68803bf830acb63ce79328b567b852c537f8f7d0789f8adf8c9f998e": {
+      "architecture": "arm64",
+      "version": "3.3.12",
+      "mode": "loop",
+      "image": {
+        "version": "3.3.12",
+        "index": "ruby:3.3-slim@sha256:2bbd17947b9c898f46aedb91924fff8f4246ba39beaf51a726bad6ddae1d3094",
+        "child": "ruby@sha256:e2cd1313aebd6fe2bf71595fe59973c16e706ddfe24747db3ad7acb73ac4a3a6",
+        "image_id": "sha256:396c461f0ba05872e650c89bd19905295bc5a621a7e3c6b6762f388b4a4f368d",
+        "architecture": "arm64",
+        "repo_digests": [
+          "ruby@sha256:2bbd17947b9c898f46aedb91924fff8f4246ba39beaf51a726bad6ddae1d3094",
+          "ruby@sha256:e2cd1313aebd6fe2bf71595fe59973c16e706ddfe24747db3ad7acb73ac4a3a6"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.3.12",
+        "objspace_offset": 1328,
+        "during_gc": 0,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 0, dont_gc = 0, dont_incremental = 0, during_gc = 0, during_compacting = 0, during_reference_updating = 0, gc_stressful = 0, has_newobj_hook = 0, during_minor_gc = 0, during_incremental_marking = 1, measure_gc = 1}",
+        "breakpoint": "rb_clock_gettime"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "7778732b68803bf830acb63ce79328b567b852c537f8f7d0789f8adf8c9f998e",
+      "execution": "native arm64 Docker container"
+    },
+    "f2c399ce4793c968bcdc1cc4a3cf47550a56325fb080038224b4f59b8abe332e": {
+      "architecture": "arm64",
+      "version": "3.3.12",
+      "mode": "nested",
+      "image": {
+        "version": "3.3.12",
+        "index": "ruby:3.3-slim@sha256:2bbd17947b9c898f46aedb91924fff8f4246ba39beaf51a726bad6ddae1d3094",
+        "child": "ruby@sha256:e2cd1313aebd6fe2bf71595fe59973c16e706ddfe24747db3ad7acb73ac4a3a6",
+        "image_id": "sha256:396c461f0ba05872e650c89bd19905295bc5a621a7e3c6b6762f388b4a4f368d",
+        "architecture": "arm64",
+        "repo_digests": [
+          "ruby@sha256:2bbd17947b9c898f46aedb91924fff8f4246ba39beaf51a726bad6ddae1d3094",
+          "ruby@sha256:e2cd1313aebd6fe2bf71595fe59973c16e706ddfe24747db3ad7acb73ac4a3a6"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.3.12",
+        "objspace_offset": 1328,
+        "during_gc": 0,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 0, dont_gc = 0, dont_incremental = 0, during_gc = 0, during_compacting = 0, during_reference_updating = 0, gc_stressful = 0, has_newobj_hook = 0, during_minor_gc = 0, during_incremental_marking = 1, measure_gc = 1}",
+        "breakpoint": "rb_clock_gettime"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "f2c399ce4793c968bcdc1cc4a3cf47550a56325fb080038224b4f59b8abe332e",
+      "execution": "native arm64 Docker container"
+    },
+    "f8e3fcc6ee9691543ea30f18c8847920373f412f5e1b5129a5459772f3bf273a": {
+      "architecture": "amd64",
+      "version": "3.2.11",
+      "mode": "gc",
+      "image": {
+        "version": "3.2.11",
+        "index": "ruby:3.2-slim@sha256:84184c9e2c368885a1d0c93ad1953c33d81081058d274b87b4aa6f3e209e5d16",
+        "child": "ruby@sha256:5854bac8d687d034731d0a4464095c3e61028ee33187a82ab3064d8fbd683787",
+        "image_id": "sha256:474f3ca270c62de95b36e5ec455d7de6b3a71e92640217e9220664012356d529",
+        "architecture": "amd64",
+        "repo_digests": [
+          "ruby@sha256:5854bac8d687d034731d0a4464095c3e61028ee33187a82ab3064d8fbd683787"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.11",
+        "objspace_offset": 1144,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_roots"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "f8e3fcc6ee9691543ea30f18c8847920373f412f5e1b5129a5459772f3bf273a",
+      "execution": "official image rootfs in a chroot, x86_64 Linux kernel under QEMU/TCG (not QEMU-user)"
+    },
+    "ca5dedc0769103d833e4d47c12c740d0bcdcb38e8a6959ca0cef908404e49b26": {
+      "architecture": "amd64",
+      "version": "3.2.11",
+      "mode": "loop",
+      "image": {
+        "version": "3.2.11",
+        "index": "ruby:3.2-slim@sha256:84184c9e2c368885a1d0c93ad1953c33d81081058d274b87b4aa6f3e209e5d16",
+        "child": "ruby@sha256:5854bac8d687d034731d0a4464095c3e61028ee33187a82ab3064d8fbd683787",
+        "image_id": "sha256:474f3ca270c62de95b36e5ec455d7de6b3a71e92640217e9220664012356d529",
+        "architecture": "amd64",
+        "repo_digests": [
+          "ruby@sha256:5854bac8d687d034731d0a4464095c3e61028ee33187a82ab3064d8fbd683787"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.11",
+        "objspace_offset": 1144,
+        "during_gc": 0,
+        "mode": 0,
+        "flags": "{mode = 0, immediate_sweep = 0, dont_gc = 0, dont_incremental = 0, during_gc = 0, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 1, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "rb_clock_gettime"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "ca5dedc0769103d833e4d47c12c740d0bcdcb38e8a6959ca0cef908404e49b26",
+      "execution": "official image rootfs in a chroot, x86_64 Linux kernel under QEMU/TCG (not QEMU-user)"
+    },
+    "506cde71299f990fb5f8517cb731ac7f9e87097733c03925888661a56c8abf29": {
+      "architecture": "amd64",
+      "version": "3.2.2",
+      "mode": "gc",
+      "image": {
+        "version": "3.2.2",
+        "index": "ruby:3.2.2-slim",
+        "child": "ruby@sha256:dc49855ca29a9f5248a6fcfd2b8e62db1af66613997884ad990e2eddb3e7f11d",
+        "image_id": "sha256:bbb66400257a886bc5fd542c6c4685eba74abef1b3cc3eb2aefb2485eaf070e7",
+        "architecture": "amd64",
+        "repo_digests": [
+          "ruby@sha256:dc49855ca29a9f5248a6fcfd2b8e62db1af66613997884ad990e2eddb3e7f11d"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.2",
+        "objspace_offset": 1128,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_stacked_objects"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "506cde71299f990fb5f8517cb731ac7f9e87097733c03925888661a56c8abf29",
+      "execution": "official image rootfs in a chroot, x86_64 Linux kernel under QEMU/TCG (not QEMU-user)"
+    },
+    "fee9cd1fa5ceb0a83de7b4e5ade669379dee77461ad8da39f624f3d715a49396": {
+      "architecture": "amd64",
+      "version": "3.2.3",
+      "mode": "gc",
+      "image": {
+        "version": "3.2.3",
+        "index": "ruby:3.2.3-slim@sha256:0d7326044980c6c4707af9a4de7c441df38794d35ca8e69eebc84983c578646b",
+        "child": "ruby@sha256:99c373e09e7831073e072e3220161ce254d0e75056a134c935397b6d976503e9",
+        "image_id": "sha256:07da8594d7b6fe888f0e1a76b759c069e75f6f300d2b54ea87844145dad6a61d",
+        "architecture": "amd64",
+        "repo_digests": [
+          "ruby@sha256:99c373e09e7831073e072e3220161ce254d0e75056a134c935397b6d976503e9"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.3",
+        "objspace_offset": 1136,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_stacked_objects"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "fee9cd1fa5ceb0a83de7b4e5ade669379dee77461ad8da39f624f3d715a49396",
+      "execution": "official image rootfs in a chroot, x86_64 Linux kernel under QEMU/TCG (not QEMU-user)"
+    },
+    "68dcd0564e807d47f5e21854ba927b658421fb7daef066393cbf45447935dce0": {
+      "architecture": "amd64",
+      "version": "3.2.4",
+      "mode": "gc",
+      "image": {
+        "version": "3.2.4",
+        "index": "ruby:3.2.4-slim@sha256:3e345863daec63492301440639ee6ad5554ad2edf20c6de4eb1c8b1d0d4459d6",
+        "child": "ruby@sha256:0e49f5b8168417226e5dbc87192112a588d01bd17f61d05a48d3d374c3542ce0",
+        "image_id": "sha256:804e41e863d411b9eed8c33cd7ba7beeeb329b2b458c88dbbb59a0a35d268bdd",
+        "architecture": "amd64",
+        "repo_digests": [
+          "ruby@sha256:0e49f5b8168417226e5dbc87192112a588d01bd17f61d05a48d3d374c3542ce0"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.2.4",
+        "objspace_offset": 1144,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, gc_stressful = 0, has_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_stacked_objects"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "68dcd0564e807d47f5e21854ba927b658421fb7daef066393cbf45447935dce0",
+      "execution": "official image rootfs in a chroot, x86_64 Linux kernel under QEMU/TCG (not QEMU-user)"
+    },
+    "12c4f0278cdd23a7dc6bd9dbc3da259c6ec68f9bc9a1f945b2739ad9a61b1fa2": {
+      "architecture": "amd64",
+      "version": "3.3.12",
+      "mode": "gc",
+      "image": {
+        "version": "3.3.12",
+        "index": "ruby:3.3-slim@sha256:2bbd17947b9c898f46aedb91924fff8f4246ba39beaf51a726bad6ddae1d3094",
+        "child": "ruby@sha256:53012760b6eee24268541775b379a96578301ba0ade9b8d60d39cb50360a4cf7",
+        "image_id": "sha256:f750467aa9ee53dd2ee48a0cd7c29656ea8f56a826c5b90e585455c471ac9102",
+        "architecture": "amd64",
+        "repo_digests": [
+          "ruby@sha256:53012760b6eee24268541775b379a96578301ba0ade9b8d60d39cb50360a4cf7"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.3.12",
+        "objspace_offset": 1304,
+        "during_gc": 1,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 1, dont_gc = 0, dont_incremental = 0, during_gc = 1, during_compacting = 0, during_reference_updating = 0, gc_stressful = 0, has_newobj_hook = 0, during_minor_gc = 0, during_incremental_marking = 0, measure_gc = 1}",
+        "breakpoint": "gc_mark_roots"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "12c4f0278cdd23a7dc6bd9dbc3da259c6ec68f9bc9a1f945b2739ad9a61b1fa2",
+      "execution": "official image rootfs in a chroot, x86_64 Linux kernel under QEMU/TCG (not QEMU-user)"
+    },
+    "b2edf48bbcba9e415d7c00dc3be86852f7c1bfff2c44509918911ca78517721e": {
+      "architecture": "amd64",
+      "version": "3.3.12",
+      "mode": "loop",
+      "image": {
+        "version": "3.3.12",
+        "index": "ruby:3.3-slim@sha256:2bbd17947b9c898f46aedb91924fff8f4246ba39beaf51a726bad6ddae1d3094",
+        "child": "ruby@sha256:53012760b6eee24268541775b379a96578301ba0ade9b8d60d39cb50360a4cf7",
+        "image_id": "sha256:f750467aa9ee53dd2ee48a0cd7c29656ea8f56a826c5b90e585455c471ac9102",
+        "architecture": "amd64",
+        "repo_digests": [
+          "ruby@sha256:53012760b6eee24268541775b379a96578301ba0ade9b8d60d39cb50360a4cf7"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.3.12",
+        "objspace_offset": 1304,
+        "during_gc": 0,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 0, dont_gc = 0, dont_incremental = 0, during_gc = 0, during_compacting = 0, during_reference_updating = 0, gc_stressful = 0, has_newobj_hook = 0, during_minor_gc = 0, during_incremental_marking = 1, measure_gc = 1}",
+        "breakpoint": "rb_clock_gettime"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "b2edf48bbcba9e415d7c00dc3be86852f7c1bfff2c44509918911ca78517721e",
+      "execution": "official image rootfs in a chroot, x86_64 Linux kernel under QEMU/TCG (not QEMU-user)"
+    },
+    "59b9fde7a0c662eb63e93c8ff7e672afca8c9bc596e8766b4d5f7722b822d76a": {
+      "architecture": "amd64",
+      "version": "3.3.12",
+      "mode": "nested",
+      "image": {
+        "version": "3.3.12",
+        "index": "ruby:3.3-slim@sha256:2bbd17947b9c898f46aedb91924fff8f4246ba39beaf51a726bad6ddae1d3094",
+        "child": "ruby@sha256:53012760b6eee24268541775b379a96578301ba0ade9b8d60d39cb50360a4cf7",
+        "image_id": "sha256:f750467aa9ee53dd2ee48a0cd7c29656ea8f56a826c5b90e585455c471ac9102",
+        "architecture": "amd64",
+        "repo_digests": [
+          "ruby@sha256:53012760b6eee24268541775b379a96578301ba0ade9b8d60d39cb50360a4cf7"
+        ]
+      },
+      "facts": {
+        "ruby_version": "3.3.12",
+        "objspace_offset": 1304,
+        "during_gc": 0,
+        "mode": 1,
+        "flags": "{mode = 1, immediate_sweep = 0, dont_gc = 0, dont_incremental = 0, during_gc = 0, during_compacting = 0, during_reference_updating = 0, gc_stressful = 0, has_newobj_hook = 0, during_minor_gc = 0, during_incremental_marking = 1, measure_gc = 1}",
+        "breakpoint": "rb_clock_gettime"
+      },
+      "environment": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "LANG=C.UTF-8"
+      ],
+      "core_sha256": "59b9fde7a0c662eb63e93c8ff7e672afca8c9bc596e8766b4d5f7722b822d76a",
+      "execution": "official image rootfs in a chroot, x86_64 Linux kernel under QEMU/TCG (not QEMU-user)"
+    }
+  }
+}
