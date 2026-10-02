@@ -1,0 +1,66 @@
+{
+  "coredump-ref": "f8e3fcc6ee9691543ea30f18c8847920373f412f5e1b5129a5459772f3bf273a",
+  "threads": [
+    {
+      "lwp": 2777,
+      "frames": [
+        "libruby.so.3.2.11+0x15bf90",
+        "libruby.so.3.2.11+0x15eb01",
+        "libruby.so.3.2.11+0x16011c",
+        "libruby.so.3.2.11+0x322219",
+        "(marking)+0 in <gc>:0",
+        "(garbage collection)+0 in <gc>:0"
+      ]
+    }
+  ],
+  "modules": [
+    {
+      "ref": "64db6e4aaf60e7b919729d8c346d88f001ec8798d37ed968f75bf4334af97826",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/local/bin/ruby"
+    },
+    {
+      "ref": "3c999be84bbb4ccbd19cfae56e93c2678171df9e3f81a3280e81b98f29e15713",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/local/lib/libruby.so.3.2.11"
+    },
+    {
+      "ref": "dfa7cda5a68ab1ce636975fb7159051e87966d25a2534b61e2bebb7012394146",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/local/lib/ruby/3.2.0/x86_64-linux/enc/trans/transdb.so"
+    },
+    {
+      "ref": "75eb8fa6cbd80878a0f029b782ba94221a13474f9d3911cffecde5b03c04755c",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/local/lib/ruby/3.2.0/x86_64-linux/enc/encdb.so"
+    },
+    {
+      "ref": "436788729ab71d794a66954d62e930c723e624587f39beb2f4f86ff1000b1d29",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/lib/x86_64-linux-gnu/libcrypt.so.1.1.0"
+    },
+    {
+      "ref": "8c1cf687490f3f7858528ceb4e651b979f625e43396431bec65e5bb89cb63860",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+    },
+    {
+      "ref": "adeedbc69ac402b762a3bd94759441e0546c33972cb2c0f5bc6869a2d32efed6",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/lib/x86_64-linux-gnu/libc.so.6"
+    },
+    {
+      "ref": "6d567d53e895273ca14a1f9dc164fc6c8d39aed2f60aa46a733c2784228915f3",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/lib/x86_64-linux-gnu/libm.so.6"
+    },
+    {
+      "ref": "0fc1ecccfa4a3b435ac1dc058b13d9a25d4e529f136a67e63b742f6a21498d3b",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/local/lib/ruby/3.2.0/x86_64-linux/monitor.so"
+    },
+    {
+      "ref": "30c61ab012a4241bed033725a09b61f5fdd3bb7df95ee852d0b096520524c7af",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/lib/x86_64-linux-gnu/libgcc_s.so.1"
+    },
+    {
+      "ref": "d15e1585c6c267296459570c8ac217ca9123044bcd4e896d2f686b32333445d2",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/lib/x86_64-linux-gnu/libgmp.so.10.5.0"
+    },
+    {
+      "ref": "85590dd58edf5445e18bc7193e5ebc01ac5841f1ae187e97705a662e90c6421e",
+      "local-path": "/var/tmp/ruby1934/rootfs/ruby-3.2.11/usr/lib/x86_64-linux-gnu/libz.so.1.3.1"
+    }
+  ]
+}
