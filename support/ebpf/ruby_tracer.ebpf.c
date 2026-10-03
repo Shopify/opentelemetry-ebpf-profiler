@@ -58,6 +58,9 @@ BPF_RODATA_VAR(bool, ruby_skip_native_resume, false)
 // https://github.com/ruby/ruby/blob/v3_4_5/vm_core.h#L1380-L1385
 #define VM_FRAME_MAGIC_MASK  0x7fff0001
 #define VM_FRAME_MAGIC_CFUNC 0x55550001
+// Marks the base frame of an rb_vm_exec invocation.
+// https://github.com/ruby/ruby/blob/v3_4_0/vm_core.h#L1383
+#define VM_FRAME_FLAG_FINISH 0x0020
 
 // https://github.com/ruby/ruby/blob/v3_4_5/gc/default/default.c#L459-L464
 #define GC_MODE_MASK    0x00000003 // bits 0-1 (2 bits for mode)
@@ -323,16 +326,23 @@ static EBPF_INLINE ErrorCode read_ruby_frame(
         // continue unwinding Ruby VM frames. Due to this issue, the ordering of Ruby and native
         // frames will almost certainly be incorrect for Ruby versions < 2.6.
         frame_type = RUBY_FRAME_TYPE_CME_CFUNC;
-      } else if (ruby_skip_native_resume || record->rubyUnwindState.jit_detected) {
+      } else if (
+        ruby_skip_native_resume || record->rubyUnwindState.jit_detected ||
+        !record->rubyUnwindState.prev_frame_finish) {
         // Push cfunc inline when native resume is disabled. Also push it inline
         // if JIT is active but frame pointers are not available, because we
         // cannot unwind through JIT frames to get back to native code.
+        // Only a cfunc directly below the base (FINISH) frame of an rb_vm_exec
+        // called into that VM loop, so only it owns the native frames between this
+        // rb_vm_exec and the next one. Any other cfunc, such as the one running
+        // when the sample was taken, owns native frames that were already unwound.
         frame_type = RUBY_FRAME_TYPE_CME_CFUNC;
       } else {
         // We save this cfp on in the "Record" entry, and when we start the unwinder
         // again we'll push it so that the order is correct and the cfunc "owns" any native code we
         // unwound rather than eliding it
         record->rubyUnwindState.cfunc_saved_frame = frame_addr;
+        record->rubyUnwindState.prev_frame_finish = false;
 
         *next_unwinder = PROG_UNWIND_NATIVE;
         return ERR_OK;
@@ -376,6 +386,7 @@ static EBPF_INLINE ErrorCode read_ruby_frame(
     return error;
   }
   increment_metric(metricID_UnwindRubyFrames);
+  record->rubyUnwindState.prev_frame_finish = (frame_flags & VM_FRAME_FLAG_FINISH) != 0;
 
   return ERR_OK;
 }
@@ -455,6 +466,15 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
   // sample landed in native code called from JIT, but a JIT PC found now should
   // still be emitted as the first Ruby/JIT owner frame.
   bool first_ruby_unwind = stack_ptr == NULL && last_stack_frame == NULL;
+
+  if (first_ruby_unwind) {
+    // A running C method puts at least two native frames above this rb_vm_exec:
+    // its own function and the VM call helper reached through an indirect call.
+    // With at most one (the VM loop itself), a cfunc on top of the VM stack is
+    // not running. Its block has returned and this rb_vm_exec is finishing, so
+    // the cfunc owns the native frames below it, like a cfunc below a FINISH frame.
+    record->rubyUnwindState.prev_frame_finish = trace->num_frames <= 1;
+  }
 
   if (!stack_ptr || !last_stack_frame) {
     // stack_ptr_current points to the current frame in the Ruby VM call stack
@@ -554,6 +574,23 @@ static EBPF_INLINE ErrorCode walk_ruby_stack(
         if (error != ERR_OK)
           return error;
       }
+      if (record->rubyUnwindState.cfunc_saved_frame != 0) {
+        // The bottom frame is a deferred cfunc, but no Ruby frames remain to
+        // resume with, so push it now rather than dropping it.
+        error = push_ruby(
+          &record->state,
+          trace,
+          RUBY_FRAME_TYPE_CME_CFUNC,
+          record->rubyUnwindState.cfunc_saved_frame,
+          0,
+          0);
+        if (error != ERR_OK)
+          return error;
+        record->rubyUnwindState.cfunc_saved_frame = 0;
+      }
+      // Every Ruby frame has been pushed. Re-entering at a later rb_vm_exec
+      // frame would read the last Ruby frame again and push it twice.
+      unwinder_mark_done(record, PROG_UNWIND_RUBY);
       *next_unwinder = (ruby_skip_native_resume || record->rubyUnwindState.jit_detected)
                          ? PROG_UNWIND_STOP
                          : PROG_UNWIND_NATIVE;
