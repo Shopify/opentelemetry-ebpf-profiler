@@ -32,3 +32,7 @@ helloworld.linkexternal:
 
 helloworld.linkexternal.stripped: helloworld.linkexternal
 	objcopy -S $< $@
+
+# Checked in rather than built by default, since it needs an AArch64 cross compiler.
+plt-arm64.so: plt.c
+	aarch64-linux-gnu-gcc -shared -fPIC -Os -Wl,-z,now -Wl,-z,max-page-size=4096 -s -o $@ $<

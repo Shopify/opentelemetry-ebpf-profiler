@@ -17,6 +17,10 @@ const (
 	// FDEs are in .debug_frame or external debug file. This controls how many
 	// basic blocks are needed to not follow .gnu_debuglink.
 	numBlocksToOmitDebugLink = 8
+
+	// arm64PLT0Size is the size of the AArch64 PLT header (PLT0). It is the lazy
+	// binding stub, which pushes x16 and x30 before branching to the resolver.
+	arm64PLT0Size = 32
 )
 
 // extractionFilter is used to filter in .eh_frame data when a better source
@@ -194,8 +198,34 @@ func extractFile(elfFile *pfelf.File, elfRef *pfelf.Reference) (*sdtypes.Interva
 			return nil, fmt.Errorf("failure to parse debug stack deltas: %v", err)
 		}
 	}
-	if filter.ehFrames {
+	if addARM64PLTDeltas(elfFile, intervals) || filter.ehFrames {
 		intervals.Sort()
 	}
 	return intervals, nil
+}
+
+// addARM64PLTDeltas synthesizes LR-based stack deltas for the AArch64 .plt.
+// Neither GNU ld nor LLD emits CFI for it, so a sample inside a PLT stub could
+// not be unwound. Every entry after PLT0 is an adrp/ldr/add/br sequence (with
+// optional bti/autia1716) that leaves SP and LR untouched, so the caller is found
+// exactly as at a function's first instruction.
+func addARM64PLTDeltas(elfFile *pfelf.File, intervals *sdtypes.IntervalData) bool {
+	if elfFile.Machine != elf.EM_AARCH64 {
+		return false
+	}
+	plt := elfFile.Section(".plt")
+	if plt == nil || plt.Size <= arm64PLT0Size {
+		return false
+	}
+	start, end := plt.Addr+arm64PLT0Size, plt.Addr+plt.Size
+	for _, bb := range intervals.Blocks {
+		if bb.Start < end && start < bb.End {
+			// Keep real CFI if the linker emitted any.
+			return false
+		}
+	}
+	bb := sdtypes.BasicBlock{Start: start, End: end}
+	bb.Deltas.Add(0, sdtypes.UnwindInfoLR)
+	intervals.Add(bb)
+	return true
 }
