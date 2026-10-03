@@ -797,6 +797,9 @@ typedef struct RubyUnwindState {
   u64 cfunc_saved_frame;
   // Detect if JIT code ran in the process (at any time)
   bool jit_detected;
+  // Defer the next cfunc: the previous frame was the base (FINISH) frame of an
+  // rb_vm_exec, or no C method is running above the first rb_vm_exec
+  bool prev_frame_finish;
 } RubyUnwindState;
 
 typedef u64 TValue;
