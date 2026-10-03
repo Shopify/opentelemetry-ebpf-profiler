@@ -13,6 +13,8 @@
         "libruby.so.3.2.2+0x1935ab",
         "libruby.so.3.2.2+0x32357f",
         "libruby.so.3.2.2+0x332b73",
+        "select+0 in <cfunc>:0",
+        "<main>+0 in /app/loop-with-ractors.rb:37",
         "libruby.so.3.2.2+0x3382d7",
         "libruby.so.3.2.2+0x1564c3",
         "libruby.so.3.2.2+0x15cb37",
