@@ -1586,6 +1586,34 @@ func rubyUses406Layout(version uint32, description string) bool {
 		strings.Contains(description, " revision "+ruby405PShopifyRevision+")")
 }
 
+// ruby41RegisteredAddrsSymbols are functions added by ruby/ruby@2ad6b99a98
+// ("GC: scope rb_gc_register_address to the calling Ractor"). The same commit
+// inserted registered_addrs fields ahead of running_ec and objspace in
+// rb_ractor_struct, and 4.1.0dev snapshots from before and after it report the
+// same version. The functions are hidden, so only .symtab lists them; any one
+// of them is enough in case the compiler inlined the others away.
+// https://github.com/ruby/ruby/commit/2ad6b99a98
+var ruby41RegisteredAddrsSymbols = map[libpf.SymbolName]struct{}{
+	"rb_ractor_absorb_registered_addrs_without_gc": {},
+	"rb_gc_mark_registered_addrs":                  {},
+	"rb_gc_registered_addrs_enroll_without_gc":     {},
+	"rb_gc_registered_addrs_unenroll_without_gc":   {},
+}
+
+// rubyHasRactorRegisteredAddrs reports whether a Ruby binary includes
+// per-ractor registered addresses, which moved rb_ractor_struct.running_ec and
+// rb_ractor_struct.objspace by 32 bytes.
+func rubyHasRactorRegisteredAddrs(ef *pfelf.File) bool {
+	found := false
+	if err := ef.VisitSymbols(func(s libpf.Symbol) bool {
+		_, found = ruby41RegisteredAddrsSymbols[s.Name]
+		return !found
+	}); err != nil {
+		log.Debugf("failed to visit symbols: %v", err)
+	}
+	return found
+}
+
 func GetLoader(_ Config) interpreter.Loader {
 	return interpreter.NewLoader(loader, []interpreter.InterpreterResource{
 		{MapName: BPFMapName, ProgID: uint32(support.ProgUnwindRuby), ProgName: "unwind_ruby"},
@@ -1623,7 +1651,8 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// - Ruby 2.5 is still commonly used at time of writing this code.
 	//   https://www.jetbrains.com/lp/devecosystem-2020/ruby/
 	// Reason for maximum supported version 4.1.x:
-	// - Ruby 4.1 layouts were measured on Shopify/ruby a68e42cf (4.1.0dev); 4.2 is unverified.
+	// - Ruby 4.1 layouts were measured on Shopify/ruby a68e42cf and b709bdb3 (4.1.0dev); 4.2 is
+	//   unverified.
 	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(4, 2, 0)
 	if version < minVer || version >= maxVer {
 		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and < %d.%d.%d)",
@@ -1633,6 +1662,11 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	}
 
 	log.Debugf("Ruby %d.%d.%d detected", (version>>16)&0xff, (version>>8)&0xff, version&0xff)
+
+	ractorRegisteredAddrs := version >= rubyVersion(4, 1, 0) && rubyHasRactorRegisteredAddrs(ef)
+	if ractorRegisteredAddrs {
+		log.Debugf("Ruby has per-ractor registered addresses; using the shifted rb_ractor_struct layout")
+	}
 
 	// Before Ruby 2.5 the symbol ruby_current_thread was used for the current execution
 	// context but got replaced in [0] with ruby_current_execution_context_ptr.
@@ -1891,6 +1925,12 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		} else {
 			vms.rb_ractor_struct.objspace = 616
 		}
+		if ractorRegisteredAddrs {
+			// registered_addrs, registered_addrs_cnt/capa and registered_addrs_listed
+			// precede objspace.
+			// https://github.com/Shopify/ruby/blob/b709bdb3e37451bb1103b50fb280968dbf038103/ractor_core.h#L108
+			vms.rb_ractor_struct.objspace += 32
+		}
 	default:
 		rid.hasObjspace = true
 		vms.objspace.flags = 20
@@ -2074,6 +2114,10 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 				vms.rb_ractor_struct.running_ec = 416
 			} else {
 				vms.rb_ractor_struct.running_ec = 432
+			}
+			if ractorRegisteredAddrs {
+				// The same registered_addrs fields precede running_ec; see objspace.
+				vms.rb_ractor_struct.running_ec += 32
 			}
 		} else if version >= rubyVersion(4, 0, 0) {
 			// Ruby 4.0+ redesigned rb_ractor_sync with Port-based API.
