@@ -1,8 +1,8 @@
 .PHONY: inline inline-compressed-dwarf inline-split-dwarf inline-big-fake-compressed-dwarf \
-	inline-no-tco clean inline-compressed-dwarf-zstd go-toolchains
+	inline-no-tco clean inline-compressed-dwarf-zstd go-toolchains asm-symbols
 
 all: inline inline-compressed-dwarf inline-split-dwarf inline-big-fake-compressed-dwarf \
-	inline-no-tco inline-compressed-dwarf-zstd go-toolchains
+	inline-no-tco inline-compressed-dwarf-zstd go-toolchains asm-symbols
 
 inline: inline.c
 	cc $< -o $@ -O2 -g
@@ -26,6 +26,11 @@ inline-big-fake-compressed-dwarf: inline
 inline-split-dwarf: inline
 	cp inline inline-split-dwarf
 	dwz -M meow -m inline-split-dwarf.dwp inline-split-dwarf inline-split-dwarf
+
+asm-symbols: asm-symbols.S
+	cc $< -o $@ -shared -nostdlib
+	# Only the symbol tables remain; code sections become SHT_NOBITS.
+	objcopy --only-keep-debug $@ $@.debug
 
 go-toolchains:
 	GOTOOLCHAIN=go1.20.14 go build -o go-1.20.14 main.go
