@@ -5,6 +5,7 @@
 
 use crate::{AnyError, VirtAddr};
 
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::{fmt, fs, io, ops, path};
 
@@ -290,13 +291,28 @@ impl<'obj> Reader<'obj> {
     }
 
     /// Iterate over function symbols in this executable.
+    ///
+    /// Function symbols with a size come first, in symbol table order. For the
+    /// debug symbol table of ELF files, they are followed by the code symbols
+    /// that hand-written assembly often leaves incomplete, wherever no sized
+    /// function symbol covers them:
+    ///
+    /// - `STT_NOTYPE` labels (no `.type` directive) in executable sections;
+    /// - symbols without a size (no `.size` directive), which are assumed to
+    ///   extend up to the next symbol of their section, or to its end. `perf`
+    ///   and `llvm-symbolizer` attribute such addresses the same way.
+    ///
+    /// Dynamic symbols without a size are skipped: the dynamic symbol table
+    /// only lists exported symbols, so extending one up to the next entry could
+    /// claim unrelated code.
     pub fn function_symbols(&self, source: SymbolSource) -> impl Iterator<Item = Symbol<'_>> {
         let iter = match source {
             SymbolSource::Debug => self.0.symbols(),
             SymbolSource::Dynamic => self.0.dynamic_symbols(),
         };
 
-        iter.filter(|x| x.kind() == object::SymbolKind::Text)
+        let sized = iter
+            .filter(|x| x.kind() == object::SymbolKind::Text)
             // Dynamic symbols with addr = 0 are imports. Also, compilers
             // often generate bogus debug symbol records at 0.
             .filter(|x| x.address() != 0)
@@ -307,8 +323,119 @@ impl<'obj> Reader<'obj> {
                     virt_addr: x.address(),
                     length: x.size(),
                 })
-            })
+            });
+
+        let incomplete = match source {
+            SymbolSource::Debug if self.0.format() == object::BinaryFormat::Elf => {
+                self.incomplete_code_symbols()
+            }
+            _ => Vec::new(),
+        };
+
+        sized.chain(incomplete)
     }
+
+    /// Debug symbols in executable sections that [`Self::function_symbols`]
+    /// reports after the sized functions: sized `STT_NOTYPE` labels, and
+    /// symbols without a size, extended up to the next symbol.
+    fn incomplete_code_symbols(&self) -> Vec<Symbol<'_>> {
+        let exec = u64::from(object::elf::SHF_EXECINSTR);
+        let code_sections: HashMap<_, _> = self
+            .0
+            .sections()
+            .filter(|sec| {
+                matches!(sec.flags(), object::SectionFlags::Elf { sh_flags } if sh_flags & exec != 0)
+            })
+            .map(|sec| (sec.index(), sec.address().saturating_add(sec.size())))
+            .collect();
+
+        let mut syms: Vec<_> = self
+            .0
+            .symbols()
+            .filter_map(|sym| {
+                let object::SymbolSection::Section(section) = sym.section() else {
+                    return None;
+                };
+                let section_end = *code_sections.get(&section)?;
+                let is_func = match (sym.kind(), sym.flags()) {
+                    (object::SymbolKind::Text, _) => true,
+                    (_, object::SymbolFlags::Elf { st_info, .. })
+                        if st_info & 0xf == object::elf::STT_NOTYPE =>
+                    {
+                        false
+                    }
+                    _ => return None,
+                };
+                // Non-UTF8 names still bound the symbols before them.
+                let name = sym.name().ok();
+                // ARM mapping symbols (`$x`, `$d`, ...) and assembler-local
+                // labels mark positions in the code, not entry points.
+                let marker =
+                    name.is_some_and(|x| x.is_empty() || x.starts_with('$') || x.starts_with(".L"));
+                if sym.address() == 0 || (!is_func && marker) {
+                    return None;
+                }
+                Some(CodeSymbol {
+                    section: section.0,
+                    section_end,
+                    addr: sym.address(),
+                    size: sym.size(),
+                    is_func,
+                    name,
+                })
+            })
+            .collect();
+
+        // At one address: sized functions, then sized labels, then symbols
+        // without a size.
+        syms.sort_unstable_by_key(|x| (x.section, x.addr, x.size == 0, !x.is_func, x.name));
+
+        let mut out = Vec::new();
+        for section in syms.chunk_by(|a, b| a.section == b.section) {
+            // End of the code already attributed: symbols inside it (aliases,
+            // local labels) are part of the routine that covers them.
+            let mut covered_until = 0;
+            for (idx, sym) in section.iter().enumerate() {
+                let end = if sym.size != 0 {
+                    sym.addr.saturating_add(sym.size)
+                } else {
+                    section[idx + 1..]
+                        .iter()
+                        .map(|next| next.addr)
+                        .find(|&addr| addr > sym.addr)
+                        .unwrap_or(sym.section_end)
+                };
+                // Sized functions were reported first.
+                if sym.is_func && sym.size != 0 {
+                    covered_until = covered_until.max(end);
+                    continue;
+                }
+                if sym.addr < covered_until || end <= sym.addr {
+                    continue;
+                }
+                covered_until = end;
+                let Some(name) = sym.name else {
+                    continue;
+                };
+                out.push(Symbol {
+                    name,
+                    virt_addr: sym.addr,
+                    length: end - sym.addr,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Code symbol considered by [`Reader::incomplete_code_symbols`].
+struct CodeSymbol<'a> {
+    section: usize,
+    section_end: VirtAddr,
+    addr: VirtAddr,
+    size: u64,
+    is_func: bool,
+    name: Option<&'a str>,
 }
 
 /// Information and raw data of an object file section.
