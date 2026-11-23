@@ -273,6 +273,7 @@ func TestProduceSnapshotsCarriesSpaceAndObjects(t *testing.T) {
 	const pid libpf.PID = 42
 	wantAttrs := attribute.NewSet(attribute.String("service.name", "checkout"))
 	wantEnv := map[libpf.String]libpf.String{libpf.Intern("ENV"): libpf.Intern("prod")}
+	wantExtra := map[libpf.String]string{libpf.Intern("k8s.pod.name"): "web-1"}
 
 	hp := &Probe{
 		tracker: NewTracker(),
@@ -284,6 +285,7 @@ func TestProduceSnapshotsCarriesSpaceAndObjects(t *testing.T) {
 				Executable:   libpf.Intern("/usr/bin/app"),
 				ContainerID:  libpf.Intern("cid-42"),
 				EnvVariables: wantEnv,
+				ExtraMeta:    wantExtra,
 			}, wantAttrs
 		},
 	}
@@ -305,6 +307,7 @@ func TestProduceSnapshotsCarriesSpaceAndObjects(t *testing.T) {
 		ContainerID:    libpf.Intern("cid-42"),
 	}, row.ResourceKey)
 	assert.Equal(t, wantEnv, row.EnvVars)
+	assert.Equal(t, wantExtra, row.ExtraMeta)
 	assert.Equal(t, wantAttrs.Equivalent(), row.ResourceAttrs.Equivalent())
 	assert.Equal(t, []uint64{4096, 2}, row.ContextValues)
 

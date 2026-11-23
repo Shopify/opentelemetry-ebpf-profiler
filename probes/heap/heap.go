@@ -807,6 +807,7 @@ func (hp *Probe) ProduceSnapshots() []samples.SnapshotProfile {
 				ContainerID:    procMeta.ContainerID,
 			},
 			EnvVars:       procMeta.EnvVariables,
+			ExtraMeta:     procMeta.ExtraMeta,
 			ResourceAttrs: resourceAttrs,
 			TraceHash:     e.TraceHash,
 			Frames:        e.Frames,

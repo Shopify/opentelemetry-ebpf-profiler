@@ -139,8 +139,9 @@ func (b *baseReporter) SetSnapshotSource(source samples.SnapshotSource) {
 //
 // Snapshot rows describe the state of a process at one instant rather than
 // individual events, so they carry no thread, CPU or per-event timestamp. Their
-// SampleKey holds only the trace hash, and ts (the collection interval end) is
-// used as the single timestamp.
+// SampleKey holds the trace hash plus any ExtraMeta produced by
+// ExtraSampleAttrProd, and ts (the collection interval end) is used as the
+// single timestamp.
 func (b *baseReporter) mergeSnapshots(tree samples.TraceEventsTree, ts time.Time) {
 	if b.snapshotSource == nil {
 		return
@@ -154,10 +155,25 @@ func (b *baseReporter) mergeSnapshots(tree samples.TraceEventsTree, ts time.Time
 		}
 		for _, row := range sp.Samples {
 			events := b.snapshotEventsFor(tree, sp.ProfileType, row)
-			sampleKey := samples.SampleKey{Hash: row.TraceHash}
 			meta := &samples.TraceEventMeta{
-				ProfileType:   sp.ProfileType,
-				ContextValues: row.ContextValues,
+				Timestamp:      libpf.UnixTime64(timestamp),
+				ExecutablePath: row.ResourceKey.ExecutablePath,
+				ContainerID:    row.ResourceKey.ContainerID,
+				PID:            libpf.PID(row.ResourceKey.PID),
+				EnvVars:        row.EnvVars,
+				ExtraMeta:      row.ExtraMeta,
+				ResourceAttrs:  row.ResourceAttrs,
+				ProfileType:    sp.ProfileType,
+				ContextValues:  row.ContextValues,
+			}
+			var extraMeta any
+			if b.cfg.ExtraSampleAttrProd != nil {
+				extraMeta = b.cfg.ExtraSampleAttrProd.CollectExtraSampleMeta(
+					&libpf.Trace{Frames: row.Frames}, meta)
+			}
+			sampleKey := samples.SampleKey{
+				Hash:      row.TraceHash,
+				ExtraMeta: extraMeta,
 			}
 			if existing, ok := events[sampleKey]; ok {
 				values, err := appendEventValues(existing.Values, meta)

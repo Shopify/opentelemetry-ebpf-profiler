@@ -141,6 +141,10 @@ type SnapshotSample struct {
 	// EnvVars are the reportable process environment variables. Like event
 	// samples, the first values seen for a resource in an interval are used.
 	EnvVars map[libpf.String]libpf.String
+	// ExtraMeta holds key-value pairs produced by a processmanager.ProcessMetaEnricher.
+	// It is forwarded to TraceEventMeta.ExtraMeta so SampleAttrProducer.CollectExtraSampleMeta
+	// can attach process-level attributes to snapshot rows.
+	ExtraMeta map[libpf.String]string
 	// ResourceAttrs are the OTel resource attributes captured by the producer.
 	// They initialize resources with no event-driven samples in the interval;
 	// metadata already collected from events takes precedence.

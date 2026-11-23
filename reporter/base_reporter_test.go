@@ -616,3 +616,130 @@ func TestMergeSnapshotsPreservesEventResourceMetadata(t *testing.T) {
 	assert.Equal(t, eventAttrs.Equivalent(), rtp.ResourceAttrs.Equivalent())
 	assert.Contains(t, rtp.Events, profileTypeSampling)
 }
+
+// k8sMetaKey is a comparable sample-key payload emitted by k8sTestAttrProducer
+// to model Prophiler's Kubernetes metadata enrichment on snapshot rows.
+type k8sMetaKey struct {
+	pod       string
+	namespace string
+	container string
+	cgroup    string
+}
+
+type k8sTestAttrProducer struct{}
+
+func (p *k8sTestAttrProducer) CollectExtraSampleMeta(_ *libpf.Trace, meta *samples.TraceEventMeta) any {
+	return k8sMetaKey{
+		pod:       meta.ExtraMeta[libpf.Intern("k8s.pod.name")],
+		namespace: meta.ExtraMeta[libpf.Intern("k8s.namespace.name")],
+		container: meta.ContainerID.String(),
+		cgroup:    meta.ExtraMeta[libpf.Intern("process.linux.cgroup")],
+	}
+}
+
+func (p *k8sTestAttrProducer) ExtraSampleAttrs(attrMgr *samples.AttrTableManager, extraMeta any) []int32 {
+	m, ok := extraMeta.(k8sMetaKey)
+	if !ok {
+		return nil
+	}
+	tmp := pprofile.NewSample()
+	attrMgr.AppendOptionalString(tmp.AttributeIndices(), attribute.Key("k8s.pod.name"), m.pod)
+	attrMgr.AppendOptionalString(tmp.AttributeIndices(), attribute.Key("k8s.namespace.name"), m.namespace)
+	attrMgr.AppendOptionalString(tmp.AttributeIndices(), attribute.Key("k8s.container.name"), m.container)
+	attrMgr.AppendOptionalString(tmp.AttributeIndices(), attribute.Key("process.linux.cgroup"), m.cgroup)
+	indices := make([]int32, tmp.AttributeIndices().Len())
+	for i := range indices {
+		indices[i] = tmp.AttributeIndices().At(i)
+	}
+	return indices
+}
+
+// TestMergeSnapshotsPreservesExtraSampleMeta verifies that snapshot rows invoke
+// ExtraSampleAttrProd.CollectExtraSampleMeta with full process metadata and
+// emit the resulting attributes (e.g. Kubernetes pod/namespace/container/cgroup)
+// into generated OTLP profiles.
+func TestMergeSnapshotsPreservesExtraSampleMeta(t *testing.T) {
+	inuseType := &samples.TypeMetadata{
+		SampleTypes: []samples.SampleType{
+			{Type: "inuse_space", Unit: "bytes"},
+			{Type: "inuse_objects", Unit: "count"},
+		},
+		ReportValues:      true,
+		OmitThreadContext: true,
+		AppendValues: func(dst []int64, meta *samples.TraceEventMeta) []int64 {
+			return append(dst, int64(meta.ContextValues[0]), int64(meta.ContextValues[1]))
+		},
+	}
+
+	reporter := createTestBaseReporter(t, &Config{
+		Name:                "test-agent",
+		Version:             "v1.0.0",
+		ExtraSampleAttrProd: &k8sTestAttrProducer{},
+	})
+
+	trace := singleNativeFrameTrace()
+	resourceKey := samples.ResourceKey{
+		PID:            42,
+		ExecutablePath: libpf.Intern("/usr/bin/app"),
+		ContainerID:    libpf.Intern("app-container"),
+	}
+	extra := map[libpf.String]string{
+		libpf.Intern("k8s.pod.name"):         "checkout-7f9d",
+		libpf.Intern("k8s.namespace.name"):   "production",
+		libpf.Intern("process.linux.cgroup"): "/kubepods/burstable/pod123",
+	}
+
+	reporter.SetSnapshotSource(&testSnapshotSource{
+		profiles: []samples.SnapshotProfile{{
+			ProfileType: inuseType,
+			Samples: []samples.SnapshotSample{{
+				ResourceKey:   resourceKey,
+				ExtraMeta:     extra,
+				TraceHash:     trace.Hash(),
+				Frames:        trace.Frames,
+				ContextValues: []uint64{8192, 4},
+			}},
+		}},
+	})
+
+	ts := time.Unix(1700, 0)
+	tree := make(samples.TraceEventsTree)
+	reporter.mergeSnapshots(tree, ts)
+
+	wantKey := samples.SampleKey{
+		Hash: trace.Hash(),
+		ExtraMeta: k8sMetaKey{
+			pod:       "checkout-7f9d",
+			namespace: "production",
+			container: "app-container",
+			cgroup:    "/kubepods/burstable/pod123",
+		},
+	}
+	require.Contains(t, tree[resourceKey].Events[inuseType], wantKey)
+
+	profiles, err := reporter.pdata.Generate(
+		tree, reporter.name, reporter.version, ts.Add(-time.Minute), ts)
+	require.NoError(t, err)
+	require.Equal(t, 1, profiles.ResourceProfiles().Len())
+
+	scopeProfiles := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0).Profiles()
+	require.Equal(t, 2, scopeProfiles.Len(), "expected both inuse_space and inuse_objects profiles")
+
+	dic := profiles.Dictionary()
+	strTable := dic.StringTable()
+	attrTable := dic.AttributeTable()
+	for i := 0; i < scopeProfiles.Len(); i++ {
+		prof := scopeProfiles.At(i)
+		require.Equal(t, 1, prof.Samples().Len())
+		sample := prof.Samples().At(0)
+		gotAttrs := make(map[string]string)
+		for j := 0; j < sample.AttributeIndices().Len(); j++ {
+			attr := attrTable.At(int(sample.AttributeIndices().At(j)))
+			gotAttrs[strTable.At(int(attr.KeyStrindex()))] = attr.Value().Str()
+		}
+		assert.Equal(t, "checkout-7f9d", gotAttrs["k8s.pod.name"])
+		assert.Equal(t, "production", gotAttrs["k8s.namespace.name"])
+		assert.Equal(t, "app-container", gotAttrs["k8s.container.name"])
+		assert.Equal(t, "/kubepods/burstable/pod123", gotAttrs["process.linux.cgroup"])
+	}
+}
