@@ -159,6 +159,7 @@ type PyProcInfo C.PyProcInfo
 type RubyProcInfo C.RubyProcInfo
 type ThreadContextProcInfo C.ThreadContextProcInfo
 type V8ProcInfo C.V8ProcInfo
+type LuaJITProcInfo C.LuaJITProcInfo
 
 const (
 	Sizeof_StackDelta    = C.sizeof_StackDelta
@@ -244,6 +245,9 @@ const (
 	LJCframeSpaceX86 = C.LUAJIT_CFRAME_SPACE_X86_64
 	LJCframeSpaceArm = C.LUAJIT_CFRAME_SPACE_AARCH64
 	LJJitMarker      = C.LUAJIT_JIT_MARKER
+	LJFFIFunc        = C.LUAJIT_FFI_FUNC
+	LJNormalFrame    = C.LUAJIT_NORMAL_FRAME
+	LJGReport        = C.LUAJIT_G_REPORT
 )
 
 var MetricsTranslation = []metrics.MetricID{

@@ -490,6 +490,11 @@ static inline EBPF_INLINE PerCPURecord *get_pristine_per_cpu_record()
   record->rubyUnwindState.last_stack_frame  = 0;
   record->rubyUnwindState.cfunc_saved_frame = 0;
   record->rubyUnwindState.jit_detected      = false;
+  record->luajitUnwindState.frame           = 0;
+  record->luajitUnwindState.prevframe       = 0;
+  record->luajitUnwindState.L_ptr           = 0;
+  record->luajitUnwindState.cframe          = 0;
+  record->luajitUnwindState.is_jit          = false;
   record->unwindersDone                     = 0;
   record->tailCalls                         = 0;
   record->ratelimitAction                   = RATELIMIT_ACTION_DEFAULT;
@@ -1055,6 +1060,7 @@ copy_state_regs(UnwindState *state, struct pt_regs *regs, bool interrupted_kerne
   state->r11 = regs->r11;
   state->r13 = regs->r13;
   state->r15 = regs->r15;
+  state->r14 = regs->r14;
 
   // Treat syscalls as return addresses, but not IRQ handling, page faults, etc..
   // https://github.com/torvalds/linux/blob/2ef5971ff3/arch/x86/include/asm/syscall.h#L31-L39
@@ -1073,6 +1079,7 @@ copy_state_regs(UnwindState *state, struct pt_regs *regs, bool interrupted_kerne
   state->r20 = regs->regs[20];
   state->r22 = regs->regs[22];
   state->r28 = regs->regs[28];
+  state->r7  = regs->regs[7];
 
   // Treat syscalls as return addresses, but not IRQ handling, page faults, etc..
   // https://github.com/torvalds/linux/blob/2ef5971ff3/arch/arm64/include/asm/ptrace.h#L118
@@ -1249,7 +1256,8 @@ unwind_trace(struct pt_regs *ctx, PerCPURecord *record, bool kernel_frames)
 
   record->usesAnonymousMappings = pid_uses_anonymous_mappings(pidInfo);
 
-  error = get_next_unwinder_after_native_frame(record, &unwinder);
+  error                   = get_next_unwinder_after_native_frame(record, &unwinder);
+  record->initialUnwinder = unwinder;
 
 exit:
   record->state.unwind_error = error;

@@ -425,6 +425,7 @@ unwind_one_frame(PerCPURecord *record, bool *stop, bool *delegate_command)
       state->r20 = rt_regs[20];
       state->r22 = rt_regs[22];
       state->r28 = rt_regs[28];
+      state->r7  = rt_regs[7];
 
       state->return_address = false;
       state->lr_invalid     = false;

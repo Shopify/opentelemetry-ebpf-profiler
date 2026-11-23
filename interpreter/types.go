@@ -39,6 +39,9 @@ var (
 	UnknownFunctionName = libpf.Intern("<unknown>")
 
 	ErrMismatchInterpreterType = errors.New("mismatched interpreter type")
+
+	// Special coredump-only error used to restart ConvertTrace processing
+	ErrLJRestart = errors.New("lj_restart")
 )
 
 // The following function Loader and interfaces Data and Instance work together
