@@ -61,7 +61,7 @@ const (
 const UnwindInfoMaxEntries = 0x8000
 
 const (
-	MetricIDBeginCumulative = 0x75
+	MetricIDBeginCumulative = 0x77
 )
 
 const (
@@ -340,13 +340,16 @@ type RubyProcInfo struct {
 	Current_ctx_ptr              uint64
 	Jit_start                    uint64
 	Jit_end                      uint64
+	Zjit_entry_addr              uint64
 	Vm_objspace                  uint16
+	Ractor_objspace              uint16
 	Running_ec                   uint16
 	Vm_stack                     uint8
 	Vm_stack_size                uint8
 	Cfp                          uint8
 	Thread_ptr                   uint8
 	Thread_vm                    uint8
+	Thread_ractor                uint8
 	Objspace_flags               uint8
 	Objspace_size_of_flags       uint8
 	Pc                           uint8
@@ -358,7 +361,7 @@ type RubyProcInfo struct {
 	Size_of_value                uint8
 	Has_objspace                 bool
 	No_native_resume             bool
-	Pad_cgo_0                    [4]byte
+	Is_ruby_41                   bool
 }
 type ThreadContextProcInfo struct {
 	Tls TLSVarInfo
@@ -387,6 +390,14 @@ type V8ProcInfo struct {
 	Leaptiering                  uint8
 	Pad_cgo_0                    [5]byte
 }
+type LuaJITProcInfo struct {
+	G2dispatch         uint16
+	Cur_L_offset       uint16
+	Cframe_size_jit    uint16
+	G2jitbase          uint16
+	Cframe_size_interp uint16
+	Interp_fp          uint16
+}
 
 const (
 	Sizeof_StackDelta    = 0x4
@@ -395,7 +406,7 @@ const (
 	Sizeof_GolangLabel   = 0x40
 
 	sizeof_PHPProcInfo           = 0x18
-	sizeof_RubyProcInfo          = 0x40
+	sizeof_RubyProcInfo          = 0x48
 	sizeof_ThreadContextProcInfo = 0xc
 )
 
@@ -466,6 +477,9 @@ const (
 	LJCframeSpaceX86 = 0x50
 	LJCframeSpaceArm = 0xd0
 	LJJitMarker      = 0x2a
+	LJFFIFunc        = 0xff1
+	LJNormalFrame    = 0x0
+	LJGReport        = 0xff2
 )
 
 var MetricsTranslation = []metrics.MetricID{
@@ -565,14 +579,14 @@ var MetricsTranslation = []metrics.MetricID{
 	0x68: metrics.IDUnwindNativeErrNonExecutableVMA,
 	0x69: metrics.IDUnwindLuaJITAttempts,
 	0x6a: metrics.IDUnwindLuaJITErrNoProcInfo,
-	0x6b: metrics.IDSamplesSkippedProcessTooNew,
-	0x6c: metrics.IDNumSyncsFromPrctl,
-	0x6d: metrics.IDNumPriorityEventDeferred,
-	0x6e: metrics.IDUnwindGoAsmcgocallAttempts,
-	0x6f: metrics.IDUnwindGoAsmcgocallSuccess,
-	0x70: metrics.IDUnwindGoAsmcgocallUnwindFailure,
-	0x71: metrics.IDUnwindThreadContextErrReadTlsPtr,
-	0x72: metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
-	0x73: metrics.IDUnwindThreadContextReadSuccesses,
-	0x74: metrics.IDUnwindThreadContextAttrsTruncated,
+	0x6d: metrics.IDSamplesSkippedProcessTooNew,
+	0x6e: metrics.IDNumSyncsFromPrctl,
+	0x6f: metrics.IDNumPriorityEventDeferred,
+	0x70: metrics.IDUnwindGoAsmcgocallAttempts,
+	0x71: metrics.IDUnwindGoAsmcgocallSuccess,
+	0x72: metrics.IDUnwindGoAsmcgocallUnwindFailure,
+	0x73: metrics.IDUnwindThreadContextErrReadTlsPtr,
+	0x74: metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
+	0x75: metrics.IDUnwindThreadContextReadSuccesses,
+	0x76: metrics.IDUnwindThreadContextAttrsTruncated,
 }
