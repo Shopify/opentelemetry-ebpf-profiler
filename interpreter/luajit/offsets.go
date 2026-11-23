@@ -22,6 +22,7 @@ const (
 	luaPushCClosureSym      libpf.SymbolName = "lua_pushcclosure"
 	luaopenJitSym           libpf.SymbolName = "luaopen_jit"
 	luaCloseSym             libpf.SymbolName = "lua_close"
+	ljVMExitHandlerSym      libpf.SymbolName = "lj_vm_exit_handler"
 )
 
 func scanSymbols(ef *pfelf.File) map[libpf.SymbolName]libpf.Symbol {
@@ -32,6 +33,7 @@ func scanSymbols(ef *pfelf.File) map[libpf.SymbolName]libpf.Symbol {
 		luaPushCClosureSym:      {},
 		luaopenJitSym:           {},
 		luaCloseSym:             {},
+		ljVMExitHandlerSym:      {},
 	}
 
 	foundSymbols := map[libpf.SymbolName]libpf.Symbol{}
@@ -118,12 +120,48 @@ func newLuajitData(ef *pfelf.File, ir util.Range) (*luajitData, error) {
 	}
 	ljd.g2Dispatch = uint16(g2dispatch)
 
+	g2jitbase, err := oft.findG2JitBaseOffset(curLOffset, g2dispatch)
+	if err != nil {
+		return nil, err
+	}
+	if g2jitbase > 0xffff {
+		return nil, fmt.Errorf("lj: g to jit_base offset %v is too large", g2jitbase)
+	}
+	ljd.g2jitbase = uint16(g2jitbase)
+
 	// If we have symbols we can check that the start address is correct.
 	if s, ok := oft.foundSymbols[ljVMAsmBeginSym]; ok && ir.Start != uint64(s.Address) {
 		return nil, fmt.Errorf("lj: unexpected start address %x, expected %x", s.Address, ir.Start)
 	}
 
 	return &ljd, nil
+}
+
+// findG2JitBaseOffset returns the offset of jit_base within global_State
+// (relative to G). jit_base is not always adjacent to cur_L: tarantool's LuaJIT
+// inserts a mem_L field between them, so we cannot simply assume cur_L+8.
+//
+// We extract it from lj_vm_exit_handler (which clears g->jit_base via the
+// DISPATCH register) when that symbol is available. On stripped binaries the
+// symbol is absent; we then fall back to cur_L+8, which is correct for
+// OpenResty/luajit2 (no mem_L) — the only stripped case we care about.
+func (o *offsetData) findG2JitBaseOffset(curLOffset, g2dispatch libpf.Address) (libpf.Address, error) {
+	fallback := curLOffset + 8
+	sym, ok := o.foundSymbols[ljVMExitHandlerSym]
+	if !ok {
+		log.Debugf("lj: no lj_vm_exit_handler symbol, assuming jit_base at cur_L+8")
+		return fallback, nil
+	}
+	b, err := o.readSym(sym)
+	if err != nil {
+		return fallback, nil
+	}
+	g2jitbase, err := o.e.findG2JitBaseFromExitHandler(b, g2dispatch, curLOffset)
+	if err != nil || g2jitbase == 0 {
+		log.Debugf("lj: could not extract jit_base offset (%v), assuming cur_L+8", err)
+		return fallback, nil
+	}
+	return g2jitbase, nil
 }
 
 type extractor interface {
@@ -176,6 +214,14 @@ type extractor interface {
 	//
 	// This is used to find the address of `luaopen_jit_util` from the code of `luaopen_jit`.
 	find2ndArgTo2ndPushClosureCall(b []byte, baseAddr, targetCall libpf.Address) (libpf.Address, error)
+
+	// lj_vm_exit_handler restores the interpreter state on trace exit. Among
+	// other things it loads BASE and L from G->jit_base / G->cur_L and then
+	// clears jit_base. Those accesses are relative to the DISPATCH register
+	// (DISPATCH = G + g2dispatch), so the displacement of the jit_base access
+	// gives us jit_base's offset from G. curLOffset disambiguates the candidate.
+	findG2JitBaseFromExitHandler(b []byte, g2dispatch,
+		curLOffset libpf.Address) (libpf.Address, error)
 }
 
 func newExtractor(ef *pfelf.File) (extractor, error) {

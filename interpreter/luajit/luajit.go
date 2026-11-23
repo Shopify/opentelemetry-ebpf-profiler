@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -59,6 +60,17 @@ type luajitData struct {
 	g2Traces uint16
 	// Offset of cur_L field in the global_State struct.
 	currentLOffset uint16
+	// Offset of jit_base within global_State (relative to G). Extracted separately
+	// because it is not always adjacent to cur_L (tarantool inserts mem_L between).
+	g2jitbase uint16
+	// How to step over the interpreter C frame on the native handback, taken from
+	// the interpreter region's stack delta. cframeSizeInterp is the CFA offset;
+	// interpFP is 1 when frame-pointer based (arm64) vs SP based (x86). 0 = default.
+	cframeSizeInterp uint16
+	interpFP         uint16
+	// Size to step over a JIT trace's C frame on the native handback (gate cframe
+	// + the interp->trace transition frame). Derived from cframeSizeInterp on x86.
+	cframeSizeJIT uint16
 }
 
 type luajitInstance struct {
@@ -84,7 +96,8 @@ type luajitInstance struct {
 	traceHashes map[libpf.Address]uint64
 	cycle       uint32
 
-	g2Traces uint16
+	g2Traces      uint16
+	cframeSizeJIT uint16
 }
 
 var (
@@ -95,9 +108,12 @@ var (
 func (d *luajitData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, _ libpf.Address,
 	rm remotememory.RemoteMemory) (interpreter.Instance, error) {
 	cdata := support.LuaJITProcInfo{
-		G2dispatch:      d.g2Dispatch,
-		Cur_L_offset:    d.currentLOffset,
-		Cframe_size_jit: uint16(cframeSizeJIT),
+		G2dispatch:         d.g2Dispatch,
+		Cur_L_offset:       d.currentLOffset,
+		Cframe_size_jit:    d.cframeSizeJIT,
+		G2jitbase:          d.g2jitbase,
+		Cframe_size_interp: d.cframeSizeInterp,
+		Interp_fp:          d.interpFP,
 	}
 	if err := ebpf.UpdateProcData(libpf.LuaJIT, pid, unsafe.Pointer(&cdata)); err != nil {
 		return nil, err
@@ -113,7 +129,8 @@ func (d *luajitData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, _ libpf
 		prefixesByG: make(map[libpf.Address][]lpm.Prefix),
 		vms:         make(vmMap),
 		traceHashes: make(map[libpf.Address]uint64),
-		g2Traces:    d.g2Traces,
+		g2Traces:      d.g2Traces,
+		cframeSizeJIT: d.cframeSizeJIT,
 	}, nil
 }
 
@@ -135,17 +152,25 @@ func (l *luajitInstance) Detach(ebpf interpreter.EbpfHandler, pid libpf.PID) err
 	return ebpf.DeleteProcData(libpf.LuaJIT, pid)
 }
 
-func GetLoader(_ Config) interpreter.Loader {
-	return interpreter.NewLoader(loader, []interpreter.InterpreterResource{
-		{MapName: BPFMapName, ProgID: uint32(support.ProgUnwindLuaJIT), ProgName: "unwind_luajit"},
-	})
+// embedsLuaJIT reports whether the executable base name ships or statically
+// links the LuaJIT runtime. The built-in set covers the LuaJIT shared library
+// (libluajit-5.1.so*, luajit*) and the well-known hosts nginx/openresty.
+// extraExecutables is an operator-configured list of additional binaries that
+// statically link LuaJIT (e.g. "tarantool"), so embedders can opt in via
+// configuration without a code change to this allowlist.
+func embedsLuaJIT(base string, extraExecutables []string) bool {
+	if strings.HasPrefix(base, "libluajit-5.1.so") ||
+		strings.HasPrefix(base, "luajit") ||
+		base == "nginx" || base == "openresty" {
+		return true
+	}
+	return slices.Contains(extraExecutables, base)
 }
 
-func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
+func loadLuaJIT(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
+	extraExecutables []string) (interpreter.Data, error) {
 	base := path.Base(info.FileName())
-	if !strings.HasPrefix(base, "libluajit-5.1.so") &&
-		!strings.HasPrefix(base, "luajit") &&
-		base != "nginx" && base != "openresty" {
+	if !embedsLuaJIT(base, extraExecutables) {
 		return nil, nil
 	}
 
@@ -154,7 +179,18 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		return nil, err
 	}
 
-	luaInterp, err := extractInterpreterBounds(ef.Machine, *info.Intervals(), cframeSize)
+	// When the binary is unstripped (e.g. tarantool), lj_vm_asm_begin marks the
+	// exact start of the VM interpreter. Anchor the interpreter-range detection
+	// to it: the stack-delta heuristic alone can match an unrelated large gap.
+	// lj_vm_asm_begin is a hidden .symtab symbol; raw ef.LookupSymbol only finds
+	// dynamic symbols, so use scanSymbols, matching the offset extraction path.
+	var asmBegin uint64
+	if sym, ok := scanSymbols(ef)[ljVMAsmBeginSym]; ok {
+		asmBegin = uint64(sym.Address)
+	}
+
+	luaInterp, err := extractInterpreterBoundsAnchored(
+		ef.Machine, *info.Intervals(), cframeSize, asmBegin)
 	if err != nil {
 		return nil, err
 	}
@@ -164,6 +200,27 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	if err != nil {
 		return nil, err
 	}
+
+	// Derive how to step over the interpreter's C frame on the native handback
+	// from the interpreter region's own stack delta (correct per build/arch),
+	// rather than the hardcoded LUAJIT_CFRAME_SPACE which is wrong for tarantool.
+	if p, fp, ok := interpCframeUnwind(info.Intervals(), luaInterp.Start); ok {
+		ljd.cframeSizeInterp = p
+		ljd.interpFP = fp
+		logf("lj: interp cframe size %d fp %d", p, fp)
+	}
+	// The JIT trace runs in the VM gate's C frame plus a small interp->trace
+	// transition frame (16 bytes). On SP-based builds (x86) the gate cframe is the
+	// extracted interp cframe, which differs from the hardcoded LJCframeSpace
+	// (tarantool 96 vs OpenResty 80) -- using the wrong base left the JIT native
+	// handback 16 bytes short, resuming in the fiber stack instead of the C
+	// caller (ERROR_4012). FP-based (arm64) keeps the arch constant. Falls back to
+	// the constant when the interp cframe couldn't be extracted.
+	ljd.cframeSizeJIT = uint16(cframeSizeJIT)
+	if ljd.cframeSizeInterp != 0 && ljd.interpFP == 0 {
+		ljd.cframeSizeJIT = ljd.cframeSizeInterp + 16
+	}
+	logf("lj: cframe size jit %d", ljd.cframeSizeJIT)
 
 	logf("lj: offsets %+v", ljd)
 
@@ -188,8 +245,18 @@ const (
 // big and has a somewhat unique FDE we can pick out. We could tighten this up by looking for
 // direct jumps to the start of the interpreter (one can be found lj_dispatch_update) but we'd
 // still need to consult the stack deltas to get the end of the interpreter.
-func extractInterpreterBounds(machine elf.Machine, intervals sdtypes.IntervalData, param int32) (util.Range,
-	error) {
+func extractInterpreterBounds(machine elf.Machine, intervals sdtypes.IntervalData,
+	param int32) (util.Range, error) {
+	return extractInterpreterBoundsAnchored(machine, intervals, param, 0)
+}
+
+func extractInterpreterBoundsAnchored(machine elf.Machine, intervals sdtypes.IntervalData, param int32,
+	asmBegin uint64) (util.Range, error) {
+	var (
+		fallback      util.Range
+		foundFallback bool
+	)
+
 DeltasLoop:
 	for i, bk := range intervals.Blocks {
 		for j, d := range bk.Deltas {
@@ -212,19 +279,70 @@ DeltasLoop:
 			}
 			dAddr := bk.Start + uint64(d.Offset)
 			nextAddr := nextBk.Start + uint64(next.Offset)
-			if nextAddr < dAddr || nextAddr-dAddr <= minInterpreterSize {
+			if nextAddr < dAddr {
+				continue
+			}
+
+			// The VM asm is one large delta interval, but its start can sit a few
+			// bytes below lj_vm_asm_begin. Match the interval containing the symbol,
+			// then start the range exactly at the symbol.
+			if asmBegin != 0 && dAddr <= asmBegin && asmBegin < nextAddr &&
+				nextAddr-asmBegin > minInterpreterSize {
+				return util.Range{Start: asmBegin, End: nextAddr}, nil
+			}
+			if nextAddr-dAddr <= minInterpreterSize {
 				continue
 			}
 
 			// The first case covers x86 w/ dwarf and old versions of luajit ARM that used dwarf and
 			// the second covers more recent arm versions that use frame pointers.
-			if (d.Info.BaseReg == support.UnwindRegSp && d.Info.Param == param) ||
-				(machine == elf.EM_AARCH64 && d.Info.BaseReg == support.UnwindRegFp && d.Info.Param == 16) {
-				return util.Range{Start: dAddr, End: nextAddr}, nil
+			if !foundFallback &&
+				((d.Info.BaseReg == support.UnwindRegSp && d.Info.Param == param) ||
+					(machine == elf.EM_AARCH64 && d.Info.BaseReg == support.UnwindRegFp && d.Info.Param == 16)) {
+				fallback = util.Range{Start: dAddr, End: nextAddr}
+				foundFallback = true
 			}
 		}
 	}
+	if foundFallback {
+		return fallback, nil
+	}
 	return util.Range{}, errors.New("failed to find interpreter range")
+}
+
+// interpCframeUnwind returns how to step over the interpreter's C frame when the
+// luajit unwinder hands back to the native unwinder. It reads the interpreter
+// region's own stack delta (the one covering interpStart): param is the CFA
+// offset and fp is 1 when that delta is frame-pointer based (CFA = fp + param,
+// as on arm64) vs stack-pointer based (CFA = sp + param, as on x86). This is
+// authoritative per build/arch, unlike the hardcoded LUAJIT_CFRAME_SPACE which
+// is wrong for tarantool (x86 wants 96 not 80; arm64 is fp-based +16 not 208).
+func interpCframeUnwind(intervals *sdtypes.IntervalData,
+	interpStart uint64) (param, fp uint16, ok bool) {
+	for _, block := range intervals.Blocks {
+		if interpStart < block.Start || interpStart >= block.End {
+			continue
+		}
+		for i := range block.Deltas {
+			start := block.Start + uint64(block.Deltas[i].Offset)
+			end := block.End
+			if i+1 < len(block.Deltas) {
+				end = block.Start + uint64(block.Deltas[i+1].Offset)
+			}
+			if start > interpStart || interpStart >= end {
+				continue
+			}
+			info := block.Deltas[i].Info
+			if info.Param <= 0 || info.Param > 0xffff {
+				return 0, 0, false
+			}
+			if info.BaseReg == support.UnwindRegFp {
+				return uint16(info.Param), 1, true
+			}
+			return uint16(info.Param), 0, true
+		}
+	}
+	return 0, 0, false
 }
 
 func (l *luajitInstance) getVMList() []libpf.Address {
@@ -373,12 +491,12 @@ func (l *luajitInstance) processVMs(ebpf interpreter.EbpfHandler, pid libpf.PID)
 				continue
 			}
 
-			stackDelta := uint64(t.spadjust) + uint64(cframeSizeJIT)
+			stackDelta := uint64(t.spadjust) + uint64(l.cframeSizeJIT)
 			// If this is a side trace, we need to add the spadjust of the root trace but
 			// only if they are different.
 			// https://github.com/openresty/luajit2/blob/7952882d/src/lj_gdbjit.c#L597
 			if t.root != 0 && traces[t.root].spadjust != t.spadjust {
-				stackDelta += uint64(traces[t.root].spadjust) + uint64(cframeSizeJIT)
+				stackDelta += uint64(traces[t.root].spadjust) + uint64(l.cframeSizeJIT)
 			}
 			p, err := l.addTrace(ebpf, pid, t, uint64(g), stackDelta)
 			if err != nil {
