@@ -10,24 +10,35 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/usdt"
 )
 
-const heapAllocArgumentCount = 3
+const (
+	heapAllocArgumentCount = 3
+	heapFreeArgumentCount  = 1
+)
 
 func parseAllocSpec(point usdt.AttachmentPoint) (support.USDTSpec, error) {
+	return parseHeapSpec(point, heapAllocArgumentCount, "alloc")
+}
+
+func parseFreeSpec(point usdt.AttachmentPoint) (support.USDTSpec, error) {
+	return parseHeapSpec(point, heapFreeArgumentCount, "free")
+}
+
+func parseHeapSpec(point usdt.AttachmentPoint, expectedArgs uint8, name string) (support.USDTSpec, error) {
 	parsed, err := usdt.ParseArguments(point.Arguments, point.Machine)
 	if err != nil {
 		return support.USDTSpec{}, err
 	}
-	if parsed.ArgumentCount != heapAllocArgumentCount {
-		return support.USDTSpec{}, fmt.Errorf("alloc probe has %d arguments, want %d",
-			parsed.ArgumentCount, heapAllocArgumentCount)
+	if parsed.ArgumentCount != expectedArgs {
+		return support.USDTSpec{}, fmt.Errorf("%s probe has %d arguments, want %d",
+			name, parsed.ArgumentCount, expectedArgs)
 	}
 
 	var spec support.USDTSpec
-	for i := range heapAllocArgumentCount {
+	for i := range expectedArgs {
 		arg := parsed.Arguments[i]
 		if arg.Size() != 8 || arg.IsSigned() || arg.IsFloat() {
 			return support.USDTSpec{}, fmt.Errorf(
-				"alloc argument %d must be an unsigned 8-byte integer", i)
+				"%s argument %d must be an unsigned 8-byte integer", name, i)
 		}
 		var registerOffset uint16
 		switch arg.Kind {
@@ -35,11 +46,11 @@ func parseAllocSpec(point usdt.AttachmentPoint) (support.USDTSpec, error) {
 		case usdt.ArgumentRegister, usdt.ArgumentRegisterDereference:
 			registerOffset, err = arg.Register.PTRegsOffset(point.Machine)
 			if err != nil {
-				return support.USDTSpec{}, fmt.Errorf("convert alloc argument %d: %w", i, err)
+				return support.USDTSpec{}, fmt.Errorf("convert %s argument %d: %w", name, i, err)
 			}
 		default:
 			return support.USDTSpec{}, fmt.Errorf(
-				"convert alloc argument %d: unsupported argument kind %d", i, arg.Kind)
+				"convert %s argument %d: unsupported argument kind %d", name, i, arg.Kind)
 		}
 		spec.Arguments[i] = support.USDTArgumentSpec{
 			Value_offset:    arg.ValueOffset,

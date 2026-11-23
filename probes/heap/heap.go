@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package heap implements a probe that discovers and attaches USDT heap
-// profiling probes on a per-process basis.
+// profiling probes (alloc/free) on a per-process basis.
 package heap // import "go.opentelemetry.io/ebpf-profiler/probes/heap"
 
 import (
@@ -15,6 +15,7 @@ import (
 
 	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"go.opentelemetry.io/otel/attribute"
 
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -33,6 +34,14 @@ const (
 	heapProbeProvider = "otel_memory"
 	allocProgName     = "uprobe_heap_alloc"
 	allocOriginVar    = "origin_id_heap_alloc"
+	freeProgName      = "uprobe_heap_free"
+	freeOriginVar     = "origin_id_heap_free"
+
+	usdtSpecsMapName         = "usdt_specs"
+	heapLivePidsMapName      = "heap_live_pids"
+	heapPIDAllocCountMapName = "heap_pid_alloc_count"
+	heapPIDAllocLimitMapName = "heap_pid_alloc_limit"
+	heapAllocLiveMapName     = "heap_alloc_live"
 )
 
 // attachmentKey identifies one uprobe link within a single process. It is
@@ -60,20 +69,50 @@ type attachment struct {
 	detaching bool
 }
 
-// Probe implements tracer.Probe and processmanager.ProbeAttacher for USDT heap profiling.
+// heapAllocKey mirrors the eBPF HeapAllocKey struct used as the key for
+// the heap_alloc_live map.
+type heapAllocKey struct {
+	PID uint32
+	_   uint32 // padding
+	Ptr uint64
+}
+
+// Probe implements tracer.Probe, tracer.TraceHandlerHooks,
+// samples.SnapshotSource, and processmanager.ProbeAttacher for USDT heap profiling.
 type Probe struct {
-	discoverer     *usdt.Discoverer
-	programs       map[string]*cebpf.Program
-	usdtSpecs      *cebpf.Map
-	mapScaleFactor uint
+	cfg         Config
+	discoverer  *usdt.Discoverer
+	programs    map[string]*cebpf.Program
+	tracker     *Tracker
+	processMeta func(libpf.PID) (process.Meta, attribute.Set)
+
+	usdtSpecs         *cebpf.Map
+	heapLivePids      *cebpf.Map
+	heapAllocLive     *cebpf.Map
+	heapPIDAllocCount *cebpf.Map
+	heapPIDAllocLimit *cebpf.Map
 
 	mu          sync.Mutex
 	unloaded    bool
 	attachments map[libpf.PID]map[attachmentKey]*attachment
 
-	// originAlloc is the dynamically-assigned origin ID for heap allocations.
+	// originAlloc and originFree are the dynamically-assigned origin IDs.
 	originAlloc uint16
+	originFree  uint16
+
+	// pendingAlloc* fields are stashed by PreHandleTrace for alloc events
+	// and consumed by PostHandleTrace after symbolization. Safe because
+	// trace processing is single-goroutine.
+	pendingAllocPID   libpf.PID
+	pendingAllocPtr   uint64
+	pendingAllocValue int64
 }
+
+var (
+	_ tracer.Probe             = (*Probe)(nil)
+	_ tracer.TraceHandlerHooks = (*Probe)(nil)
+	_ samples.SnapshotSource   = (*Probe)(nil)
+)
 
 // New creates a heap probe.
 func New(cfg Config) (*Probe, error) {
@@ -81,8 +120,8 @@ func New(cfg Config) (*Probe, error) {
 		return nil, err
 	}
 	return &Probe{
-		attachments:    make(map[libpf.PID]map[attachmentKey]*attachment),
-		mapScaleFactor: cfg.MapScaleFactor,
+		cfg:         cfg,
+		attachments: make(map[libpf.PID]map[attachmentKey]*attachment),
 	}, nil
 }
 
@@ -141,7 +180,13 @@ func appendAllocValues(dst []int64, meta *samples.TraceEventMeta) []int64 {
 func (hp *Probe) Load(_ context.Context, reg tracer.ProbeRegistrar,
 	pctx *tracer.ProbeContext,
 ) (err error) {
-	// Register origin ID. The eBPF program reads this from RODATA.
+	var hooks tracer.TraceHandlerHooks
+	if hp.cfg.LiveHeapProfiling {
+		hp.tracker = NewTracker()
+		hooks = hp
+	}
+
+	// Register origin IDs. The eBPF programs read these from RODATA.
 	hp.originAlloc, err = reg.Register(&tracer.OriginEntry{
 		Meta: &samples.TypeMetadata{
 			SampleTypes: []samples.SampleType{
@@ -151,27 +196,63 @@ func (hp *Probe) Load(_ context.Context, reg tracer.ProbeRegistrar,
 			ReportValues: true,
 			AppendValues: appendAllocValues,
 		},
+		Hooks: hooks,
 	})
 	if err != nil {
 		return fmt.Errorf("registering heap alloc origin: %w", err)
 	}
 
+	progNames := []string{allocProgName}
+	extraVars := []string{allocOriginVar}
+	if hp.cfg.LiveHeapProfiling {
+		hp.originFree, err = reg.Register(&tracer.OriginEntry{
+			Meta: &samples.TypeMetadata{
+				SampleTypes:  []samples.SampleType{{Type: "heap_free", Unit: "count"}},
+				AppendValues: samples.AppendFirstContextValue,
+			},
+			Hooks: hooks,
+		})
+		if err != nil {
+			return fmt.Errorf("registering heap free origin: %w", err)
+		}
+		progNames = append(progNames, freeProgName)
+		extraVars = append(extraVars, freeOriginVar)
+	}
+
+	probeMapNames := []string{
+		usdtSpecsMapName,
+		heapLivePidsMapName,
+		heapPIDAllocCountMapName,
+		heapPIDAllocLimitMapName,
+		heapAllocLiveMapName,
+	}
+
 	// Load eBPF programs via ProbeContext.
-	coll, err := pctx.CollectionSpecWith(
-		[]string{"usdt_specs"},
-		[]string{allocProgName},
-		[]string{allocOriginVar},
-	)
+	coll, err := pctx.CollectionSpecWith(probeMapNames, progNames, extraVars)
 	if err != nil {
 		return fmt.Errorf("building collection spec: %w", err)
 	}
 	// Probe-owned maps bypass the tracer's normal map-size adaptation.
-	coll.Maps["usdt_specs"].MaxEntries <<= uint32(hp.mapScaleFactor)
+	coll.Maps[usdtSpecsMapName].MaxEntries <<= uint32(hp.cfg.MapScaleFactor)
+	if !hp.cfg.LiveHeapProfiling {
+		// uprobe_heap_alloc still references these maps; shrink them to 1 entry
+		// when live-heap tracking is disabled so they consume negligible memory.
+		coll.Maps[heapLivePidsMapName].MaxEntries = 1
+		coll.Maps[heapPIDAllocCountMapName].MaxEntries = 1
+		coll.Maps[heapAllocLiveMapName].MaxEntries = 1
+	}
 
-	// Set origin ID in RODATA so the eBPF program emits the correct value.
+	// Set origin IDs in RODATA so the eBPF programs emit the correct values.
 	if v, ok := coll.Variables[allocOriginVar]; ok {
 		if err := v.Set(hp.originAlloc); err != nil {
-			return fmt.Errorf("setting origin_id_heap_alloc: %w", err)
+			return fmt.Errorf("setting %s: %w", allocOriginVar, err)
+		}
+	}
+	if hp.cfg.LiveHeapProfiling {
+		if v, ok := coll.Variables[freeOriginVar]; ok {
+			if err := v.Set(hp.originFree); err != nil {
+				return fmt.Errorf("setting %s: %w", freeOriginVar, err)
+			}
 		}
 	}
 
@@ -181,37 +262,52 @@ func (hp *Probe) Load(_ context.Context, reg tracer.ProbeRegistrar,
 	}
 	defer restoreRlimit()
 
-	specMap, err := cebpf.NewMap(coll.Maps["usdt_specs"])
-	if err != nil {
-		return fmt.Errorf("creating usdt_specs map: %w", err)
-	}
-
+	probeMaps := make(map[string]*cebpf.Map, len(probeMapNames))
+	ebpfProgs := make(map[string]*cebpf.Program)
 	// Everything created from here on is owned by Load until it returns
 	// successfully, so release it on any error.
-	ebpfProgs := make(map[string]*cebpf.Program)
 	defer func() {
 		if err == nil {
 			return
 		}
 		hp.usdtSpecs = nil
+		hp.heapLivePids = nil
+		hp.heapAllocLive = nil
+		hp.heapPIDAllocCount = nil
+		hp.heapPIDAllocLimit = nil
 		hp.programs = nil
 		hp.discoverer = nil
+		hp.tracker = nil
 		for _, p := range ebpfProgs {
 			_ = p.Close()
 		}
-		_ = specMap.Close()
+		for _, m := range probeMaps {
+			_ = m.Close()
+		}
 	}()
 
-	if err := pctx.RewriteMaps(coll, map[string]*cebpf.Map{"usdt_specs": specMap}); err != nil {
+	for _, name := range probeMapNames {
+		m, mapErr := cebpf.NewMap(coll.Maps[name])
+		if mapErr != nil {
+			err = fmt.Errorf("creating %s map: %w", name, mapErr)
+			return err
+		}
+		probeMaps[name] = m
+	}
+
+	if err = pctx.RewriteMaps(coll, probeMaps); err != nil {
 		return fmt.Errorf("rewriting maps: %w", err)
 	}
 
-	progs := []tracer.ProgLoaderHelper{{
-		Name:             allocProgName,
-		NoTailCallTarget: true,
-		Enable:           true,
-	}}
-	if err := pctx.LoadProbeUnwinders(coll, ebpfProgs, progs, 0); err != nil {
+	progs := make([]tracer.ProgLoaderHelper, 0, len(progNames))
+	for _, name := range progNames {
+		progs = append(progs, tracer.ProgLoaderHelper{
+			Name:             name,
+			NoTailCallTarget: true,
+			Enable:           true,
+		})
+	}
+	if err = pctx.LoadProbeUnwinders(coll, ebpfProgs, progs, 0); err != nil {
 		return fmt.Errorf("loading heap eBPF programs: %w", err)
 	}
 
@@ -219,14 +315,33 @@ func (hp *Probe) Load(_ context.Context, reg tracer.ProbeRegistrar,
 	if p, ok := ebpfProgs[allocProgName]; ok {
 		hp.programs["alloc"] = p
 	}
+	if p, ok := ebpfProgs[freeProgName]; ok {
+		hp.programs["free"] = p
+	}
 	hp.discoverer, err = usdt.NewDiscoverer()
 	if err != nil {
 		return fmt.Errorf("creating USDT discoverer: %w", err)
 	}
 
+	// Write the per-PID alloc limit into the eBPF array map so the
+	// kernel-side code enforces the cap.
+	if hp.cfg.LiveHeapProfiling && hp.cfg.LiveHeapMaxEntriesPerPID > 0 {
+		key := uint32(0)
+		val := uint32(hp.cfg.LiveHeapMaxEntriesPerPID)
+		if putErr := probeMaps[heapPIDAllocLimitMapName].Put(key, val); putErr != nil {
+			log.Warnf("heap probe: failed to set %s: %v", heapPIDAllocLimitMapName, putErr)
+		}
+	}
+
+	hp.usdtSpecs = probeMaps[usdtSpecsMapName]
+	hp.heapLivePids = probeMaps[heapLivePidsMapName]
+	hp.heapAllocLive = probeMaps[heapAllocLiveMapName]
+	hp.heapPIDAllocCount = probeMaps[heapPIDAllocCountMapName]
+	hp.heapPIDAllocLimit = probeMaps[heapPIDAllocLimitMapName]
+	hp.processMeta = pctx.ProcessMeta
+
 	// Register for per-process callbacks via ProbeAttacher.
-	hp.usdtSpecs = specMap
-	if err := pctx.AddAttacher(hp); err != nil {
+	if err = pctx.AddAttacher(hp); err != nil {
 		return err
 	}
 	return nil
@@ -281,7 +396,15 @@ func (hp *Probe) Attach(pr process.Process, mapping *process.RawMapping,
 		if !contained {
 			continue
 		}
-		spec, err := parseAllocSpec(point)
+		var spec support.USDTSpec
+		switch point.Name {
+		case "alloc":
+			spec, err = parseAllocSpec(point)
+		case "free":
+			spec, err = parseFreeSpec(point)
+		default:
+			continue
+		}
 		if err != nil {
 			log.Warnf("heap probe: invalid arguments for %s:%s at offset %#x: %v",
 				point.Provider, point.Name, point.Location, err)
@@ -334,6 +457,7 @@ func (hp *Probe) Attach(pr process.Process, mapping *process.RawMapping,
 	// Reserve each site and register its argument layout before attaching the
 	// uprobe. Multiple mappings of the same file share one PID-scoped link but
 	// each runtime address gets its own specification.
+	attachedFree := false
 	for _, candidate := range candidates {
 		hp.mu.Lock()
 		if hp.unloaded {
@@ -363,6 +487,7 @@ func (hp *Probe) Attach(pr process.Process, mapping *process.RawMapping,
 			}
 			attached.specKeys[candidate.specKey] = libpf.Void{}
 			hp.mu.Unlock()
+			attachedFree = attachedFree || candidate.point.Name == "free"
 			// In some cases, e.g. with dlmopen, a library may be mapped in multiple
 			// times. A PID-scoped uprobe is registered by inode and file offset, so
 			// the existing link fires for every mapping of that site in this process.
@@ -428,6 +553,15 @@ func (hp *Probe) Attach(pr process.Process, mapping *process.RawMapping,
 		}
 		pending.lnk = lnk
 		hp.mu.Unlock()
+		attachedFree = attachedFree || candidate.point.Name == "free"
+	}
+
+	if attachedFree && hp.cfg.LiveHeapProfiling {
+		hp.mu.Lock()
+		if !hp.unloaded && hp.heapLivePids != nil {
+			hp.setHeapLivePID(hp.heapLivePids, pid, true)
+		}
+		hp.mu.Unlock()
 	}
 	return nil
 }
@@ -463,6 +597,12 @@ func (hp *Probe) Detach(pid libpf.PID) {
 		}
 	}
 
+	// Purge userspace live-heap state and collect pointers for eBPF cleanup.
+	var ptrs []uint64
+	if hp.tracker != nil {
+		ptrs = hp.tracker.HandleProcessExit(pid)
+	}
+
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
 	for _, cleanup := range cleanups {
@@ -486,13 +626,28 @@ func (hp *Probe) Detach(pid libpf.PID) {
 	if len(hp.attachments[pid]) == 0 {
 		delete(hp.attachments, pid)
 	}
+
+	if !hp.unloaded {
+		if hp.heapAllocLive != nil && len(ptrs) > 0 {
+			for _, ptr := range ptrs {
+				key := heapAllocKey{PID: uint32(pid), Ptr: ptr}
+				_ = hp.heapAllocLive.Delete(key)
+			}
+		}
+		if hp.heapPIDAllocCount != nil {
+			pidKey := uint32(pid)
+			_ = hp.heapPIDAllocCount.Delete(pidKey)
+		}
+		if hp.heapLivePids != nil {
+			hp.setHeapLivePID(hp.heapLivePids, pid, false)
+		}
+	}
 }
 
 // Unload implements tracer.Probe. Uprobe links are fd-backed, so the runtime
 // releases them automatically when the profiler exits; per-PID cleanup also
-// happens via Detach. We close any remaining links explicitly here so the
-// lifecycle is clear and does not rely on Detach being called for every PID
-// during shutdown.
+// happens via Detach. We close any remaining links, probe-owned maps, and
+// programs explicitly here.
 func (hp *Probe) Unload() error {
 	hp.mu.Lock()
 	if hp.unloaded {
@@ -502,8 +657,18 @@ func (hp *Probe) Unload() error {
 	hp.unloaded = true
 	attachments := hp.attachments
 	specMap := hp.usdtSpecs
+	livePids := hp.heapLivePids
+	allocLive := hp.heapAllocLive
+	pidCount := hp.heapPIDAllocCount
+	pidLimit := hp.heapPIDAllocLimit
+	programs := hp.programs
 	hp.attachments = make(map[libpf.PID]map[attachmentKey]*attachment)
 	hp.usdtSpecs = nil
+	hp.heapLivePids = nil
+	hp.heapAllocLive = nil
+	hp.heapPIDAllocCount = nil
+	hp.heapPIDAllocLimit = nil
+	hp.programs = nil
 	hp.mu.Unlock()
 
 	var errs error
@@ -526,8 +691,153 @@ func (hp *Probe) Unload() error {
 			}
 		}
 	}
-	if specMap != nil {
-		errs = errors.Join(errs, specMap.Close())
+	for _, p := range programs {
+		if p != nil {
+			errs = errors.Join(errs, p.Close())
+		}
+	}
+	for _, m := range []*cebpf.Map{specMap, livePids, allocLive, pidCount, pidLimit} {
+		if m != nil {
+			errs = errors.Join(errs, m.Close())
+		}
 	}
 	return errs
+}
+
+// PreHandleTrace implements tracer.TraceHandlerHooks.
+// For free events: updates the tracker and consumes the trace.
+// For alloc events: stashes raw eBPF fields for PostHandleTrace and
+// continues with symbolization.
+func (hp *Probe) PreHandleTrace(trace *libpf.EbpfTrace) bool {
+	if trace.Origin == hp.originFree {
+		if hp.tracker != nil && len(trace.ContextValues) > 1 {
+			hp.tracker.HandleFree(trace.PID, trace.ContextValues[1])
+		}
+		return false // consumed
+	}
+	// Alloc event: stash raw fields for PostHandleTrace.
+	hp.pendingAllocPID = trace.PID
+	hp.pendingAllocPtr = 0
+	hp.pendingAllocValue = 0
+	if len(trace.ContextValues) > 0 {
+		hp.pendingAllocValue = int64(trace.ContextValues[0])
+	}
+	if len(trace.ContextValues) > 1 {
+		hp.pendingAllocPtr = trace.ContextValues[1]
+	}
+	return true
+}
+
+// PostHandleTrace implements tracer.TraceHandlerHooks. It feeds heap alloc
+// events to the live heap tracker after symbolization.
+func (hp *Probe) PostHandleTrace(trace *libpf.Trace) {
+	if hp.tracker == nil {
+		return
+	}
+	hp.tracker.HandleAlloc(
+		hp.pendingAllocPID,
+		hp.pendingAllocPtr,
+		trace.Hash(),
+		hp.pendingAllocValue,
+		trace.Frames,
+	)
+}
+
+// inuseProfileType describes the live-heap snapshot profile. The samples are
+// produced by ProduceSnapshots rather than by trace events, so they carry no
+// thread or CPU attribution.
+var inuseProfileType = &samples.TypeMetadata{
+	SampleTypes: []samples.SampleType{
+		{Type: "inuse_space", Unit: "bytes"},
+		{Type: "inuse_objects", Unit: "count"},
+	},
+	ReportValues:      true,
+	AppendValues:      appendInuseValues,
+	OmitThreadContext: true,
+}
+
+func appendInuseValues(dst []int64, meta *samples.TraceEventMeta) []int64 {
+	var space, objects int64
+	if len(meta.ContextValues) > 0 {
+		space = int64(meta.ContextValues[0])
+	}
+	if len(meta.ContextValues) > 1 {
+		objects = int64(meta.ContextValues[1])
+	}
+	return append(dst, space, objects)
+}
+
+// ProduceSnapshots implements samples.SnapshotSource. Returns inuse profiles
+// from the live heap tracker snapshot, enriched with per-PID process metadata.
+func (hp *Probe) ProduceSnapshots() []samples.SnapshotProfile {
+	if hp.tracker == nil {
+		return nil
+	}
+	entries := hp.tracker.Snapshot()
+	if len(entries) == 0 {
+		return nil
+	}
+
+	type cachedMeta struct {
+		meta  process.Meta
+		attrs attribute.Set
+	}
+	var metaByPID map[libpf.PID]cachedMeta
+	if hp.processMeta != nil {
+		metaByPID = make(map[libpf.PID]cachedMeta)
+	}
+
+	result := make([]samples.SnapshotSample, len(entries))
+	for i, e := range entries {
+		var procMeta process.Meta
+		var resourceAttrs attribute.Set
+		if metaByPID != nil {
+			cached, ok := metaByPID[e.PID]
+			if !ok {
+				cached.meta, cached.attrs = hp.processMeta(e.PID)
+				metaByPID[e.PID] = cached
+			}
+			procMeta = cached.meta
+			resourceAttrs = cached.attrs
+		}
+		result[i] = samples.SnapshotSample{
+			ResourceKey: samples.ResourceKey{
+				PID:            int64(e.PID),
+				ExecutablePath: procMeta.Executable,
+				ContainerID:    procMeta.ContainerID,
+			},
+			EnvVars:       procMeta.EnvVariables,
+			ResourceAttrs: resourceAttrs,
+			TraceHash:     e.TraceHash,
+			Frames:        e.Frames,
+			ContextValues: []uint64{uint64(e.Space), uint64(e.Objects)},
+		}
+	}
+
+	return []samples.SnapshotProfile{{
+		ProfileType: inuseProfileType,
+		Samples:     result,
+	}}
+}
+
+// setHeapLivePID adds or removes a PID from the heap_live_pids eBPF map
+// and notifies the userspace live heap tracker.
+func (hp *Probe) setHeapLivePID(livePids *cebpf.Map, pid libpf.PID, enabled bool) {
+	key := uint32(pid)
+	if enabled {
+		val := uint8(1)
+		if err := livePids.Put(key, val); err != nil {
+			log.Warnf("heap probe: set %s for PID %d: %v (map full?)", heapLivePidsMapName, pid, err)
+		}
+	} else {
+		if err := livePids.Delete(key); err != nil && !errors.Is(err, cebpf.ErrKeyNotExist) {
+			log.Debugf("heap probe: delete %s for PID %d: %v", heapLivePidsMapName, pid, err)
+		}
+	}
+
+	// Notify the userspace tracker so it accepts/rejects alloc samples for this PID.
+	if hp.tracker != nil {
+		log.Debugf("heap probe: SetPIDLiveHeapSupport PID %d enabled=%v", pid, enabled)
+		hp.tracker.SetPIDLiveHeapSupport(pid, enabled)
+	}
 }

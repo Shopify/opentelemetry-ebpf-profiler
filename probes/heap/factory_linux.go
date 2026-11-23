@@ -18,7 +18,12 @@ import (
 func NewFactory() extension.Factory {
 	return extension.NewFactory(
 		metadata.Type,
-		func() component.Config { return &Config{MapScaleFactor: defaultMapScaleFactor} },
+		func() component.Config {
+			return &Config{
+				MapScaleFactor:           defaultMapScaleFactor,
+				LiveHeapMaxEntriesPerPID: defaultLiveHeapMaxEntriesPerPID,
+			}
+		},
 		createExtension,
 		metadata.ExtensionsStability,
 	)

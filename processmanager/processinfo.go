@@ -905,6 +905,12 @@ func (pm *ProcessManager) metaForPID(pid libpf.PID) (process.Meta, attribute.Set
 	return process.Meta{}, attribute.Set{}
 }
 
+// MetaForPID returns the process metadata and process-context resource
+// attributes for pid, read under one lock.
+func (pm *ProcessManager) MetaForPID(pid libpf.PID) (process.Meta, attribute.Set) {
+	return pm.metaForPID(pid)
+}
+
 // ThreadLabelDecoderForPID returns a decoder for pid's per-thread labels, or nil
 // when pid is untracked or publishes no schema. Safe to use after the lock
 // drops, see processcontext.Info.

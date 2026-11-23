@@ -9,9 +9,11 @@ import (
 	"fmt"
 
 	cebpf "github.com/cilium/ebpf"
+	"go.opentelemetry.io/otel/attribute"
 
 	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/process"
 	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/rlimit"
@@ -24,6 +26,7 @@ type ProbeContext struct {
 	maps             map[string]*cebpf.Map
 	sysVars          SysConfigVars
 	registerAttacher func(pm.ProbeAttacher) error
+	processMeta      func(libpf.PID) (process.Meta, attribute.Set)
 	KernelSymbolizer *kallsyms.Symbolizer
 	reg              ProbeRegistrar
 	// maxConcurrentProgLoads caps how many eBPF programs are verified at once.
@@ -422,6 +425,16 @@ func (c *ProbeContext) AddAttacher(a pm.ProbeAttacher) error {
 	return c.registerAttacher(a)
 }
 
+// ProcessMeta returns the cached process metadata and process-context resource
+// attributes for pid. Snapshot probes use this to populate SnapshotSample
+// resource metadata.
+func (c *ProbeContext) ProcessMeta(pid libpf.PID) (process.Meta, attribute.Set) {
+	if c.processMeta == nil {
+		return process.Meta{}, attribute.Set{}
+	}
+	return c.processMeta(pid)
+}
+
 // TraceHandlerHooks is a set of trace handler hooks that may be attached to a
 // freshly registered origin ID via ProbeRegistrar.Register. It
 // allows probes to intercept traces with a matching origin either before
@@ -494,6 +507,7 @@ func (t *Tracer) Enable(ctx context.Context, p Probe) error {
 			t.processManager.RegisterProbeAttacher(a)
 			return nil
 		},
+		processMeta:            t.processManager.MetaForPID,
 		KernelSymbolizer:       t.kernelSymbolizer,
 		maxConcurrentProgLoads: t.maxConcurrentProgLoads,
 	}

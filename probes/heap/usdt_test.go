@@ -72,3 +72,30 @@ func TestParseAllocSpecRejectsWrongContract(t *testing.T) {
 		})
 	}
 }
+
+func TestParseFreeSpec(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		arguments string
+		machine   elf.Machine
+		wantErr   bool
+	}{
+		{name: "amd64 register", arguments: "8@%rdi", machine: elf.EM_X86_64},
+		{name: "arm64 register", arguments: "8@x0", machine: elf.EM_AARCH64},
+		{name: "too many args", arguments: "8@%rdi 8@%rsi", machine: elf.EM_X86_64, wantErr: true},
+		{name: "narrow arg", arguments: "4@%edi", machine: elf.EM_X86_64, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := parseFreeSpec(usdt.AttachmentPoint{
+				Arguments: tc.arguments,
+				Machine:   tc.machine,
+			})
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, uint8(1), spec.Count)
+		})
+	}
+}

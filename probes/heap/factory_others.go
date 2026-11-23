@@ -20,7 +20,12 @@ import (
 func NewFactory() extension.Factory {
 	return extension.NewFactory(
 		metadata.Type,
-		func() component.Config { return &Config{MapScaleFactor: defaultMapScaleFactor} },
+		func() component.Config {
+			return &Config{
+				MapScaleFactor:           defaultMapScaleFactor,
+				LiveHeapMaxEntriesPerPID: defaultLiveHeapMaxEntriesPerPID,
+			}
+		},
 		func(_ context.Context, _ extension.Settings, _ component.Config) (extension.Extension, error) {
 			return nil, errors.New("heap extension is only supported on Linux amd64/arm64")
 		},
