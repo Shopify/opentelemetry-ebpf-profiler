@@ -60,6 +60,14 @@ const (
 	// https://github.com/ruby/ruby/blob/c149708018135595b2c19c5f74baf9475674f394/include/ruby/internal/value_type.h#L119
 	rubyTArray = 0x7
 
+	// RUBY_T_DATA
+	// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/include/ruby/internal/value_type.h#L127
+	rubyTData = 0xc
+
+	// TYPED_DATA_EMBEDDED, stored in the low bit of RTypedData.type
+	// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/include/ruby/internal/core/rtypeddata.h#L115
+	typedDataEmbedded = 1
+
 	// RUBY_T_MASK
 	// https://github.com/ruby/ruby/blob/c149708018135595b2c19c5f74baf9475674f394/include/ruby/internal/value_type.h#L142
 	rubyTMask = 0x1f
@@ -132,6 +140,10 @@ type rubyData struct {
 	// How ruby_current_ec is accessed in TLS, nil when it was not resolved.
 	tlsEC *tls.Var
 
+	// Address of rb_zjit_entry. The eBPF program reads it on every stack walk
+	// because ZJIT can be enabled after the profiler attached.
+	zjitEntryAddr libpf.Address
+
 	// Address to global symbols, for id to string mappings
 	globalSymbolsAddr libpf.Address
 	// version of the currently used Ruby interpreter.
@@ -164,7 +176,7 @@ type rubyData struct {
 
 		// https://github.com/ruby/ruby/blob/v3_4_5/vm_core.h#L1108
 		thread_struct struct {
-			vm uint8
+			vm, ractor uint8
 		}
 
 		// https://github.com/ruby/ruby/blob/v3_4_5/vm_core.h#L666
@@ -251,7 +263,7 @@ type rubyData struct {
 		// rb_ractor_struct
 		// https://github.com/ruby/ruby/blob/5ce0d2aa354eb996cb3ca9bb944f880ff6acfd57/ractor_core.h#L82
 		rb_ractor_struct struct {
-			running_ec uint16
+			running_ec, objspace uint16
 		}
 
 		// rb_callable_method_entry_struct
@@ -288,6 +300,28 @@ type rubyData struct {
 		// https://github.com/ruby/ruby/blob/v3_4_7/symbol.h#L61-L66
 		rb_symbols_t struct {
 			ids uint8
+		}
+
+		// Since Ruby 4.1, rb_symbols_t.ids is a TypedData id_entry_dir whose
+		// entries are TypedData buckets wrapping rb_darray(struct sym_id_entry).
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/include/ruby/internal/core/rtypeddata.h#L393
+		rtypeddata_struct struct {
+			data_type, data, size_of_rtypeddata uint8
+		}
+
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/symbol.c#L217
+		id_entry_dir_struct struct {
+			capa, entries uint8
+		}
+
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/darray.h#L112
+		rb_darray_struct struct {
+			size, data uint8
+		}
+
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/symbol.c#L160
+		sym_id_entry_struct struct {
+			str, size_of_sym_id_entry uint8
 		}
 	}
 }
@@ -329,9 +363,12 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		Thread_ptr:                   r.vmStructs.execution_context_struct.thread_ptr,
 
 		Thread_vm:        r.vmStructs.thread_struct.vm,
+		Thread_ractor:    r.vmStructs.thread_struct.ractor,
 		Has_objspace:     r.hasObjspace,
 		No_native_resume: r.version < rubyVersion(2, 6, 0),
+		Is_ruby_41:       r.version >= rubyVersion(4, 1, 0),
 		Vm_objspace:      r.vmStructs.vm_struct.gc_objspace,
+		Ractor_objspace:  r.vmStructs.rb_ractor_struct.objspace,
 
 		Objspace_flags:         r.vmStructs.objspace.flags,
 		Objspace_size_of_flags: r.vmStructs.objspace.size_of_flags,
@@ -345,6 +382,9 @@ func (r *rubyData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 	}
 	if r.currentCtxPtr != 0 {
 		cdata.Current_ctx_ptr = uint64(r.currentCtxPtr + bias)
+	}
+	if r.zjitEntryAddr != 0 {
+		cdata.Zjit_entry_addr = uint64(r.zjitEntryAddr + bias)
 	}
 
 	if err := ebpf.UpdateProcData(libpf.Ruby, pid, unsafe.Pointer(&cdata)); err != nil {
@@ -860,7 +900,11 @@ func (r *rubyInstance) readClassName(classAddr libpf.Address) (libpf.String, boo
 
 	// Read the rbasic + rclass_ext + classpath + value to buffer entire object + classpath pointer
 	// do one large, buffered read rather than many small reads.
-	dataBytes := make([]byte, r.r.vmStructs.rclass_and_rb_classext_t.classext+r.r.vmStructs.rb_classext_struct.classpath+r.r.vmStructs.size_of_value)
+	// Since Ruby 4.1 classpath precedes attached_object, so size the buffer by
+	// whichever field comes last; otherwise singleton classes lose their names.
+	lastField := max(r.r.vmStructs.rb_classext_struct.classpath,
+		r.r.vmStructs.rb_classext_struct.as_singleton_class_attached_object)
+	dataBytes := make([]byte, r.r.vmStructs.rclass_and_rb_classext_t.classext+lastField+r.r.vmStructs.size_of_value)
 	if err := r.rm.Read(classAddr, dataBytes); err != nil {
 		return classPath, singleton, err
 	}
@@ -927,6 +971,10 @@ func (r *rubyInstance) id2str(originalId uint64) (libpf.String, error) {
 		}
 	}
 
+	if r.r.version >= rubyVersion(4, 1, 0) {
+		return r.id2strTypedData(serial)
+	}
+
 	ids := r.rm.Ptr(r.globalSymbolsAddr + libpf.Address(vms.rb_symbols_t.ids))
 	idx := serial / idEntryUnit
 
@@ -977,6 +1025,57 @@ func (r *rubyInstance) id2str(originalId uint64) (libpf.String, error) {
 	return symbolName, err
 }
 
+// readTypedDataPtr returns the struct wrapped by a T_DATA object, honoring
+// embedded TypedData like RTYPEDDATA_GET_DATA.
+// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/include/ruby/internal/core/rtypeddata.h#L628
+func (r *rubyInstance) readTypedDataPtr(object libpf.Address) (libpf.Address, error) {
+	vms := &r.r.vmStructs
+	data := make([]byte, vms.rtypeddata_struct.size_of_rtypeddata)
+	if err := r.rm.Read(object, data); err != nil {
+		return 0, fmt.Errorf("failed to read TypedData at 0x%x: %v", object, err)
+	}
+	if npsr.Uint64(data, uint(vms.rbasic_struct.flags))&rubyTMask != rubyTData {
+		return 0, fmt.Errorf("object at 0x%x is not T_DATA", object)
+	}
+	if npsr.Uint64(data, uint(vms.rtypeddata_struct.data_type))&typedDataEmbedded != 0 {
+		return object + libpf.Address(vms.rtypeddata_struct.data), nil
+	}
+	if ptr := npsr.Ptr(data, uint(vms.rtypeddata_struct.data)); ptr != 0 {
+		return ptr, nil
+	}
+	return 0, fmt.Errorf("TypedData at 0x%x has no data", object)
+}
+
+// id2strTypedData mimics get_id_serial_entry for Ruby 4.1+, where the global
+// id table is a TypedData directory of TypedData rb_darray buckets.
+// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/symbol.c#L864
+func (r *rubyInstance) id2strTypedData(serial uint64) (libpf.String, error) {
+	vms := &r.r.vmStructs
+	if serial == 0 {
+		return libpf.NullString, errors.New("invalid symbol serial 0")
+	}
+	dir, err := r.readTypedDataPtr(r.rm.Ptr(r.globalSymbolsAddr + libpf.Address(vms.rb_symbols_t.ids)))
+	if err != nil {
+		return libpf.NullString, err
+	}
+	idx := serial / idEntryUnit
+	if capa := r.rm.Uint64(dir + libpf.Address(vms.id_entry_dir_struct.capa)); idx >= capa {
+		return libpf.NullString, fmt.Errorf("invalid idx %d, directory capacity %d", idx, capa)
+	}
+	entries := r.rm.Ptr(dir + libpf.Address(vms.id_entry_dir_struct.entries))
+	bucket, err := r.readTypedDataPtr(r.rm.Ptr(entries + libpf.Address(idx*uint64(vms.size_of_value))))
+	if err != nil {
+		return libpf.NullString, err
+	}
+	pos := serial % idEntryUnit
+	if size := r.rm.Uint64(bucket + libpf.Address(vms.rb_darray_struct.size)); pos >= size {
+		return libpf.NullString, fmt.Errorf("invalid position %d, bucket size %d", pos, size)
+	}
+	entry := uint64(vms.rb_darray_struct.data) + pos*uint64(vms.sym_id_entry_struct.size_of_sym_id_entry)
+	stringPtr := r.rm.Ptr(bucket + libpf.Address(entry+uint64(vms.sym_id_entry_struct.str)))
+	return r.getStringCached(stringPtr, r.readRubyString)
+}
+
 func (r *rubyInstance) readIseqBody(iseqBody, pc libpf.Address, frameAddrType uint8) (*rubyIseq, error) {
 	vms := &r.r.vmStructs
 
@@ -999,18 +1098,35 @@ func (r *rubyInstance) readIseqBody(iseqBody, pc libpf.Address, frameAddrType ui
 		return &rubyIseq{}, err
 	}
 
-	iseqBaseLabelPtr := npsr.Ptr(dataBytes, uint(vms.iseq_location_struct.base_label))
+	// Body used for for qualified method label is indirect, need to do: iseq body -> local iseq -> iseq body
+	// https://github.com/ruby/ruby/blob/v3_4_5/vm_backtrace.c#L1943
+	// https://github.com/ruby/ruby/blob/v3_4_5/iseq.c#L1426
+	localIseqPtr := r.rm.Ptr(iseqBody + libpf.Address(vms.iseq_constant_body.local_iseq))
+	var iseqLocalBody libpf.Address
+	if localIseqPtr != 0 {
+		iseqLocalBody = r.rm.Ptr(localIseqPtr + libpf.Address(vms.iseq_struct.body))
+	}
+
+	baseLabelOffset := vms.iseq_location_struct.base_label
+	var iseqBaseLabelPtr libpf.Address
+	if r.r.version >= rubyVersion(4, 1, 0) {
+		// Ruby 4.1 removed location.base_label; like rb_iseq_base_label(), use the
+		// local iseq's label, or this iseq's own label when it has no local iseq.
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/iseq.c#L1619
+		baseLabelOffset = vms.iseq_location_struct.label
+		iseqBaseLabelPtr = iseqLabelPtr
+		if localIseqPtr != 0 {
+			iseqBaseLabelPtr = r.rm.Ptr(iseqLocalBody +
+				libpf.Address(vms.iseq_constant_body.location+baseLabelOffset))
+		}
+	} else {
+		iseqBaseLabelPtr = npsr.Ptr(dataBytes, uint(baseLabelOffset))
+	}
 	iseqBaseLabel, err := r.getStringCached(iseqBaseLabelPtr, r.readRubyString)
 	if err != nil {
 		log.Debugf("Failed to get source base label (iseq@0x%08x) %d, %v", iseqBody, frameAddrType, err)
 		return &rubyIseq{}, err
 	}
-
-	// Body used for for qualified method label is indirect, need to do: iseq body -> local iseq -> iseq body
-	// https://github.com/ruby/ruby/blob/v3_4_5/vm_backtrace.c#L1943
-	// https://github.com/ruby/ruby/blob/v3_4_5/iseq.c#L1426
-	localIseqPtr := r.rm.Ptr(iseqBody + libpf.Address(vms.iseq_constant_body.local_iseq))
-	iseqLocalBody := r.rm.Ptr(localIseqPtr + libpf.Address(vms.iseq_struct.body))
 
 	// Check iseq body type to see if it is a method before trying to read it
 	// https://github.com/ruby/ruby/blob/v3_4_5/iseq.c#L1428-L1430
@@ -1019,7 +1135,7 @@ func (r *rubyInstance) readIseqBody(iseqBody, pc libpf.Address, frameAddrType ui
 	var methodName libpf.String
 	if iseqType == iseqTypeMethod {
 		methodNamePtr := r.rm.Ptr(iseqLocalBody +
-			libpf.Address(vms.iseq_constant_body.location+vms.iseq_location_struct.base_label))
+			libpf.Address(vms.iseq_constant_body.location+baseLabelOffset))
 		methodName, err = r.getStringCached(methodNamePtr, r.readRubyString)
 		if err != nil {
 			log.Debugf("Unable to find local method name on iseq method (%d) (iseq@0x%08x) %v", iseqType, iseqBody, err)
@@ -1440,6 +1556,21 @@ func determineRubyVersion(ef *pfelf.File) (uint32, error) {
 	return rubyVersion(uint32(major), uint32(minor), uint32(release)), nil
 }
 
+const ruby405PShopifyRevision = "21a2595676"
+
+// rubyUses406Layout reports whether a Ruby 4.0 binary contains the two layout
+// changes released in 4.0.6. Shopify's transitional 4.0.5-pshopify3 build is
+// cut from ruby/ruby@21a2595676 and therefore contains both changes despite its
+// older version string. ruby_description is an exported, on-disk symbol, unlike
+// the pshopify branch suffix which is present only in DWARF.
+func rubyUses406Layout(version uint32, description string) bool {
+	if version >= rubyVersion(4, 0, 6) {
+		return true
+	}
+	return version == rubyVersion(4, 0, 5) &&
+		strings.Contains(description, " revision "+ruby405PShopifyRevision+")")
+}
+
 func GetLoader(cfg Config) interpreter.Loader {
 	return interpreter.NewLoader(
 		func(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
@@ -1468,14 +1599,25 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 		return nil, err
 	}
 
+	var description string
+	if version == rubyVersion(4, 0, 5) {
+		if _, memory, descriptionErr := ef.SymbolData("ruby_description", 128); descriptionErr == nil {
+			description = strings.TrimRight(pfunsafe.ToString(memory), "\x00")
+		}
+	}
+	usesRuby406Layout := rubyUses406Layout(version, description)
+	if version < rubyVersion(4, 0, 6) && usesRuby406Layout {
+		log.Debugf("Ruby %s uses backported 4.0.6 VM layout", description)
+	}
+
 	// Reason for lowest supported version:
 	// - Ruby 2.5 is still commonly used at time of writing this code.
 	//   https://www.jetbrains.com/lp/devecosystem-2020/ruby/
-	// Reason for maximum supported version 4.0.x:
-	// - Ruby 4.0 was released December 2025 with ZJIT and redesigned Ractor Port API
-	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(4, 1, 0)
+	// Reason for maximum supported version 4.1.x:
+	// - Ruby 4.1 layouts were measured on Shopify/ruby a68e42cf (4.1.0dev); 4.2 is unverified.
+	minVer, maxVer := rubyVersion(2, 5, 0), rubyVersion(4, 2, 0)
 	if version < minVer || version >= maxVer {
-		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and <= %d.%d.%d)",
+		return nil, fmt.Errorf("unsupported Ruby %d.%d.%d (need >= %d.%d.%d and < %d.%d.%d)",
 			(version>>16)&0xff, (version>>8)&0xff, version&0xff,
 			(minVer>>16)&0xff, (minVer>>8)&0xff, minVer&0xff,
 			(maxVer>>16)&0xff, (maxVer>>8)&0xff, maxVer&0xff)
@@ -1615,6 +1757,15 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 		vms.rclass_and_rb_classext_t.classext = 24
 		vms.rb_classext_struct.as_singleton_class_attached_object = 112
 		vms.rb_classext_struct.classpath = 128
+	case version >= rubyVersion(4, 1, 0):
+		// Ruby 4.1 moved classpath ahead of the singleton attached_object.
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/internal/class.h
+		rid.hasClassPath = true
+		rid.rubyFlSingleton = libpf.Address(RUBY_FL_USER1)
+
+		vms.rclass_and_rb_classext_t.classext = 24
+		vms.rb_classext_struct.as_singleton_class_attached_object = 104
+		vms.rb_classext_struct.classpath = 24
 	default:
 		rid.hasClassPath = true
 		rid.rubyFlSingleton = libpf.Address(RUBY_FL_USER1)
@@ -1638,7 +1789,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 	case version < rubyVersion(4, 1, 0):
 		rid.lastOpId = 171
 	default:
-		rid.lastOpId = 170
+		rid.lastOpId = 174
 	}
 
 	// Ruby does not provide introspection data, hard code the struct field offsets. Some
@@ -1689,7 +1840,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 		} else {
 			vms.vm_struct.gc_objspace = 1272
 		}
-		if version >= rubyVersion(4, 0, 6) {
+		if usesRuby406Layout {
 			// Ruby 4.0.6 inserted rb_vm_t.master_box before root_box,
 			// shifting the gc.objspace field by one pointer.
 			// https://github.com/ruby/ruby/blob/v4.0.6/vm_core.h
@@ -1697,6 +1848,20 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 			vms.vm_struct.gc_objspace += 8
 		}
 		vms.objspace.flags = 28
+	case version >= rubyVersion(4, 1, 0):
+		// Ruby 4.1 moved the GC objspace from rb_vm_t into each ractor; the
+		// current one is thread->ractor->objspace. vm.gc.global_objspace has a
+		// different type and must not be used instead.
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/gc.c#L248
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/ractor_core.h#L154
+		rid.hasObjspace = true
+		vms.thread_struct.ractor = 24
+		vms.objspace.flags = 76
+		if runtime.GOARCH == "amd64" {
+			vms.rb_ractor_struct.objspace = 600
+		} else {
+			vms.rb_ractor_struct.objspace = 616
+		}
 	default:
 		rid.hasObjspace = true
 		vms.objspace.flags = 20
@@ -1729,6 +1894,9 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 		vms.control_frame_struct.size_of_control_frame_struct = 56
 	}
 	vms.iseq_struct.body = 16
+	if version >= rubyVersion(4, 1, 0) {
+		vms.iseq_struct.body = 8
+	}
 
 	vms.iseq_constant_body.iseq_type = 0
 	vms.iseq_constant_body.size = 4
@@ -1771,6 +1939,15 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 		// 304 is the size without them and the "common" size regardless of config.
 		// It is safer to set this to the smaller value, especially since the highest field we actually access is much lower
 		vms.iseq_constant_body.size_of_iseq_constant_body = 304
+	case version >= rubyVersion(4, 1, 0):
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/vm_core.h#L433
+		vms.iseq_constant_body.insn_info_body = 104
+		vms.iseq_constant_body.insn_info_size = 120
+		vms.iseq_constant_body.succ_index_table = 112
+		vms.iseq_constant_body.local_iseq = 160
+		// Read only the prefix through local_iseq; the trailing JIT fields depend on
+		// the build configuration and are not needed for symbolization.
+		vms.iseq_constant_body.size_of_iseq_constant_body = 168
 	default: // 3.3.x and 3.5.x have the same values
 		vms.iseq_constant_body.insn_info_body = 112
 		vms.iseq_constant_body.insn_info_size = 128
@@ -1785,6 +1962,13 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 	vms.iseq_location_struct.base_label = 8
 	vms.iseq_location_struct.label = 16
 	vms.iseq_location_struct.size_of_iseq_location_struct = 24
+	if version >= rubyVersion(4, 1, 0) {
+		// Ruby 4.1 removed base_label; readIseqBody derives it via local_iseq.
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/vm_core.h#L342
+		vms.iseq_location_struct.base_label = 0
+		vms.iseq_location_struct.label = 8
+		vms.iseq_location_struct.size_of_iseq_location_struct = 16
+	}
 
 	switch {
 	case version < rubyVersion(2, 6, 0):
@@ -1842,9 +2026,27 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 	vms.rb_method_iseq_struct.iseqptr = 0
 
 	vms.rb_symbols_t.ids = 16
+	if version >= rubyVersion(4, 1, 0) {
+		vms.rtypeddata_struct.data_type = 24
+		vms.rtypeddata_struct.data = 32
+		vms.rtypeddata_struct.size_of_rtypeddata = 40
+		vms.id_entry_dir_struct.capa = 0
+		vms.id_entry_dir_struct.entries = 8
+		vms.rb_darray_struct.size = 0
+		vms.rb_darray_struct.data = 16
+		vms.sym_id_entry_struct.str = 8
+		vms.sym_id_entry_struct.size_of_sym_id_entry = 16
+	}
 
 	if version >= rubyVersion(3, 0, 0) {
-		if version >= rubyVersion(4, 0, 0) {
+		if version >= rubyVersion(4, 1, 0) {
+			// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/ractor_core.h#L78
+			if runtime.GOARCH == "amd64" {
+				vms.rb_ractor_struct.running_ec = 416
+			} else {
+				vms.rb_ractor_struct.running_ec = 432
+			}
+		} else if version >= rubyVersion(4, 0, 0) {
 			// Ruby 4.0+ redesigned rb_ractor_sync with Port-based API.
 			// Offsets determined via GDB analysis of rb_ractor_struct.
 			if runtime.GOARCH == "amd64" {
@@ -1852,7 +2054,7 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 			} else {
 				vms.rb_ractor_struct.running_ec = 0x148
 			}
-			if version >= rubyVersion(4, 0, 6) {
+			if usesRuby406Layout {
 				// Ruby 4.0.6 added runnable_hot_th and runnable_hot_th_waiting
 				// to struct rb_thread_sched, which is embedded in
 				// rb_ractor_struct.threads before running_ec.
@@ -1872,6 +2074,15 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo,
 			} else {
 				vms.rb_ractor_struct.running_ec = 0x218
 			}
+		}
+	}
+
+	if version >= rubyVersion(4, 1, 0) {
+		// ZJIT-enabled builds export rb_zjit_entry; it is non-zero while ZJIT
+		// runs, and then CFP_PC/CFP_ISEQ read the JIT frame instead of the CFP.
+		// https://github.com/Shopify/ruby/blob/a68e42cfad16857e146d27044c9116cd4bae950b/zjit.h#L204
+		if symbol, symbolErr := ef.LookupSymbol("rb_zjit_entry"); symbolErr == nil {
+			rid.zjitEntryAddr = libpf.Address(symbol.Address)
 		}
 	}
 

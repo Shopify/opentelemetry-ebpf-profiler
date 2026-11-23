@@ -519,10 +519,14 @@ typedef struct RubyProcInfo {
   // JIT regions, for detecting if a native PC was JIT
   u64 jit_start, jit_end;
 
+  // Address of rb_zjit_entry, or zero for builds without ZJIT.
+  // Its value can change after process attachment when ZJIT is enabled.
+  u64 zjit_entry_addr;
+
   // Offsets and sizes of Ruby internal structs
 
-  // rb_vm_struct offsets
-  u16 vm_objspace;
+  // rb_vm_struct offsets (before 4.1) and rb_ractor_struct offsets (4.1+)
+  u16 vm_objspace, ractor_objspace;
 
   // rb_ractor_struct offset:
   u16 running_ec;
@@ -531,7 +535,7 @@ typedef struct RubyProcInfo {
   u8 vm_stack, vm_stack_size, cfp, thread_ptr;
 
   // rb_thread_struct offsets
-  u8 thread_vm;
+  u8 thread_vm, thread_ractor;
 
   // rb_objspace offsets
   u8 objspace_flags, objspace_size_of_flags;
@@ -554,6 +558,9 @@ typedef struct RubyProcInfo {
 
   // is ruby too old to unwind native stack
   bool no_native_resume;
+
+  // Ruby 4.1+ uses per-ractor objspace, 5-bit imemo mask, and bit 6 during_gc
+  bool is_ruby_41;
 
 } RubyProcInfo;
 
