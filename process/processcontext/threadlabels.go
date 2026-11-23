@@ -19,9 +19,12 @@ import (
 //
 // [OTEP 4947]: https://github.com/open-telemetry/opentelemetry-specification/blob/main/oteps/profiles/4947-thread-ctx.md
 const (
-	threadCtxSchemaVersionKey       = "threadlocal.schema_version"
-	supportedThreadCtxSchemaVersion = "tlsdesc_v1_dev"
-	threadCtxKeyMapKey              = "threadlocal.attribute_key_map"
+	threadCtxSchemaVersionKey = "threadlocal.schema_version"
+	// Merged OTEP 4947 uses "tls_v1"; keep accepting the pre-merge dev name
+	// "tlsdesc_v1_dev" for backwards compatibility with existing publishers.
+	supportedThreadCtxSchemaVersion    = "tls_v1"
+	supportedThreadCtxSchemaVersionDev = "tlsdesc_v1_dev"
+	threadCtxKeyMapKey                 = "threadlocal.attribute_key_map"
 	// maxThreadCtxAttributeKeys is the largest key map DecodeLabels can address,
 	// since it reads the key index as a single byte.
 	maxThreadCtxAttributeKeys = 256
@@ -61,7 +64,8 @@ func readThreadContextInfo(attrs []*commonpb.KeyValue) (*threadContextInfo, erro
 		// No schema published: the common case, not a fault.
 		return nil, nil
 	}
-	if v := version.GetValue().GetStringValue(); v != supportedThreadCtxSchemaVersion {
+	if v := version.GetValue().GetStringValue(); v != supportedThreadCtxSchemaVersion &&
+		v != supportedThreadCtxSchemaVersionDev {
 		return nil, fmt.Errorf("unsupported thread context schema version: %s", v)
 	}
 	if keyMap == nil {

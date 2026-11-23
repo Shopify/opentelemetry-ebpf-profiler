@@ -74,6 +74,13 @@ func TestReadThreadContextInfo(t *testing.T) {
 			},
 			wantKeyMap: []libpf.String{libpf.Intern("a"), libpf.Intern("b")},
 		},
+		"legacy dev version and key map": {
+			attrs: []*commonpb.KeyValue{
+				attr(threadCtxSchemaVersionKey, strVal(supportedThreadCtxSchemaVersionDev)),
+				attr(threadCtxKeyMapKey, arrVal(strVal("a"), strVal("b"))),
+			},
+			wantKeyMap: []libpf.String{libpf.Intern("a"), libpf.Intern("b")},
+		},
 		"key map before version": {
 			attrs: []*commonpb.KeyValue{
 				attr(threadCtxKeyMapKey, arrVal(strVal("a"))),
