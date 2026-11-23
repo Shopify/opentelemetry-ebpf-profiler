@@ -975,8 +975,8 @@ func probeUnwinderJobs(coll *cebpf.CollectionSpec, tailcallMap *cebpf.Map,
 			return nil, err
 		}
 
-		// Skip rewriting tail call maps for external perf_event based probes.
-		if unwindProg.Name != "perf_event__external" {
+		// Skip rewriting tail call maps for perf_event based probes.
+		if progSpec.Type != cebpf.PerfEvent {
 			// Replace the prog array for the tail calls.
 			insns := progArrayReferences(perfTailCallMapFD, progSpec.Instructions)
 			for _, ins := range insns {

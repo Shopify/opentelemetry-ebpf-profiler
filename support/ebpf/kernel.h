@@ -125,9 +125,24 @@ typedef struct user_pt_regs bpf_user_pt_regs_t;
   #error "Unsupported architecture"
 #endif
 
+// Mirrors uapi/linux/bpf_perf_event.h.
 struct bpf_perf_event_data {
   bpf_user_pt_regs_t regs;
+  u64 sample_period;
+  u64 addr;
 };
+
+#if defined(__aarch64__)
+_Static_assert(sizeof(bpf_user_pt_regs_t) == 272, "bad arm64 bpf_user_pt_regs_t size");
+_Static_assert(
+  __builtin_offsetof(struct bpf_perf_event_data, sample_period) == 272,
+  "bad arm64 bpf_perf_event_data.sample_period offset");
+#else
+_Static_assert(sizeof(bpf_user_pt_regs_t) == 168, "bad x86_64 bpf_user_pt_regs_t size");
+_Static_assert(
+  __builtin_offsetof(struct bpf_perf_event_data, sample_period) == 168,
+  "bad x86_64 bpf_perf_event_data.sample_period offset");
+#endif
 
 // The following works with clang and gcc.
 // Checked with

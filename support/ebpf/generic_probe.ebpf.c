@@ -77,3 +77,14 @@ int perf_event__external(struct bpf_perf_event_data *ctx)
   }
   return probe__generic((struct pt_regs *)&ctx->regs, value);
 }
+
+// perf_event__direct serves as entry point for externally opened perf events
+// (hardware counters, software events, ...) whose program is attached directly by the
+// hosting probe. The sample period is reported as context value so the sum over samples
+// equals the number of events attributed to a stack.
+SEC("perf_event/direct")
+int perf_event__direct(struct bpf_perf_event_data *ctx)
+{
+  u64 period = ctx->sample_period;
+  return probe__generic((struct pt_regs *)&ctx->regs, &period);
+}

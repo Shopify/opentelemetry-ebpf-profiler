@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
+	"go.opentelemetry.io/ebpf-profiler/rlimit"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
@@ -348,6 +349,71 @@ func (c *ProbeContext) RegisterCollectTrampoline(meta *samples.TypeMetadata, kin
 		CtxMap:     ctxMap,
 		trampoline: prog,
 	}, nil
+}
+
+// RegisterPerfEventCollectTrampoline registers meta as a new sample origin and
+// loads the perf_event-typed collect trampoline (perf_event__direct). The
+// returned program is meant to be attached directly to perf events opened by
+// the caller (perf_event_open + PERF_EVENT_IOC_SET_BPF); each sample reports
+// the event's sample period as its context value, so the sum over a stack's
+// samples equals the number of events attributed to that stack.
+//
+// The caller owns the returned program and must close it from its Probe.Unload
+// implementation after detaching the perf events.
+func (c *ProbeContext) RegisterPerfEventCollectTrampoline(meta *samples.TypeMetadata) (*cebpf.Program, error) {
+	const (
+		trampolineProgName = "perf_event__direct"
+		originVarName      = "origin_id_probe"
+	)
+
+	originID, err := c.reg.Register(&OriginEntry{Meta: meta})
+	if err != nil {
+		return nil, fmt.Errorf("registering perf event collect trampoline origin: %w", err)
+	}
+	coll, err := c.CollectionSpecWith(nil, []string{trampolineProgName}, []string{originVarName})
+	if err != nil {
+		return nil, err
+	}
+	v, ok := coll.Variables[originVarName]
+	if !ok {
+		return nil, fmt.Errorf("variable %q missing after CollectionSpecWith", originVarName)
+	}
+	if err := v.Set(originID); err != nil {
+		return nil, fmt.Errorf("set %s: %w", originVarName, err)
+	}
+	progSpec := coll.Programs[trampolineProgName]
+	if progSpec.Type != cebpf.PerfEvent {
+		return nil, fmt.Errorf("program %q has type %s, want %s",
+			trampolineProgName, progSpec.Type, cebpf.PerfEvent)
+	}
+	if err := c.RewriteMaps(coll, nil); err != nil {
+		return nil, err
+	}
+	// Kernels before 5.11 account BPF map memory (.rodata.var) against RLIMIT_MEMLOCK.
+	restoreRlimit, err := rlimit.MaximizeMemlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to adjust rlimit: %w", err)
+	}
+	defer restoreRlimit()
+
+	ebpfProgs := make(map[string]*cebpf.Program)
+	// LoadProbeUnwinders skips rewriting perf_progs/per_cpu_records for PerfEvent
+	// programs, so perf_event__direct tail-calls into the tracer's own perf chain
+	// and shares its per-CPU record (serialized per CPU by bpf_prog_active).
+	if err := c.LoadProbeUnwinders(coll, ebpfProgs, []ProgLoaderHelper{
+		{
+			Name:             trampolineProgName,
+			NoTailCallTarget: true,
+			Enable:           true,
+		},
+	}, 0); err != nil {
+		return nil, err
+	}
+	prog, ok := ebpfProgs[trampolineProgName]
+	if !ok {
+		return nil, fmt.Errorf("program %q not found after loading", trampolineProgName)
+	}
+	return prog, nil
 }
 
 // AddAttacher registers a per-process attacher with the process manager.
